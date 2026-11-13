@@ -260,6 +260,9 @@ CONFIG_DIR=${CLAUDE_CONFIG_DIR:-${HOME:-}}
 # success the worker never sees. Refuse rather than guess at the worker's cwd.
 case ${CLAUDE_CONFIG_DIR:-} in
   '' | /*) ;;
+  # A Windows drive-letter path (C:\... or C:/...) is absolute too; Git Bash
+  # hands CLAUDE_CONFIG_DIR through in that form when a native tool set it.
+  [A-Za-z]:[\\/]*) ;;
   *) refuse "CLAUDE_CONFIG_DIR '$CLAUDE_CONFIG_DIR' is a relative path, so the store the worker reads cannot be guaranteed to be the one written here; set it to an absolute path" ;;
 esac
 # fm-spawn forwards a set CLAUDE_CONFIG_DIR onto the launch without requiring it

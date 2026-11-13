@@ -191,13 +191,16 @@ runtime_chain_body() {
   local ours=$1
   cat <<EOF
 ours=$(quote_for_hook "$ours")
+# Path equality that survives Git for Windows naming one directory two ways
+# (/d/x in the shell, D:/x from git): fall back to a same-file test.
+same_path() { [ "\$1" = "\$2" ] || { [ -n "\$1" ] && [ -n "\$2" ] && [ "\$1" -ef "\$2" ]; }; }
 case \${GIT_CONFIG_COUNT:-} in
 '' | *[!0-9]*) ;;
 *)
   count=\$((10#\$GIT_CONFIG_COUNT)) i=0 kept=0
   while [ "\$i" -lt "\$count" ]; do
     key=GIT_CONFIG_KEY_\$i value=GIT_CONFIG_VALUE_\$i
-    if [ "\${!key-}" != core.hooksPath ] || [ "\${!value-}" != "\$ours" ]; then
+    if [ "\${!key-}" != core.hooksPath ] || ! same_path "\${!value-}" "\$ours"; then
       [ "\$i" = "\$kept" ] || export "GIT_CONFIG_KEY_\$kept=\${!key-}" "GIT_CONFIG_VALUE_\$kept=\${!value-}"
       kept=\$((kept + 1))
     fi
@@ -215,7 +218,7 @@ orig=\$(unset GIT_CONFIG_PARAMETERS; git rev-parse --path-format=absolute --git-
   echo "fm-git-strip-ai-trailers: cannot resolve this repository's hooks directory; refusing to skip its \$name hook" >&2
   exit 1
 }
-if [ "\$orig" = "\$ours" ]; then
+if same_path "\$orig" "\$ours"; then
   exit 0
 fi
 if [ -x "\$orig/\$name" ]; then

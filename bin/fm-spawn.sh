@@ -6294,6 +6294,8 @@ exclude_path() {
   [ -n "$EXCL" ] || return 0
   case "$EXCL" in
     /*) ;;
+    # Git for Windows answers with a drive-letter absolute path (D:/...).
+    [A-Za-z]:[\\/]*) ;;
     *) EXCL="$WT/$EXCL" ;;
   esac
   mkdir -p "$(dirname "$EXCL")"

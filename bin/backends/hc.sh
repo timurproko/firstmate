@@ -239,10 +239,22 @@ fm_backend_hc_target_ready() {  # <target> [expected-label]
 # fm_backend_hc_hello: the generation handshake for <session> over `hc
 # connect`. Prints the negotiated generation, nothing on failure.
 fm_backend_hc_hello() {  # <session>
-  local session=$1 out gen
-  out=$(printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
-      "$FM_BACKEND_HC_GENERATION" \
-    | fm_backend_hc_env_run "$session" connect --session "$session" 2>/dev/null) || return 1
+  local session=$1 out gen reply rc i
+  # Hold stdin open until the reply lands (bounded ~10s): on Windows,
+  # `hc connect` exits on stdin EOF without flushing an in-flight reply, so
+  # a bare `printf | hc connect` returns nothing there. Portable to bash 3.2
+  # (no coproc).
+  reply=$(mktemp "${TMPDIR:-/tmp}/fm-hc-hello.XXXXXX") || return 1
+  {
+    printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
+      "$FM_BACKEND_HC_GENERATION"
+    i=0
+    while [ "$i" -lt 200 ] && ! [ -s "$reply" ]; do sleep 0.05; i=$((i + 1)); done
+  } | fm_backend_hc_env_run "$session" connect --session "$session" >"$reply" 2>/dev/null
+  rc=$?
+  out=$(head -n 1 "$reply" 2>/dev/null)
+  rm -f "$reply"
+  [ "$rc" -eq 0 ] || return 1
   gen=$(printf '%s' "$out" | jq -r '.result.generation // empty' 2>/dev/null)
   [ -n "$gen" ] || return 1
   printf '%s' "$gen"
@@ -340,10 +352,57 @@ fm_backend_hc_send_text_line() {  # <target> <text> [expected-label]
 }
 
 fm_backend_hc_current_path() {  # <target> [expected-label]
-  local json
+  local json pid
   fm_backend_hc_target_ready "$1" "${2:-}" || return 0
   json=$(fm_backend_hc_get "$1") || return 0
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      pid=$(printf '%s' "$json" | jq -r '.foreground.pid // .pid // empty' 2>/dev/null)
+      if [ -n "$pid" ] && fm_backend_hc_msys_cwd "$pid"; then return 0; fi
+      ;;
+  esac
   printf '%s' "$json" | jq -r '.foreground.cwd // .cwd // empty' 2>/dev/null
+}
+
+# fm_backend_hc_msys_cwd: the real cwd of a Windows hc terminal's shell.
+# On Git Bash/MSYS, hc only sees the native launcher (Git\bin\bash.exe), whose
+# Windows cwd never follows the MSYS shell's `cd`, and it cannot see a nested
+# shell such as the one `treehouse get` opens. So: map the launcher's Windows
+# pid (and its direct children) to an MSYS process, take that process's
+# console, and report the cwd of the newest interactive bash on that console.
+# Prints nothing and fails when no mapping is found.
+fm_backend_hc_msys_cwd() {  # <windows-pid>
+  local root=$1 kids p w tty best n argv a interactive
+  case "$root" in ''|*[!0-9]*) return 1 ;; esac
+  kids=$(powershell.exe -NoProfile -Command \
+    "(Get-CimInstance Win32_Process -Filter 'ParentProcessId=$root').ProcessId" 2>/dev/null | tr -d '\r')
+  tty=
+  for p in /proc/[0-9]*; do
+    w=; { IFS= read -r w <"$p/winpid"; } 2>/dev/null || continue
+    case " $root $(printf '%s' "$kids" | tr '\n' ' ') " in
+      *" $w "*) { IFS= read -r tty <"$p/ctty"; } 2>/dev/null; [ -n "$tty" ] && break ;;
+    esac
+  done
+  case "$tty" in ''|*'?'*) return 1 ;; esac
+  best=
+  for p in /proc/[0-9]*; do
+    w=; { IFS= read -r w <"$p/ctty"; } 2>/dev/null || continue
+    [ "$w" = "$tty" ] || continue
+    argv=()
+    { mapfile -d '' argv <"$p/cmdline"; } 2>/dev/null || continue
+    case "${argv[0]:-}" in */bash|*/bash.exe|bash) ;; *) continue ;; esac
+    interactive=1
+    for a in "${argv[@]:1}"; do
+      case "$a" in --login|-l|-i) ;; *) interactive=0; break ;; esac
+    done
+    [ "$interactive" -eq 1 ] || continue
+    n=${p#/proc/}
+    if [ -z "$best" ] || [ "$n" -gt "$best" ]; then best=$n; fi
+  done
+  [ -n "$best" ] || return 1
+  p=$(readlink "/proc/$best/cwd" 2>/dev/null) || return 1
+  [ -n "$p" ] || return 1
+  printf '%s' "$p"
 }
 
 fm_backend_hc_composer_caps() {
