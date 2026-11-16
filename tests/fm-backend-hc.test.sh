@@ -35,6 +35,12 @@ case "$cmd" in
   server) printf '{"live":0}\n' ;;
   connect)
     IFS= read -r _req || true
+    if [ "${FAKE_HC_EOF_DROPS_REPLY:-}" = 1 ]; then
+      # Windows hc: an already-closed stdin ends the process before the reply is
+      # flushed; a still-open stdin (the read times out) lets the reply through.
+      IFS= read -r -t 0.3 _more; rc=$?
+      [ "$rc" -gt 128 ] || exit 0
+    fi
     printf '{"jsonrpc":"2.0","id":1,"result":{"generation":%s}}\n' "${FAKE_HC_GENERATION:-1}"
     ;;
   ls) cat "$D/ls.json" 2>/dev/null || printf '{"terminals":[]}\n' ;;
@@ -293,6 +299,22 @@ test_container_ensure_gates_binary_version_and_generation() {
   pass "hc: container_ensure refuses a misnamed, old, or wrong-generation binary"
 }
 
+test_hello_survives_a_core_that_exits_on_stdin_eof() {
+  local out request
+  setup_case eofhello
+  request='{"jsonrpc":"2.0","method":"hello","params":{"generation":1},"id":1}'
+  # A plain pipe closes stdin right after the request; such a core answers nothing.
+  out=$(printf '%s\n' "$request" | FAKE_HC_EOF_DROPS_REPLY=1 FAKE_HC_DIR="$D" "$FB/hc" connect --session fmtest)
+  assert_equals "$out" "" "the fake reproduces a core that drops its reply on early EOF"
+  out=$(FAKE_HC_EOF_DROPS_REPLY=1 hc_shell 'fm_backend_hc_hello fmtest')
+  assert_equals "$out" 1 "hello holds the request pipe open until the reply lands"
+  out=$(FAKE_HC_EOF_DROPS_REPLY=1 hc_shell 'fm_backend_hc_container_ensure')
+  assert_equals "$out" fmtest "container_ensure passes the handshake on such a core"
+  out=$(hc_shell 'fm_backend_hc_hello fmtest')
+  assert_equals "$out" 1 "a core that answers before EOF is unchanged"
+  pass "hc: hello handshake survives a core that exits on stdin EOF before flushing (Windows)"
+}
+
 test_send_text_submit_confirms_through_send_wait() {
   local tag out log
   setup_case submit
@@ -375,5 +397,6 @@ fm_test_run \
   test_capture_and_current_path_read_the_recorded_terminal \
   test_endpoint_validation_binds_hc_meta \
   test_container_ensure_gates_binary_version_and_generation \
+  test_hello_survives_a_core_that_exits_on_stdin_eof \
   test_send_text_submit_confirms_through_send_wait \
   test_send_delimiters_and_binary_socket_pins

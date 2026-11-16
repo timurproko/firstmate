@@ -238,11 +238,26 @@ fm_backend_hc_target_ready() {  # <target> [expected-label]
 
 # fm_backend_hc_hello: the generation handshake for <session> over `hc
 # connect`. Prints the negotiated generation, nothing on failure.
+#
+# The request pipe stays open until the first reply line has landed (bounded
+# at ~10 s). hc on Windows exits when its stdin reaches EOF, before an
+# in-flight reply is flushed, so a bare `printf | hc connect` prints nothing
+# there (reproduced on hc 0.1.19 and 0.1.21). Holding the write end open until
+# the reply exists is portable, needs no coproc (bash 3.2), and changes nothing
+# where hc already answers before EOF.
 fm_backend_hc_hello() {  # <session>
-  local session=$1 out gen
-  out=$(printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
-      "$FM_BACKEND_HC_GENERATION" \
-    | fm_backend_hc_env_run "$session" connect --session "$session" 2>/dev/null) || return 1
+  local session=$1 out gen reply rc i
+  reply=$(mktemp "${TMPDIR:-/tmp}/fm-hc-hello.XXXXXX") || return 1
+  {
+    printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
+      "$FM_BACKEND_HC_GENERATION"
+    i=0
+    while [ "$i" -lt 200 ] && ! [ -s "$reply" ]; do sleep 0.05; i=$((i + 1)); done
+  } | fm_backend_hc_env_run "$session" connect --session "$session" >"$reply" 2>/dev/null
+  rc=$?
+  out=$(head -n 1 "$reply" 2>/dev/null)
+  rm -f "$reply"
+  [ "$rc" -eq 0 ] || return 1
   gen=$(printf '%s' "$out" | jq -r '.result.generation // empty' 2>/dev/null)
   [ -n "$gen" ] || return 1
   printf '%s' "$gen"
