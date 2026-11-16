@@ -111,7 +111,12 @@ An input, capture, or close that carries the task label refuses a terminal whose
   A started turn or a still-working wait confirms it natively; otherwise the adapter falls back to the composer screen, with Enter retries only for a proven pending composer.
   A blocked terminal (exit 9) returns `unknown` without typing or retrying and is never forced.
 - hc reports one foreground process per terminal.
-  When that process is a launcher, the adapter also reads the rest of its process group from `ps`, which works only for terminals on the local machine.
+  When that process is a launcher, the adapter also reads the rest of its process group from `ps`, which works only for terminals on the local machine and cannot see inside a native Windows launcher.
+- An A1 worker (a pinned-Pi harness detected as `pi`) is controlled through A1's public integration API instead: A1 publishes its exact session and runtime as native `a1.session`/`a1.runtime` labels with an `a1.at` heartbeat (fresh within 90 s), and `fm-control.sh exit` asks `a1 api` protocol 1 `session.lifecycle` for liveness and `session.exit` for a graceful stop of that exact target.
+  A1 admits the stop only when idle with an empty editor, no queued input and no open dialog; its refusals (`session-busy`, `editor-not-empty`, `pending-input`, `overlay-open`, `session-stopping`) are reported verbatim, and nothing is typed, cleared or killed instead.
+  `stopped` is proven by A1 answering `session-unavailable` for that session afterwards, never by an acknowledgement alone; a timed-out or uncorrelated answer is an unknown outcome that is observed, not re-requested.
+  An A1 whose identity labels are missing or stale, or whose API cannot be reached, is refused rather than typed into. `FM_A1_BIN` overrides the `a1` found on `PATH`. Stock Pi keeps `/quit`.
+- The `hello` handshake holds its request pipe open until the first reply line lands: hc on Windows exits on stdin EOF before flushing an in-flight reply, so a plain pipe into `hc connect` prints nothing there.
 - Right after a terminal starts, `hc get` can report no foreground process yet, and agent state reads `unreadable` until the shell is up.
 - `--secondmate` spawns are refused.
 - A worker inherits `HC_SESSION`, `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, and `HC_SCOPE` from its terminal, and the `config/launch-env-allowlist` floor keeps them; whether a real harness then reports native status under Firstmate's launch is not verified.
@@ -121,7 +126,8 @@ An input, capture, or close that carries the task label refuses a terminal whose
 
 ## Tests
 
-`tests/fm-backend-hc.test.sh` pins the adapter against a fake `hc`.
+`tests/fm-backend-hc.test.sh` pins the adapter against a fake `hc`, including a core that drops its reply on early stdin EOF.
+`tests/fm-hc-a1-exit-api.test.sh` covers the A1 exit through the public API: exact-target requests, lifecycle-proven liveness, verbatim refusals, unknown and unavailable outcomes, no keys or slash prompts, unconfirmed exits that are not re-requested, and refusal of an A1 without native identity.
 `tests/fm-backend-hc-liveness-live-e2e.test.sh` is the default-on live guard: it launches every installed harness bare in a private core and requires `alive`.
 `tests/fm-backend-hc-smoke.test.sh` drives the real binary in an isolated lab; [`bin/fm-hc-lab.sh`](../bin/fm-hc-lab.sh) owns the isolation and metadata-tripwire contract, and [`tests/hc-test-safety.sh`](../tests/hc-test-safety.sh) owns guarded test teardown.
 `tests/fm-backend-hc-appdetect-smoke.test.sh` runs a real `bin/fm-spawn.sh` spawn in the same kind of lab for the app-terminal and explicit cases, and checks that a live app window never selects hc for a marker-less process and starts nothing for a session with no running core.
