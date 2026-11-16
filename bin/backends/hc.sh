@@ -238,11 +238,26 @@ fm_backend_hc_target_ready() {  # <target> [expected-label]
 
 # fm_backend_hc_hello: the generation handshake for <session> over `hc
 # connect`. Prints the negotiated generation, nothing on failure.
+#
+# The request pipe stays open until the first reply line has landed (bounded
+# at ~10 s). hc on Windows exits when its stdin reaches EOF, before an
+# in-flight reply is flushed, so a bare `printf | hc connect` prints nothing
+# there (reproduced on hc 0.1.19 and 0.1.21). Holding the write end open until
+# the reply exists is portable, needs no coproc (bash 3.2), and changes nothing
+# where hc already answers before EOF.
 fm_backend_hc_hello() {  # <session>
-  local session=$1 out gen
-  out=$(printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
-      "$FM_BACKEND_HC_GENERATION" \
-    | fm_backend_hc_env_run "$session" connect --session "$session" 2>/dev/null) || return 1
+  local session=$1 out gen reply rc i
+  reply=$(mktemp "${TMPDIR:-/tmp}/fm-hc-hello.XXXXXX") || return 1
+  {
+    printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
+      "$FM_BACKEND_HC_GENERATION"
+    i=0
+    while [ "$i" -lt 200 ] && ! [ -s "$reply" ]; do sleep 0.05; i=$((i + 1)); done
+  } | fm_backend_hc_env_run "$session" connect --session "$session" >"$reply" 2>/dev/null
+  rc=$?
+  out=$(head -n 1 "$reply" 2>/dev/null)
+  rm -f "$reply"
+  [ "$rc" -eq 0 ] || return 1
   gen=$(printf '%s' "$out" | jq -r '.result.generation // empty' 2>/dev/null)
   [ -n "$gen" ] || return 1
   printf '%s' "$gen"
@@ -480,6 +495,121 @@ EOF
   fm_backend_hc_group_has_agent "$pid" && { printf 'alive'; return 0; }
   [ "$class" != shell ] || { printf 'dead'; return 0; }
   printf 'ambiguous'
+}
+
+# --- A1 workers: exact-runtime control through A1's public integration API ---
+#
+# A1 (a pinned-Pi harness that Firstmate detects as `pi`) publishes its exact
+# session and runtime identity as native Core labels (`a1.session`,
+# `a1.runtime`, heartbeat `a1.at`) and answers `a1 api` protocol-1 requests
+# for that exact target: `session.lifecycle` (read-only readiness and
+# liveness, verified against the runtime process) and `session.exit`
+# (ordinary /quit path, admitted only when idle with an empty editor, no
+# queued input and no dialog). That is the supported way to prove an A1
+# alive or stopped and to stop it; hc's foreground/process-group reading
+# cannot see inside a Windows launcher, and keys or slash prompts cannot
+# prove an empty editor. Stock Pi is untouched by everything below.
+
+# fm_backend_hc_a1_target <target> <expected-label>
+#   Prints "<sessionId>\t<runtimeId>" when the terminal is live, carries this
+#   task's labels, reports app a1, and `a1.at` is fresh (A1's consumer
+#   contract: 90 s plus 5 s clock tolerance). Prints a reason and fails
+#   otherwise: not-a1 | identity-missing | identity-stale | foreign-terminal |
+#   not-live | terminal-unreadable.
+fm_backend_hc_a1_target() {  # <target> <expected-label>
+  local target=$1 expected=$2 json now verdict
+  case "$expected" in fm-?*) ;; *) printf 'not-a-task-label'; return 1 ;; esac
+  json=$(fm_backend_hc_get "$target" 2>/dev/null) || { printf 'terminal-unreadable'; return 1; }
+  now=$(date +%s)
+  verdict=$(printf '%s' "$json" | jq -r --arg task "$expected" --arg home "$(fm_backend_hometag)" --argjson now "$now" '
+    def uuid: type == "string" and test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$");
+    if .state != "live" then "not-live"
+    elif .labels["firstmate.task"] != $task or .labels["firstmate.home"] != $home then "foreign-terminal"
+    elif .status.app != "a1" then "not-a1"
+    elif ((.labels["a1.session"] | uuid) and (.labels["a1.runtime"] | uuid)) | not then "identity-missing"
+    elif ((.labels["a1.at"] // "") | test("^[0-9]+$") | not) then "identity-missing"
+    elif (((.labels["a1.at"] | tonumber) / 1000 | floor) as $at | ($now - $at) > 90 or ($at - $now) > 5) then "identity-stale"
+    else "ok\t" + .labels["a1.session"] + "\t" + .labels["a1.runtime"] end' 2>/dev/null) || verdict=''
+  verdict=${verdict%$'\r'}  # Windows jq ends lines with CRLF
+  case "$verdict" in
+    ok$'\t'*) printf '%s' "${verdict#ok$'\t'}" ;;
+    '') printf 'terminal-unreadable'; return 1 ;;
+    *) printf '%s' "$verdict"; return 1 ;;
+  esac
+}
+
+# fm_backend_hc_a1_api <operation> <sessionId> <runtimeId>
+#   One `a1 api` call for the exact target. Prints the raw JSON reply; fails
+#   with a reason on stdout when no reply can be trusted: a1-not-found |
+#   a1-api-timeout | malformed-response | uncorrelated-response. The reply is
+#   trusted only when version, id, command and (on success) exact target echo
+#   the request. An executable `FM_A1_BIN` overrides the `a1` found on PATH.
+fm_backend_hc_a1_api() {  # <operation> <sessionId> <runtimeId>
+  local operation=$1 session=$2 runtime=$3 a1 id request response code ok
+  if [ -n "${FM_A1_BIN:-}" ] && [ -x "${FM_A1_BIN}" ]; then a1=$FM_A1_BIN
+  else a1=$(command -v a1 2>/dev/null) || { printf 'a1-not-found'; return 1; }; fi
+  id="fm-$(date +%s)-$$-$RANDOM"
+  request=$(jq -cn --arg id "$id" --arg type "$operation" --arg session "$session" --arg runtime "$runtime" \
+    '{version:1,id:$id,type:$type,target:{scope:"session",sessionId:$session,runtimeId:$runtime}}')
+  # A1 bounds the request itself (3 s end to end); the outer timeout only guards
+  # a wedged launcher. A killed call is an unknown outcome, not a refusal.
+  response=$(MSYS_NO_PATHCONV=1 timeout 20 "$a1" api "$request" 2>/dev/null); code=$?
+  [ "$code" -ne 124 ] || { printf 'a1-api-timeout'; return 1; }
+  ok=$(printf '%s' "$response" | jq -r --arg id "$id" --arg type "$operation" --arg session "$session" --arg runtime "$runtime" '
+    if type != "object" or .version != 1 or .type != "response" then "malformed"
+    elif .id != $id or .command != $type then "uncorrelated"
+    elif .success == true and (.data.target.sessionId != $session or .data.target.runtimeId != $runtime) then "uncorrelated"
+    elif .success != true and ((.error.code | type) != "string") then "malformed"
+    else "ok" end' 2>/dev/null) || ok=malformed
+  case "${ok%$'\r'}" in
+    ok) printf '%s' "$response" ;;
+    uncorrelated) printf 'uncorrelated-response'; return 1 ;;
+    *) printf 'malformed-response'; return 1 ;;
+  esac
+}
+
+# fm_backend_hc_a1_agent_state <sessionId> <runtimeId>
+#   alive | dead | unreadable. `dead` is A1's own verdict that no live runtime
+#   holds that exact session (session-unavailable, which includes a process
+#   liveness check); every transport or limit failure stays unreadable, never
+#   a stopped agent.
+fm_backend_hc_a1_agent_state() {  # <sessionId> <runtimeId>
+  local reply code
+  reply=$(fm_backend_hc_a1_api session.lifecycle "$1" "$2") || { printf 'unreadable'; return 0; }
+  if printf '%s' "$reply" | jq -e '.success == true' >/dev/null 2>&1; then printf 'alive'; return 0; fi
+  code=$(printf '%s' "$reply" | jq -r '.error.code' 2>/dev/null)
+  case "${code%$'\r'}" in
+    session-unavailable) printf 'dead' ;;
+    *) printf 'unreadable' ;;
+  esac
+}
+
+# fm_backend_hc_a1_exit <sessionId> <runtimeId>
+#   Requests a graceful exit. Prints one verdict:
+#     admitted               A1 acknowledged status=admitted; the caller still
+#                            proves termination with fm_backend_hc_a1_agent_state.
+#     refused\t<blocker>      session-busy | editor-not-empty | pending-input |
+#                            overlay-open | session-stopping; nothing changed.
+#     unavailable\t<reason>   a1 missing, or a transport failure such as
+#                            session-unavailable; nothing was accepted.
+#     unknown\t<reason>       the request may have been admitted (timeout,
+#                            uncorrelated or unparseable answer): observe, never
+#                            retry blindly.
+fm_backend_hc_a1_exit() {  # <sessionId> <runtimeId>
+  local reply verdict
+  reply=$(fm_backend_hc_a1_api session.exit "$1" "$2") || {
+    case "$reply" in a1-not-found) printf 'unavailable\t%s' "$reply" ;; *) printf 'unknown\t%s' "$reply" ;; esac
+    return 0
+  }
+  verdict=$(printf '%s' "$reply" | jq -r '
+    if .success == true then
+      if .data.status == "admitted" and .data.lifecycle == "stopping" then "admitted" else "unknown\tunacknowledged-admission" end
+    elif (.error.code | IN("session-stopping","session-busy","editor-not-empty","pending-input","overlay-open")) then "refused\t" + .error.code
+    elif (.error.code | IN("request-expired","control-failed")) then "unknown\t" + .error.code
+    else "unavailable\t" + .error.code end' 2>/dev/null) || verdict=''
+  verdict=${verdict%$'\r'}
+  [ -n "$verdict" ] || verdict=$'unknown\tmalformed-response'
+  printf '%s' "$verdict"
 }
 
 # fm_backend_hc_group_has_agent: whether any other process in <pid>'s process

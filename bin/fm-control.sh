@@ -34,7 +34,11 @@
 #              otherwise reports `cancel=not-running` having sent one press.
 #   exit       Stop the agent, preserving its terminal endpoint, worktree, and
 #              every uncommitted change. Interrupts first when the task reads
-#              busy, then submits the harness's exit command. Postcondition:
+#              busy, then submits the harness's exit command. On the hc
+#              backend an A1 identified by its native session labels is asked
+#              to stop through its public API (`a1 api` session.exit) and
+#              proven stopped by that API; refusals are reported verbatim and
+#              never worked around. Postcondition:
 #              the backend's recovery-grade classifier reports the agent gone.
 #              Already-stopped is success (idempotent). An endpoint that reads
 #              `missing` (or, on Rex, `unreadable`, which is how a stopped Rex
@@ -711,8 +715,65 @@ retire_busy_incarnation() {
 
 # do_exit: stop the running agent, preserving endpoint and worktree. Prints
 # `already-stopped`, `endpoint-gone`, or `stopped`.
+#
+# An A1 worker on the hc backend takes its own path: A1 publishes exact
+# session/runtime identity as Core labels and answers `a1 api` for that exact
+# target, so liveness and the stop itself are proven by the runtime, never by
+# hc's foreground/process-group reading (blind inside a Windows launcher) or
+# by typed keys. A1 refuses while a turn runs, the editor holds text, input is
+# queued or a dialog is open; those refusals are reported verbatim, nothing is
+# cleared, typed or killed. An A1 whose identity labels are missing or stale
+# is refused rather than typed into.
+do_exit_a1_api() {  # <sessionId> <runtimeId>
+  local session=$1 runtime=$2 state verdict
+  state=$(fm_backend_hc_a1_agent_state "$session" "$runtime")
+  case "$state" in
+    dead) printf 'already-stopped'; return 0 ;;
+    alive) ;;
+    *) die "task $ID's A1 session cannot be reached through its API (lifecycle=$state); refusing to send any lifecycle input to an unverified runtime" ;;
+  esac
+  verdict=$(fm_backend_hc_a1_exit "$session" "$runtime")
+  case "$verdict" in
+    admitted) ;;
+    refused$'\t'*)
+      die "A1 refused to stop task $ID: ${verdict#*$'\t'}. Nothing was changed; resolve that state (a running turn, a draft, queued input or an open dialog), then retry '$VERB'"
+      ;;
+    unavailable$'\t'*)
+      die "A1 exit control is unavailable for task $ID (${verdict#*$'\t'}); no exit input was sent"
+      ;;
+    *) ;;  # possibly admitted: the wait below decides, with no second request
+  esac
+  state=$(wait_a1_state "$EXIT_WAIT" "$session" "$runtime" dead) \
+    || die "exit-delivered $ID a1-exit=${verdict#*$'\t'} agent-state=$state exit=unconfirmed; the agent did not stop within ${EXIT_WAIT}s"
+  retire_busy_incarnation
+  printf 'stopped'
+}
+wait_a1_state() {  # <timeout> <sessionId> <runtimeId> <wanted>
+  local timeout=$1 session=$2 runtime=$3 want=$4 state started=$SECONDS
+  while :; do
+    state=$(fm_backend_hc_a1_agent_state "$session" "$runtime")
+    if [ "$state" = "$want" ]; then printf '%s' "$state"; return 0; fi
+    awk -v e="$((SECONDS - started))" -v t="$timeout" 'BEGIN{exit !(e < t)}' || break
+    sleep "$POLL"
+  done
+  printf '%s' "$state"
+  return 1
+}
 do_exit() {
-  local state cmd hazard verdict composer_state cancel absence interrupt_result=not-needed dialog
+  local state cmd hazard verdict composer_state cancel absence interrupt_result=not-needed dialog a1
+  if [ "$BACKEND" = hc ] && { [ "$HARNESS" = pi ] || [ "$HARNESS" = pi-signed ]; }; then
+    # Agent-state reads run in command substitutions, so load the adapter here.
+    fm_backend_source hc || die "the HC control adapter could not be loaded for task $ID"
+    if a1=$(fm_backend_hc_a1_target "$T" "$LABEL"); then
+      do_exit_a1_api "${a1%%$'\t'*}" "${a1#*$'\t'}"
+      return
+    fi
+    case "$a1" in
+      identity-missing|identity-stale)
+        die "task $ID's terminal reports A1 but its native session identity is $a1; refusing to type into an A1 whose exact session cannot be addressed. Update or relaunch it, then retry '$VERB'"
+        ;;
+    esac
+  fi
   require_state_verified_backend exit
   fm_control_backend_exit_supported "$BACKEND" \
     || die "task $ID runs on the $BACKEND backend, whose T3 Orchestrator V2 tools have no session stop, so 'exit' cannot stop its agent; 'interrupt' ends the running turn and teardown archives the thread"
