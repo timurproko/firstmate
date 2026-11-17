@@ -51,8 +51,23 @@ case "$cmd" in
     cat "$D/$last.json"
     ;;
   rm) [ -e "$D/rm-sticks" ] || rm -f "$D/$last.json"; printf '{}\n' ;;
-  read) printf 'screen of %s\n' "$last" ;;
+  read)
+    # With <dir>/probe-pwd set, answer the last sent cwd probe the way a shell
+    # would: the echoed command, then the path between that probe's markers,
+    # wrapped over two rows with terminal padding.
+    if [ -f "$D/probe-pwd" ] && [ -f "$D/last-send" ]; then
+      pwd_out=$(cat "$D/probe-pwd")
+      half=$(( ${#pwd_out} / 2 ))
+      printf '$ %s\n' "$(cat "$D/last-send")"
+      printf '%s\r\n' "$(grep -o '__FM_HC_CWD_[A-Za-z0-9_]*_BEGIN__' "$D/last-send" | head -n 1)"
+      printf '%s\n%s   \n' "${pwd_out:0:half}" "${pwd_out:half}"
+      printf '%s\n$ \n' "$(grep -o '__FM_HC_CWD_[A-Za-z0-9_]*_END__' "$D/last-send" | head -n 1)"
+    else
+      printf 'screen of %s\n' "$last"
+    fi
+    ;;
   send)
+    printf '%s' "$last" > "$D/last-send"
     if [ -f "$D/send.exit" ]; then
       printf '{"error":{"kind":"%s"}}\n' "$(cat "$D/send.kind" 2>/dev/null || echo blocked)" >&2
       exit "$(cat "$D/send.exit")"
@@ -272,6 +287,33 @@ test_capture_and_current_path_read_the_recorded_terminal() {
   pass "hc: capture, visible capture, and current path read the recorded terminal"
 }
 
+test_current_path_asks_the_shell_behind_a_windows_launcher() {
+  local tag out
+  setup_case winpath
+  tag=$(hometag_of)
+  # Native Windows: hc's foreground is the launcher, frozen at its start cwd.
+  write_terminal "$D" t1 live fm-a1 "$tag" bash.exe 'C:\Program Files\Git\bin\bash.exe'
+  printf '/c/Users/me/.treehouse/proj-1a2b3c/1/proj' > "$D/probe-pwd"
+  out=$(hc_shell 'fm_backend_hc_current_path fmtest:t1 fm-a1')
+  assert_equals "$out" "/c/Users/me/.treehouse/proj-1a2b3c/1/proj" \
+    "behind a Windows launcher the shell's own answer is the path, rejoined across wrapped rows"
+  assert_contains "$(cat "$D/log")" $'\x1fsend\x1f' "the launcher case must ask the shell"
+
+  # A shell that never answers proves nothing: no fallback to the launcher's cwd.
+  rm -f "$D/probe-pwd" "$D/log"
+  out=$(hc_shell 'fm_backend_hc_current_path fmtest:t1 fm-a1')
+  assert_equals "$out" "" "an unanswered probe must read as unknown, never as the launcher's cwd"
+
+  # A harness reporting native status owns the terminal's input: never probe it.
+  jq '.status = {app: "a1", state: "done"}' "$D/t1.json" > "$D/t1.tmp" && mv "$D/t1.tmp" "$D/t1.json"
+  printf '/c/somewhere' > "$D/probe-pwd"
+  rm -f "$D/log"
+  out=$(hc_shell 'fm_backend_hc_current_path fmtest:t1 fm-a1')
+  assert_equals "$out" "" "with a harness status present the path is unknown"
+  assert_not_contains "$(cat "$D/log")" $'\x1fsend\x1f' "nothing may be typed into a terminal a harness reports status in"
+  pass "hc: behind a native Windows launcher, current path asks the shell and never types into a harness"
+}
+
 test_endpoint_validation_binds_hc_meta() {
   local meta out
   setup_case meta
@@ -395,6 +437,7 @@ fm_test_run \
   test_kill_proves_the_terminal_is_gone \
   test_kill_refuses_another_tasks_terminal \
   test_capture_and_current_path_read_the_recorded_terminal \
+  test_current_path_asks_the_shell_behind_a_windows_launcher \
   test_endpoint_validation_binds_hc_meta \
   test_container_ensure_gates_binary_version_and_generation \
   test_hello_survives_a_core_that_exits_on_stdin_eof \
