@@ -314,6 +314,32 @@ test_current_path_asks_the_shell_behind_a_windows_launcher() {
   pass "hc: behind a native Windows launcher, current path asks the shell and never types into a harness"
 }
 
+test_home_tag_is_derived_once_per_home() {
+  local out counter
+  setup_case hometag-memo
+  counter="$D/hash-calls"
+  # Count every hash pipeline: the adapter may derive the tag once when sourced,
+  # and never again for the same home and root, however many operations ask.
+  for tool in shasum sha256sum; do
+    cat > "$FB/$tool" <<SH
+#!/usr/bin/env bash
+printf x >> "$counter"
+printf '%s  -
+' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+SH
+    chmod +x "$FB/$tool"
+  done
+  out=$(hc_shell 'a=$(fm_backend_hometag); b=$(fm_backend_hometag); c=$(fm_backend_hc_scoped_label fm-a1)
+    bash -c ". \"'"$FM_TEST_ROOT"'/bin/fm-backend.sh\"; fm_backend_source hc; fm_backend_hometag >/dev/null"
+    printf "%s %s %s
+" "$a" "$b" "$c"
+    FM_HOME="$FM_HOME/other"; printf "%s
+" "$(fm_backend_hometag)"')
+  assert_contains "$out" "firstmate-01234567 firstmate-01234567 firstmate-01234567-fm-a1" "the memoized tag is the derived tag"
+  assert_equals "$(wc -c < "$counter" | tr -d ' ')" 2     "one derivation for the sourced home (shared with a child script), one for a different home"
+  pass "hc: the home tag is derived once per home and root, in this shell and its children"
+}
+
 test_endpoint_validation_binds_hc_meta() {
   local meta out
   setup_case meta
@@ -437,7 +463,7 @@ fm_test_run \
   test_kill_proves_the_terminal_is_gone \
   test_kill_refuses_another_tasks_terminal \
   test_capture_and_current_path_read_the_recorded_terminal \
-  test_current_path_asks_the_shell_behind_a_windows_launcher \
+  test_current_path_asks_the_shell_behind_a_windows_launcher   test_home_tag_is_derived_once_per_home \
   test_endpoint_validation_binds_hc_meta \
   test_container_ensure_gates_binary_version_and_generation \
   test_hello_survives_a_core_that_exits_on_stdin_eof \

@@ -50,6 +50,9 @@
 
 # shellcheck source=bin/fm-backend-hometag-lib.sh
 . "$FM_BACKEND_LIB_DIR/fm-backend-hometag-lib.sh"
+# Every hc operation labels or verifies a terminal with the home tag, several
+# times per command; derive it once for this shell and its children.
+fm_backend_hometag_memoize
 # shellcheck source=bin/fm-composer-lib.sh
 . "$FM_BACKEND_LIB_DIR/fm-composer-lib.sh"
 # shellcheck source=bin/fm-agent-process-lib.sh
