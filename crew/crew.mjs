@@ -369,11 +369,15 @@ function cmdFinish(args) {
   if (task.terminal && terminal(task.terminal)) { hc(['kill', task.terminal]); hc(['rm', task.terminal]); }
   if (terminal(task.terminal)) refuse(`Core still has terminal ${task.terminal}; the working copy was kept.`, 6);
   const project = h.config.projects[task.project];
-  if (project && fs.existsSync(task.worktree)) {
-    let removed = run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
-    for (let i = 0; removed.code !== 0 && i < 5; i++) { sleep(1000); removed = run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]); }
-    if (removed.code !== 0) refuse(`The terminal is closed, but the working copy could not be removed: ${removed.stderr.trim()}`, 6);
+  // Removing a working copy can fail on the first try while the closed terminal's processes
+  // let go of the folder, and a failed try may already have detached it from git. So: ask
+  // git, and whatever it says, make sure the folder is gone and git's list is pruned.
+  for (let i = 0; fs.existsSync(task.worktree) && i < 8; i++) {
+    if (project) run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
+    if (fs.existsSync(task.worktree)) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { sleep(1000); } }
   }
+  if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
+  if (fs.existsSync(task.worktree)) refuse(`The terminal is closed, but the working copy is still in use and could not be removed: ${task.worktree}`, 6);
   saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
   console.log(`finished ${id} (${result.how}); report kept at ${task.report}`);
 }
