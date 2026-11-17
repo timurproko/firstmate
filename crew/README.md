@@ -35,6 +35,9 @@ crew status [--all] [--json]             tasks and their terminals
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               stop it, remove its terminal and working copy
 crew done [<id>]                         (worker) my report is written
+crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
+crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
+crew update | crew rollback              bring this machine's crew up to date, or back one step
 ```
 
 The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), written by
@@ -66,6 +69,36 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
 | `claude` | `claude "<instruction>"` | terminal closed when idle |
 
 Adding one is a line in `AGENTS` in `crew.mjs`.
+
+## Crew repairs itself
+
+A defect in crew is handled like any other work: a worker fixes it on a branch, in a copy
+of crew's own source. The coordinator's rules tell it to do this instead of working around
+the defect, and without asking the person.
+
+| Command | What it does |
+| --- | --- |
+| `crew fix "<problem>"` | Starts a fixer (`fix-1`, `fix-2`, …) on crew's source. One at a time. Recent crash records are attached. |
+| `crew selfmerge <id>` | Publishes the repair to `main` of the source and updates this machine. |
+| `crew update` | Fast-forwards this machine's crew to the published `main`. |
+| `crew rollback` | Puts this machine back on the revision before its last update. |
+
+`crew selfmerge` is the only gate, so it refuses unless all of this holds: the fixer
+reported; nothing is uncommitted; the branch rebases cleanly onto the published `main`; every
+changed file is under `crew/`; and `node crew/crew.test.mjs` exits 0 in the fixer's copy. The
+push is an ordinary one (never forced), with the machine's own git credentials.
+
+The copy Herdr installed (`~/.crew/tool`) fast-forwards itself at each `crew start`, so a
+repair published from one machine reaches the others at their next session. A developer's
+checkout never updates itself. After `crew rollback` the machine stays on the older revision
+until something newer than the one it left is published. `crew start` also rewrites the
+home's `AGENTS.md` when the rules of the running version differ, so do not keep notes there.
+
+A command that fails with an unexpected error exits 70 and writes a record to
+`~/.crew/crashes/`.
+
+What this does not protect against: a repair that passes the suite and is still wrong. It
+reaches every machine at its next session; `crew rollback` is per machine.
 
 ## Limits
 
