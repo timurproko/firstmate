@@ -40,8 +40,10 @@ const setTerminal = (address, patch) => { const w = readWorld(); Object.assign(w
 
 const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), fakeUser = path.join(root, 'user');
 fs.mkdirSync(fakeUser);
+const claudeConfig = path.join(root, 'claude.json');
+fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
 function crew(args, { terminal, cwd = homeDir } = {}) {
-  const env = { ...process.env, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
+  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -126,7 +128,27 @@ try {
   setTerminal('c1', { state: 'finished' });
   r = crew(['start'], { terminal: 'c2' }); assert.equal(r.code, 0); assert.match(r.out, /unfinished tasks: t3\[working\]/);
   assert.equal(crew(['finish', 't3'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish and owner takeover');
+  // Claude Code: the instruction comes before its options, and it keeps its permission system.
+  assert.equal(crew(['spawn', 'tc', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' }).code, 0);
+  const claudeLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
+  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,Read,Edit,Write,Glob,Grep'; exec bash"), claudeLine);
+  assert.ok(!claudeLine.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
+  // Its copy is recorded as trusted in Claude's config, beside what was there; a1/pi copies are not.
+  const copyKey = slash(path.join(copies, 'tc'));
+  let cc = JSON.parse(fs.readFileSync(claudeConfig, 'utf8'));
+  assert.deepEqual(cc.projects[copyKey], { hasTrustDialogAccepted: true, crewWorkerCopy: true });
+  assert.deepEqual([cc.theme, cc.projects['C:/mine']], ['dark', { hasTrustDialogAccepted: true, history: [1] }], 'Nothing else in the config is touched');
+  assert.deepEqual(Object.keys(cc.projects).length, 2, 'Only the Claude worker got an entry');
+  assert.equal(crew(['finish', 'tc', '--force'], { terminal: 'c2' }).code, 0);
+  cc = JSON.parse(fs.readFileSync(claudeConfig, 'utf8'));
+  assert.deepEqual(Object.keys(cc.projects), ['C:/mine'], 'Finish removes the entry crew made and no other');
+  // A config crew cannot parse is never overwritten; the worker still starts.
+  fs.writeFileSync(claudeConfig, '{ not json');
+  const r2 = crew(['spawn', 'td', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' });
+  assert.equal(r2.code, 0); assert.match(r2.out, /could not record the working copy as trusted/);
+  assert.equal(fs.readFileSync(claudeConfig, 'utf8'), '{ not json');
+  assert.equal(crew(['finish', 'td', '--force'], { terminal: 'c2' }).code, 0);
+  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command and its folder trust');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

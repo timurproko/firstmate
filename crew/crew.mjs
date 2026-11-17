@@ -21,10 +21,14 @@ export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'home');
 // --- agents ------------------------------------------------------------------
 // The only per-agent knowledge: how to start it with one instruction, and how it can be
 // asked to leave. `close` means the terminal is closed once the agent is no longer working.
+// `args` follow the instruction: Claude Code reads a prompt placed after --allowedTools as
+// one more tool name. A Claude worker keeps its permission system; it is only told up front
+// that editing files and using its ordinary tools inside its own working copy is expected,
+// so it does not stop to ask for each one. Folder trust: see trustClaudeFolder below.
 export const AGENTS = {
   a1: { command: 'a1', exit: 'a1-api' },
   pi: { command: 'pi', exit: 'close' },
-  claude: { command: 'claude', exit: 'close' },
+  claude: { command: 'claude', exit: 'close', trust: 'claude', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,Read,Edit,Write,Glob,Grep'] },
 };
 
 // --- small helpers -----------------------------------------------------------
@@ -120,6 +124,42 @@ function requireOwner(h) {
   if (owner && live) refuse(`Read-only: this home is owned by terminal ${owner.terminal}. Only that session may change it.`, 3);
   refuse('This session does not hold the home. Run `crew start` first.', 3);
 }
+
+// --- Claude Code folder trust ---------------------------------------------------
+// Claude Code asks "do you trust this folder?" for every new path whose project carries
+// Claude settings, and a worker's copy is always a new path, so every Claude worker would
+// stop at a dialog nobody is watching. Registering a project with `crew project add` is
+// the person's decision that agents may work on it; a worker's copy is that same code. So
+// crew records the copy as trusted in Claude's own config before starting the worker, the
+// way Claude itself records an accepted dialog, and removes the entry again at finish.
+// This means the project's Claude settings (hooks included) load in the worker unasked.
+const claudeConfigFile = () => process.env.CREW_CLAUDE_CONFIG || path.join(os.homedir(), '.claude.json');
+function editClaudeProjects(edit) {
+  const file = claudeConfigFile();
+  let config;
+  try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
+    if (error.code !== 'ENOENT') return false; // unreadable or not JSON: never overwrite it
+    config = {};
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return false;
+  if (!config.projects || typeof config.projects !== 'object') config.projects = {};
+  if (!edit(config.projects)) return true;
+  const tmp = `${file}.crew-${process.pid}.tmp`;
+  try { fs.writeFileSync(tmp, JSON.stringify(config, null, 2)); fs.renameSync(tmp, file); return true; }
+  catch { fs.rmSync(tmp, { force: true }); return false; }
+}
+export const trustClaudeFolder = folder => editClaudeProjects(projects => {
+  const key = slash(folder);
+  if (projects[key]?.hasTrustDialogAccepted === true) return false;
+  projects[key] = { ...(projects[key] ?? {}), hasTrustDialogAccepted: true, crewWorkerCopy: true };
+  return true;
+});
+const forgetClaudeFolder = folder => editClaudeProjects(projects => {
+  const key = slash(folder);
+  if (!projects[key]?.crewWorkerCopy) return false; // only entries crew made
+  delete projects[key];
+  return true;
+});
 
 // --- commands ----------------------------------------------------------------
 const COORDINATOR_RULES = `# Crew coordinator
@@ -248,13 +288,14 @@ function cmdSpawn(args) {
   if (wt.code !== 0) { saveTask(h, { ...record, state: 'failed', error: wt.stderr.trim().slice(0, 400) }); refuse(`Could not create the working copy: ${wt.stderr.trim()}`, 5); }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report }));
 
+  if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   // The agent starts with one instruction as its argument, so nothing is typed into it and
   // there is no race with its startup. The shell stays afterwards so the terminal survives
   // the agent leaving; `crew finish` removes it.
   const instruction = `Read the brief at ${brief} and carry it out exactly.`;
   const line = [
     `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
-    `${shq(agent.command)} ${shq(instruction)}`,
+    [agent.command, instruction, ...(agent.args ?? [])].map(shq).join(' '),
     'exec bash --login -i',
   ].join('; ');
   const tag = h.config.tag;
@@ -382,6 +423,7 @@ function cmdFinish(args) {
     if (fs.existsSync(task.worktree)) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { sleep(1000); } }
   }
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
+  if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
   // An emptied folder that something still sits in (a helper process the agent left behind)
   // is not worth failing for: the work is gone from disk and from git; say so and move on.
   let leftover = '';
