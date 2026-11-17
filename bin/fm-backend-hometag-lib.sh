@@ -31,6 +31,11 @@ FM_BACKEND_HOMETAG_SECONDMATE_MARKER=".fm-secondmate-home"
 
 fm_backend_hometag() {
   local marker="$FM_HOME/$FM_BACKEND_HOMETAG_SECONDMATE_MARKER" id prefix root hash
+  # A tag memoized for exactly this home and root (fm_backend_hometag_memoize)
+  # is the answer: the derivation below spawns a hash pipeline on every call.
+  case "${FM_BACKEND_HOMETAG_MEMO:-}" in
+    "$FM_HOME|$FM_ROOT|"?*) printf '%s' "${FM_BACKEND_HOMETAG_MEMO#"$FM_HOME|$FM_ROOT|"}"; return 0 ;;
+  esac
   if [ -f "$marker" ]; then
     id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
     if [ -n "$id" ]; then
@@ -50,4 +55,22 @@ fm_backend_hometag() {
     hash=$(printf '%s' "$root" | cksum | awk '{printf "%08x", $1}')
   fi
   printf '%s-%s' "$prefix" "$hash"
+}
+
+# fm_backend_hometag_memoize: derive the tag once in the CALLING shell and
+# export it, keyed by the exact FM_HOME and FM_ROOT it was derived for. Most
+# callers read the tag inside a command substitution, where nothing they compute
+# survives, so an adapter that asks for it many times per command (hc labels and
+# verifies every terminal with it) calls this once when it is sourced. Child
+# scripts inherit the export; a different home or root never matches the key and
+# derives its own.
+fm_backend_hometag_memoize() {
+  local tag
+  case "${FM_BACKEND_HOMETAG_MEMO:-}" in
+    "${FM_HOME:-}|${FM_ROOT:-}|"?*) return 0 ;;
+  esac
+  [ -n "${FM_HOME:-}" ] && [ -n "${FM_ROOT:-}" ] || return 0
+  tag=$(fm_backend_hometag) || return 0
+  [ -n "$tag" ] || return 0
+  export FM_BACKEND_HOMETAG_MEMO="$FM_HOME|$FM_ROOT|$tag"
 }
