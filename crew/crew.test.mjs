@@ -40,7 +40,7 @@ const setTerminal = (address, patch) => { const w = readWorld(); Object.assign(w
 
 const homeDir = path.join(root, 'home'), project = path.join(root, 'project');
 function crew(args, { terminal, cwd = homeDir } = {}) {
-  const env = { ...process.env, CREW_HC: fake, CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
+  const env = { ...process.env, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -74,7 +74,9 @@ try {
   }
   r = crew(['spawn', 't1', '--project', 'demo', '--agent', 'pi', 'Count the lines of README.md.'], { terminal: 'c1' });
   assert.equal(r.code, 0, r.out); assert.match(r.out, /spawned t1: pi scout in terminal t1/);
-  const wt = path.join(homeDir, 'worktrees', 't1');
+  const copies = path.join(root, 'copies', JSON.parse(fs.readFileSync(path.join(homeDir, 'crew.json'), 'utf8')).tag);
+  const wt = path.join(copies, 't1');
+  assert.ok(!slash(wt).startsWith(slash(homeDir) + '/'), 'A working copy is never inside the home, where the coordinator rules live');
   assert.equal(fs.readFileSync(path.join(wt, 'README.md'), 'utf8').replace(/\r/g, ''), 'one\ntwo\n');
   const call = readWorld().log.find(a => a[0] === 'run');
   for (const want of ['--bg', '--keep', '--no-parent', '--no-notify', 'crew.task=t1', 'herdr.right-click=menu']) assert.ok(call.includes(want), want);
@@ -96,7 +98,7 @@ try {
   assert.equal(crew(['spawn', 't2', '--project', 'demo', 'x'], { terminal: 'c1' }).code, 0);
   setTerminal('t2', { status: { app: 'pi', state: 'working' } });
   r = crew(['finish', 't2'], { terminal: 'c1' }); assert.equal(r.code, 6); assert.match(r.out, /still working/);
-  assert.ok(fs.existsSync(path.join(homeDir, 'worktrees', 't2')), 'A refused finish removes nothing');
+  assert.ok(fs.existsSync(path.join(copies, 't2')), 'A refused finish removes nothing');
   r = crew(['wait', 't2', '--timeout', '1'], { terminal: 'c1' }); assert.equal(r.code, 124); assert.match(r.out, /still working after 1s/);
   setTerminal('t2', { state: 'finished' });
   r = crew(['wait', 't2', '--timeout', '20'], { terminal: 'c1' }); assert.equal(r.code, 0); assert.match(r.out, /== t2: failed - The worker terminal ended without a report/);
