@@ -571,6 +571,28 @@ else if (a[0] === 'get') {
   fs.rmSync(ghDown);
   for (const id of ['g0', 'g1', 'g2']) assert.equal(tl(['finish', id, '--force']).code, 0, id);
 
+  // show: the page is opened by lavish-axi, and its address goes on the terminal as the labels
+  // Herdr's status bar reads, so the person can open it from wherever they sit.
+  const fakeLavish = path.join(root, 'fake-lavish.mjs'), page = path.join(root, 'report.html');
+  fs.writeFileSync(page, '<h1>Report</h1>');
+  fs.writeFileSync(fakeLavish, `const a = process.argv.slice(2);
+if (a[0] === '--version') console.log('0.1.96');
+else if (a[0].endsWith('broken.html')) { console.error('error: the user ended this session'); process.exit(1); }
+else console.log('session: opened\\nurl: "http://127.0.0.1:4387/session/d849b898fa86dff9"\\nfile: ' + a[0]);
+`);
+  const L = { CREW_TOOL_LAVISH_AXI: fakeLavish };
+  assert.equal(crew(['show'], { terminal: 'c2', env: L }).code, 2);
+  assert.equal(crew(['show', path.join(root, 'none.html')], { terminal: 'c2', env: L }).code, 2);
+  assert.equal(crew(['show', page], { terminal: 'c2' }).code, 4, 'No lavish-axi, no page');
+  r = crew(['show', page], { terminal: 'c2', env: L }); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /shown: http:\/\/127\.0\.0\.1:4387\/session\/d849b898fa86dff9\n.*Lavish link in the status bar/);
+  assert.deepEqual(readWorld().log.filter(a => a[0] === 'label').slice(-2), [['label', 'c2', 'custom.preview.url=http://127.0.0.1:4387/session/d849b898fa86dff9'], ['label', 'c2', 'custom.preview.label=Lavish']]);
+  const before = readWorld().log.length;
+  r = crew(['show', page], { env: L }); assert.equal(r.code, 0); assert.match(r.out, /not a Herdr terminal/);
+  assert.equal(readWorld().log.length, before, 'Outside a terminal nothing is labelled');
+  fs.writeFileSync(path.join(root, 'broken.html'), 'x');
+  r = crew(['show', path.join(root, 'broken.html')], { terminal: 'c2', env: L }); assert.equal(r.code, 4); assert.match(r.out, /did not open the page: error: the user ended this session/);
+
   console.log('PASS: Firstmate\'s tools (list, backlog, treehouse copies, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
