@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -201,6 +201,21 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
   \`hc read <terminal> --lines 80\`, then either spawn a fresh worker or tell the person.
 - \`crew project list\` shows the projects you may use. Ask before adding one.
 - When you are done for the session, run \`crew end\`.
+
+## When crew itself is wrong
+A crew command that prints \`internal error\`, or that plainly does something other than what
+these rules and \`crew --help\` say, is a defect in crew, not in the project. Do not work
+around it by hand and never edit crew's own files yourself.
+1. \`crew fix "<the command you ran, what happened, what you expected>"\` starts a fixer on
+   crew's own source. Then \`crew wait <fix id>\`.
+2. \`crew selfmerge <fix id>\` publishes the repair by itself, without asking the person, but
+   only if it stays inside crew's folder and crew's whole test suite passes. It then updates
+   this machine; other machines update when their next session starts.
+3. \`crew finish <fix id>\`, retry the command that failed, and go on with the work.
+4. Tell the person in one line what was wrong and that it is repaired.
+- If \`crew selfmerge\` refuses, read why. Finish that fix and start one new \`crew fix\` that
+  includes the refusal. After two refused repairs of the same problem, stop and tell the person.
+- If crew got worse right after an update, run \`crew rollback\` and tell the person.
 `;
 
 function cmdInit(args) {
@@ -261,10 +276,31 @@ function cmdStart() {
   const h = home();
   const mine = me();
   if (!mine) refuse('crew start must run inside a Herdr terminal (no HC_TERMINAL_ID).', 3);
+  // The installed tool brings itself up to date here, once per session, so a fix published
+  // from any machine reaches this one without anybody installing it. The command then runs
+  // again as the new version. A machine that went back after a bad update stays where it is
+  // until something newer than that bad revision is published.
+  if (installedCopy() && !process.env.CREW_NO_UPDATE) {
+    const u = updateTool({ respectPin: true });
+    if (u.pinned) console.log(`crew stays at ${short(toolRevision())} after a rollback from ${short(u.pinned)}; \`crew update\` returns to the latest.`);
+    else if (u.failed) console.log(`crew did not check for updates: ${u.note}`);
+    else if (u.changed) {
+      console.log(`crew updated itself ${short(u.from)} -> ${short(u.revision)}`);
+      const again = spawnSync(process.execPath, [fileURLToPath(import.meta.url), 'start'], { stdio: 'inherit', env: { ...process.env, CREW_NO_UPDATE: '1' } });
+      process.exitCode = again.status ?? 1;
+      return;
+    }
+  }
   const { owner, live, unknown } = ownerState(h);
   if (owner && unknown && owner.terminal !== mine) refuse(`${CORE_SILENT} the owner terminal ${owner.terminal}, so this home was not taken over. Try again.`, 4);
   if (owner && live && owner.terminal !== mine) refuse(`Read-only: this home is owned by live terminal ${owner.terminal}.`, 3);
   writeJson(h.owner, { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined });
+  // The rules file belongs to the tool: a newer crew may have changed what a coordinator does.
+  const rules = path.join(h.dir, 'AGENTS.md');
+  if (fs.existsSync(rules) && fs.readFileSync(rules, 'utf8') !== COORDINATOR_RULES) {
+    fs.writeFileSync(rules, COORDINATOR_RULES);
+    console.log(`the coordinator rules changed with this crew version: read ${slash(rules)} again before going on`);
+  }
   const open = allTasks(h).filter(t => t.state !== 'closed');
   console.log(`you hold ${slash(h.dir)} (terminal ${mine})`);
   console.log(open.length ? `unfinished tasks: ${open.map(t => `${t.id}[${t.state}]`).join(' ')}` : 'no unfinished tasks');
@@ -331,11 +367,15 @@ function cmdSpawn(args) {
   const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
   if (fs.existsSync(taskDir(h, id))) refuse(`Task ${id} already exists.`);
+  launchWorker(h, { id, opts, agent, project, task });
+}
 
+// Creates the task, its working copy and its terminal. `extra` is kept on the task record.
+function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   const dir = taskDir(h, id), worktree = slash(path.join(h.worktrees, id)), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
-  const record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null };
+  const record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null, ...extra };
   saveTask(h, record);
 
   const wt = opts.kind === 'ship'
@@ -496,7 +536,8 @@ function cmdFinish(args) {
   if (task.state === 'closed') { console.log(`${id} is already closed`); return; }
   const result = stopWorker(task, { force });
   if (!result.stopped) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
-  const project = h.config.projects[task.project];
+  // A self-fix works on crew's own source, which is not a registered project.
+  const project = task.projectPath ? { path: task.projectPath } : h.config.projects[task.project];
   // Work that exists only in the working copy is lost when the copy goes: a ship task's
   // branch keeps commits, nothing keeps uncommitted or untracked files. So a ship task
   // with such files is not cleaned up unless discarding them was asked for. (A scout is
@@ -525,6 +566,8 @@ function cmdFinish(args) {
     if (fs.existsSync(task.worktree)) sleep(1000);
   }
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
+  // A published self-fix is on main; its branch has nothing left to keep.
+  if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', `crew/${id}`]);
   if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
   // An emptied folder that something still sits in (a helper process the agent left behind)
   // is not worth failing for: the work is gone from disk and from git; say so and move on.
@@ -535,6 +578,147 @@ function cmdFinish(args) {
   }
   saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
   console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}`);
+}
+
+// --- crew maintains itself -------------------------------------------------------
+// A defect in crew is repaired the way any other work is done: by a worker, on a branch, in
+// its own copy - here a copy of crew's own source. `crew selfmerge` is the only gate between
+// that branch and every machine, so it checks what it can check without a person: the change
+// stays inside crew/, it sits on top of the published main, and the whole test suite passes.
+// Machines pick the result up at their next `crew start`; `crew rollback` undoes it locally.
+const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || path.join(HERE, '..')));
+const STATE = path.join(os.homedir(), '.crew');
+const PREVIOUS = path.join(STATE, 'tool-previous'), PINNED = path.join(STATE, 'tool-pinned'), CRASHES = path.join(STATE, 'crashes');
+const SELF_PROJECT = 'crew:self'; // not a valid project name, so it can never be a registered one
+const toolGit = (...args) => run('git', ['-C', TOOL_ROOT, ...args], { timeout: 120000 });
+const toolRevision = () => { const r = toolGit('rev-parse', 'HEAD'); return r.code === 0 ? r.stdout.trim() : null; };
+const short = revision => String(revision ?? '').slice(0, 8) || 'unknown';
+const lastLine = text => String(text ?? '').trim().split(/\r?\n/).filter(Boolean).at(-1) ?? 'no message';
+const readLine = file => { try { return fs.readFileSync(file, 'utf8').trim() || null; } catch { return null; } };
+const isClone = () => fs.existsSync(path.join(TOOL_ROOT, '.git'));
+// Only the copy Herdr installed updates itself; a developer's checkout is left alone.
+const installedCopy = () => process.env.CREW_AUTO_UPDATE === '1' || slash(path.resolve(STATE, 'tool')).toLowerCase() === TOOL_ROOT.toLowerCase();
+
+// Fast-forwards the tool to the published main. Never merges, rebases or discards anything.
+function updateTool({ respectPin = false } = {}) {
+  if (!isClone()) return { failed: true, note: `${TOOL_ROOT} is not a git clone` };
+  const before = toolRevision();
+  const fetched = toolGit('fetch', '--quiet', 'origin', 'main');
+  if (fetched.code !== 0) return { failed: true, note: `the source could not be reached (${lastLine(fetched.stderr)})` };
+  const target = toolGit('rev-parse', 'origin/main').stdout.trim();
+  const pinned = readLine(PINNED);
+  if (pinned && respectPin && pinned === target) return { pinned };
+  if (pinned) fs.rmSync(PINNED, { force: true });
+  if (!target || target === before) return { changed: false, revision: before };
+  if (toolGit('merge-base', '--is-ancestor', before, target).code !== 0) return { failed: true, note: 'this copy has commits the published main does not have; it was left as it is' };
+  const merged = toolGit('merge', '--ff-only', '--quiet', target);
+  if (merged.code !== 0) return { failed: true, note: lastLine(merged.stderr) };
+  fs.mkdirSync(STATE, { recursive: true });
+  fs.writeFileSync(PREVIOUS, `${before}\n`);
+  return { changed: true, from: before, revision: target };
+}
+
+function cmdUpdate() {
+  const u = updateTool();
+  if (u.failed) refuse(`crew was not updated: ${u.note}`, 4);
+  console.log(u.changed ? `crew updated ${short(u.from)} -> ${short(u.revision)}` : `crew is up to date (${short(u.revision)})`);
+}
+
+function cmdRollback() {
+  const previous = readLine(PREVIOUS), current = toolRevision();
+  if (!previous || !current) refuse('No earlier crew revision is recorded on this machine.');
+  if (previous === current) refuse(`crew is already at ${short(previous)}.`);
+  if (toolGit('status', '--porcelain', '--untracked-files=no').stdout.trim()) refuse(`${TOOL_ROOT} has uncommitted changes; nothing was rolled back.`, 6);
+  const back = toolGit('reset', '--hard', '--quiet', previous);
+  if (back.code !== 0) refuse(`Could not go back to ${short(previous)}: ${lastLine(back.stderr)}`, 6);
+  fs.writeFileSync(PINNED, `${current}\n`);
+  fs.rmSync(PREVIOUS, { force: true });
+  console.log(`crew went back ${short(current)} -> ${short(previous)} on this machine. It stays there until something newer than ${short(current)} is published, or until \`crew update\`.`);
+}
+
+function recordCrash(argv, error) {
+  try {
+    fs.mkdirSync(CRASHES, { recursive: true });
+    const file = path.join(CRASHES, `${now().replace(/[:.]/g, '-')}-${process.pid}.txt`);
+    fs.writeFileSync(file, [`crew ${VERSION} at ${short(toolRevision())} (${TOOL_ROOT})`, `when: ${now()}`, `platform: ${process.platform}, node ${process.version}`,
+      `command: crew ${argv.join(' ')}`, `folder: ${slash(process.cwd())}`, '', String(error?.stack ?? error), ''].join('\n'));
+    return file;
+  } catch { return null; }
+}
+function recentCrashes() {
+  try {
+    return fs.readdirSync(CRASHES).filter(n => n.endsWith('.txt')).sort().slice(-3).map(n => path.join(CRASHES, n))
+      .filter(f => Date.now() - fs.statSync(f).mtimeMs < 24 * 3600 * 1000);
+  } catch { return []; }
+}
+
+function cmdFix(args) {
+  const h = home();
+  requireOwner(h);
+  const opts = { kind: 'ship', agent: process.env.CREW_FIX_AGENT || 'a1', project: SELF_PROJECT }, words = [];
+  for (let i = 0; i < args.length; i++) { if (args[i] === '--agent') opts.agent = args[++i]; else words.push(args[i]); }
+  const problem = words.join(' ').trim();
+  if (!problem) refuse(`Usage: crew fix [--agent ${Object.keys(AGENTS).join('|')}] "<what you ran, what happened, what you expected>"`);
+  const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  if (!isClone()) refuse(`crew's own source (${TOOL_ROOT}) is not a git clone, so it cannot be repaired from here.`);
+  // One repair at a time: two fixers on the same few files would only undo each other.
+  const open = allTasks(h).filter(t => t.selfFix && t.state !== 'closed');
+  if (open.length) refuse(`A repair is already open: ${open.map(t => `${t.id}[${t.state}]`).join(' ')}. Wait for it and merge or finish it first.`);
+  let n = 1;
+  while (fs.existsSync(taskDir(h, `fix-${n}`))) n++;
+  const id = `fix-${n}`, crashes = recentCrashes();
+  const task = [
+    'Repair a defect in the crew tool itself. This working copy is crew\'s own source: the tool is `crew/crew.mjs`, its tests are `crew/crew.test.mjs`, its design is in `crew/README.md`.',
+    '', '## The problem, as the coordinator saw it', problem,
+    ...(crashes.length ? ['', '## Crash records from this machine (read them)', ...crashes.map(f => `- \`${slash(f)}\``)] : []),
+    '', '## What to do',
+    '1. Find the cause in `crew/crew.mjs`. Say so in the report if the problem is not a defect in crew.',
+    '2. Add a check to `crew/crew.test.mjs` that fails because of the defect, then make the smallest change that fixes it.',
+    '3. Change files under `crew/` only. A change anywhere else is rejected unseen.',
+    '4. Run `node crew/crew.test.mjs` and keep going until it exits 0. The fix is published only if the whole suite passes.',
+    '5. Commit on this branch. Do not push: the coordinator publishes it with `crew selfmerge`.',
+    '6. In the report give the cause, the change and the new check, each in a line or two.',
+  ].join('\n');
+  launchWorker(h, { id, opts, agent, project: { path: TOOL_ROOT }, task, extra: { selfFix: true, projectPath: TOOL_ROOT, base: toolRevision() } });
+  console.log(`next: crew wait ${id}, then crew selfmerge ${id}`);
+}
+
+function cmdSelfmerge(args) {
+  const h = home();
+  requireOwner(h);
+  const id = args[0], task = loadTask(h, id);
+  if (!task.selfFix) refuse(`Task ${id} is not a repair of crew; \`crew selfmerge\` publishes only those.`);
+  if (task.merged) { console.log(`${id} is already published as ${short(task.merged)}`); return; }
+  if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; a repair is published only after its worker reported.`);
+  const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
+  const no = (why, code = 6) => refuse(`Repair ${id} was not published: ${why}`, code);
+  if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone.`);
+  const dirty = git('status', '--porcelain');
+  if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). The fixer must commit or remove them.`);
+  const fetched = git('fetch', '--quiet', 'origin', 'main');
+  if (fetched.code !== 0) no(`the source could not be reached (${lastLine(fetched.stderr)}). Try again.`, 4);
+  // On top of what is published now, so a fix made on another machine meanwhile is kept.
+  const rebased = git('rebase', '--quiet', 'origin/main');
+  if (rebased.code !== 0) { git('rebase', '--abort'); no(`it does not apply on top of the published main (${lastLine(rebased.stderr || rebased.stdout)}). Finish it and start a new repair.`); }
+  const files = git('diff', '--name-only', 'origin/main', 'HEAD').stdout.split(/\r?\n/).filter(Boolean);
+  if (!files.length) no('it changes nothing compared with the published main.');
+  const outside = files.filter(f => !f.startsWith('crew/'));
+  if (outside.length) no(`it changes files outside crew/ (${outside.slice(0, 5).join(', ')}). A repair may only touch crew's own folder.`);
+  // The suite runs as it would on a clean machine: nothing of this session leaks into it.
+  const command = process.env.CREW_SELFTEST || 'node crew/crew.test.mjs';
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
+  const tested = run(command, [], { shell: true, cwd: wt, env, timeout: 15 * 60 * 1000 });
+  if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
+  const revision = git('rev-parse', 'HEAD').stdout.trim();
+  // An ordinary push: if main moved in these seconds it is refused, and the next try rebases again.
+  const pushed = git('push', '--quiet', 'origin', 'HEAD:main');
+  if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}). Run \`crew selfmerge ${id}\` again.`, 4);
+  saveTask(h, { ...loadTask(h, id), merged: revision, mergedAt: now() });
+  console.log(`published ${id} as ${short(revision)} (${files.length} file${files.length === 1 ? '' : 's'}: ${files.slice(0, 5).join(', ')}); tests passed`);
+  const u = updateTool();
+  console.log(u.changed ? `this machine now runs ${short(u.revision)} (was ${short(u.from)}); \`crew rollback\` goes back`
+    : u.failed ? `this machine was not updated: ${u.note}. Run \`crew update\`.` : `this machine already runs ${short(u.revision)}`);
+  console.log(`other machines update at their next \`crew start\`. Now: crew finish ${id}, then retry what failed.`);
 }
 
 function taskElapsedSeconds(task, currentTime) {
@@ -572,7 +756,8 @@ function cmdStatus(args) {
   for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.agent}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.error ? `\t${t.error}` : ''}`);
 }
 
-const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus };
+const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
+  fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew/home)
   crew project add <name> <git folder>     register a project   (crew project list)
@@ -583,7 +768,10 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew status [--all] [--json]             tasks and their terminals
   crew stop <id> [--force]                 ask the worker to leave
   crew finish <id> [--force]               stop it, remove its terminal and working copy
-  crew done [<id>]                         (worker) my report is written`;
+  crew done [<id>]                         (worker) my report is written
+  crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
+  crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
+  crew update | crew rollback              bring this machine's crew up to date, or back one step`;
 
 export function main(argv) {
   const [name, ...args] = argv;
@@ -591,9 +779,17 @@ export function main(argv) {
   const command = COMMANDS[name];
   if (!command) { console.log(USAGE); process.exitCode = name && name !== '--help' && name !== 'help' ? 2 : 0; return; }
   try { command(args); } catch (error) {
-    if (!(error instanceof Refusal)) throw error;
-    console.error(`crew: ${error.message}`);
-    process.exitCode = error.exitCode;
+    if (error instanceof Refusal) {
+      console.error(`crew: ${error.message}`);
+      process.exitCode = error.exitCode;
+      return;
+    }
+    // Anything else is a defect in crew. It is written down where a fixer will find it.
+    const record = recordCrash(argv, error);
+    console.error(`crew: internal error - ${error?.message ?? error}`);
+    console.error(`This is a defect in crew itself, not in the task.${record ? ` Record: ${slash(record)}` : ''}`);
+    console.error('To have it repaired: crew fix "<what you ran and what you expected>"');
+    process.exitCode = 70;
   }
 }
 
