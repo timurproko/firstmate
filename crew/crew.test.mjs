@@ -569,7 +569,19 @@ else if (a[0] === 'get') {
   assert.notEqual(spawnSync('git', ['-C', projectOrigin, 'rev-parse', '--verify', '-q', 'crew/g1']).status, 0, 'crew pushed nothing itself');
   assert.match(fs.readFileSync(path.join(homeDir, 'backlog.md'), 'utf8'), /- \[x\] g1 .*\(done https:\/\/github\.com\/acme\/demo\/pull\/9\)/);
   fs.rmSync(ghDown);
+  assert.ok(g1brief.includes(intentFile + ' --skip ci`') && g1brief.includes('The gate ends when the pull request is open'), 'By default the gate stops at the open pull request');
   for (const id of ['g0', 'g1', 'g2']) assert.equal(tl(['finish', id, '--force']).code, 0, id);
+  // A project says which gate steps it leaves out; push and pull request never are.
+  for (const bad of ['push', 'ci,pr', 'nonsense', '']) assert.equal(tl(['project', 'add', 'demo', project, '--gate-skip', bad]).code, 2, bad);
+  r = tl(['project', 'add', 'demo', project, '--gate-skip', 'ci,lint']); assert.equal(r.code, 0, r.out); assert.ok(r.out.includes('(gate skips: ci, lint)'));
+  assert.equal(tl(['spawn', 'g3', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.ok(fs.readFileSync(taskOf('g3').brief, 'utf8').includes(' --skip ci,lint`'));
+  assert.equal(tl(['finish', 'g3', '--force']).code, 0);
+  r = tl(['project', 'add', 'demo', project, '--gate-skip', 'none']); assert.ok(r.out.includes('(gate skips: nothing)'));
+  assert.equal(tl(['spawn', 'g4', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  const g4brief = fs.readFileSync(taskOf('g4').brief, 'utf8');
+  assert.ok(!g4brief.includes('--skip') && g4brief.includes('no-mistakes axi handoff') && g4brief.includes('ten minutes'), 'A watched gate is told how its watch ends');
+  assert.equal(tl(['finish', 'g4', '--force']).code, 0);
 
   // show: the page is opened by lavish-axi, and its address goes on the terminal as the labels
   // Herdr's status bar reads, so the person can open it from wherever they sit.
