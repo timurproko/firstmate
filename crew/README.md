@@ -151,3 +151,4 @@ reaches every machine at its next session; `crew rollback` is per machine.
 ## Tests
 
 `node crew/crew.test.mjs` runs everything against a fake Core.
+The suite needs only Node.js and git.
