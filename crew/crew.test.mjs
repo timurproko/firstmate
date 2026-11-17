@@ -213,8 +213,16 @@ try {
   const r2 = crew(['spawn', 'td', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' });
   assert.equal(r2.code, 0); assert.match(r2.out, /could not record the working copy as trusted/);
   assert.equal(fs.readFileSync(claudeConfig, 'utf8'), '{ not json');
+  // Remove: refused while an unfinished task uses the project; afterwards the entry goes, the folder stays.
+  r = crew(['project', 'remove', 'demo'], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /used by unfinished tasks: td\[working\]/);
+  assert.match(crew(['project', 'list']).out, /^demo\t/m, 'A refused remove keeps the project');
+  assert.equal(crew(['project', 'remove', 'nope']).code, 2, 'Only a registered project can be removed');
   assert.equal(crew(['finish', 'td', '--force'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command, its folder trust and account choice');
+  r = crew(['project', 'remove', 'demo'], { terminal: 'c2' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /project demo removed/);
+  assert.equal(crew(['project', 'list']).out.trim(), '');
+  assert.ok(fs.existsSync(path.join(project, 'README.md')), 'The project folder is untouched');
+  assert.equal(crew(['spawn', 'te', '--project', 'demo', 'x'], { terminal: 'c2' }).code, 2, 'A removed project cannot be used');
+  console.log('PASS: crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
