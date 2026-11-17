@@ -38,9 +38,10 @@ else save();
 const readWorld = () => JSON.parse(fs.readFileSync(world, 'utf8'));
 const setTerminal = (address, patch) => { const w = readWorld(); Object.assign(w.terminals[address], patch); fs.writeFileSync(world, JSON.stringify(w)); };
 
-const homeDir = path.join(root, 'home'), project = path.join(root, 'project');
+const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), fakeUser = path.join(root, 'user');
+fs.mkdirSync(fakeUser);
 function crew(args, { terminal, cwd = homeDir } = {}) {
-  const env = { ...process.env, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
+  const env = { ...process.env, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -52,7 +53,11 @@ try {
   git('-C', project, 'add', '-A'); git('-C', project, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'init');
 
   // A home, with coordinator rules any agent reads, and a registered project.
-  assert.match(crew(['status']).out, /No crew home here/);
+  assert.match(crew(['status'], { cwd: root }).out, /No crew home yet/);
+  // With no folder, the home is the per-user one, and crew then works from anywhere.
+  assert.ok(crew(['init'], { cwd: root }).out.includes('/user/.crew/home'), 'The default home is under the user folder');
+  assert.ok(crew(['status'], { cwd: root }).out.includes('.crew/home - no owner'), 'crew finds the default home from any folder');
+  fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
   assert.equal(crew(['init', homeDir]).code, 0);
   assert.ok(fs.readFileSync(path.join(homeDir, 'AGENTS.md'), 'utf8').includes('crew spawn'));
   assert.equal(fs.readFileSync(path.join(homeDir, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
