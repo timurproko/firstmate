@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.5.1';
+export const VERSION = '0.5.2';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -25,10 +25,12 @@ export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'home');
 // one more tool name. A Claude worker keeps its permission system; it is only told up front
 // that editing files and using its ordinary tools inside its own working copy is expected,
 // so it does not stop to ask for each one. Folder trust: see trustClaudeFolder below.
+// PowerShell is in the list beside Bash: on Windows Claude Code runs its commands through
+// that tool, and without it every command (`crew done` included) waits for a person.
 export const AGENTS = {
   a1: { command: 'a1', exit: 'a1-api' },
   pi: { command: 'pi', exit: 'close' },
-  claude: { command: 'claude', exit: 'close', trust: 'claude', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,Read,Edit,Write,Glob,Grep'] },
+  claude: { command: 'claude', exit: 'close', trust: 'claude', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'] },
 };
 
 // --- small helpers -----------------------------------------------------------
