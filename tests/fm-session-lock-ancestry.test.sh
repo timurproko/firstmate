@@ -530,7 +530,8 @@ test_a1_process_shapes_are_pi_harnesses() {
     "$node C:/Users/u/AppData/Roaming/npm/node_modules/@timurproko/a1/bin/pi-compatible.js --thinking low" \
     "$node C:/Users/u/AppData/Roaming/npm/node_modules/@timurproko/a1/bin/cli.js" \
     "/usr/bin/node /home/u/.local/lib/a1/bin/ui.js" \
-    "$node C:\\Users\\u\\AppData\\Local\\a1\\releases\\0.2.7\\bin\\ui.js"; do
+    "$node C:\\Users\\u\\AppData\\Local\\a1\\releases\\0.2.7\\bin\\ui.js" \
+    "\"$node.exe\" \"C:/Users/u/AppData/Local/a1/releases/0.2.7/bin/ui.js\""; do
     lib_eval "$fakebin" "fm_harness_process_matches '$node' '$args'" \
       || fail "A1 process was not recognized as a Pi harness: $args"
   done

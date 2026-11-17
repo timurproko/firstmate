@@ -41,7 +41,7 @@ FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$|^omp$|^agy$'
 # path shape below lets process evidence agree. Paths are matched with forward
 # slashes, which is how ps reports them on POSIX and how the Windows bridge
 # normalizes them.
-FM_A1_SCRIPT_RE='(^|/)(a1/releases/[^/ ]+|@timurproko/a1|a1)/bin/(ui|cli|pi-compatible)[.]js([[:space:]]|$)'
+FM_A1_SCRIPT_RE='(^|/)(a1/releases/[^/ ]+|@timurproko/a1|a1)/bin/(ui|cli|pi-compatible)[.]js"?([[:space:]]|$)'
 
 # The same harnesses as exact executable names. Keep in sync with
 # FM_HARNESS_RE. Used only for the stricter path evidence below, where the
