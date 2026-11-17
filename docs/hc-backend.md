@@ -98,7 +98,7 @@ An input, capture, or close that carries the task label refuses a terminal whose
 | Send a line and submit | `hc send` |
 | Submit with confirmation | `hc send --wait`; see submit safety under Limits |
 | Named key | `hc keys` |
-| Current path | `hc get`, the foreground process's `cwd` |
+| Current path | `hc get`, the foreground process's `cwd`; behind a native Windows launcher, a `pwd` probe (see Limits) |
 | Busy state | `hc get`, native `status.state` (`working` is busy) |
 | Agent state | `hc get`, the foreground process and its process group, through the shared classifier |
 | Close | `hc kill`, then `hc rm`, then `hc get` must answer not found |
@@ -112,6 +112,9 @@ An input, capture, or close that carries the task label refuses a terminal whose
   A blocked terminal (exit 9) returns `unknown` without typing or retrying and is never forced.
 - hc reports one foreground process per terminal.
   When that process is a launcher, the adapter also reads the rest of its process group from `ps`, which works only for terminals on the local machine and cannot see inside a native Windows launcher.
+- On native Windows that launcher (`bash.exe`) is the only foreground process hc reports, and its `cwd` stays where the terminal started: it follows neither a `cd` nor the shell `treehouse get` opens in the worktree.
+  Current path therefore asks the shell itself there, printing `pwd` between two markers unique to the call and reading that block back from the capture, as the cmux and zellij adapters do.
+  The probe is sent only while the terminal carries no native harness status, so it is never typed into an agent; with a status present, or when the shell does not answer, the path reads as unknown and `bin/fm-spawn.sh` refuses rather than trusting the launcher's directory.
 - An A1 worker (a pinned-Pi harness detected as `pi`) is controlled through A1's public integration API instead: A1 publishes its exact session and runtime as native `a1.session`/`a1.runtime` labels with an `a1.at` heartbeat (fresh within 90 s), and `fm-control.sh exit` asks `a1 api` protocol 1 `session.lifecycle` for liveness and `session.exit` for a graceful stop of that exact target.
   A1 admits the stop only when idle with an empty editor, no queued input and no open dialog; its refusals (`session-busy`, `editor-not-empty`, `pending-input`, `overlay-open`, `session-stopping`) are reported verbatim, and nothing is typed, cleared or killed instead.
   `stopped` is proven by A1 answering `session-unavailable` for that session afterwards, never by an acknowledgement alone; a timed-out or uncorrelated answer is an unknown outcome that is observed, not re-requested.
