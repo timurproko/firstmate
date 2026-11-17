@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, AGENTS } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, AGENTS, main } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -42,6 +42,8 @@ const file = ${JSON.stringify(world)}, w = JSON.parse(fs.readFileSync(file, 'utf
 w.log.push(a); const save = () => fs.writeFileSync(file, JSON.stringify(w));
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
   w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
+else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
+else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
 else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; save(); }
 else if (a[0] === 'rm') { delete w.terminals[a.at(-1)]; save(); }
@@ -63,6 +65,55 @@ function crew(args, { terminal, cwd = homeDir } = {}) {
 const git = (...args) => { const r = spawnSync('git', args, { encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
 
 try {
+  // Status uses spawn time (creation while preparing), freezes settled tasks, and formats
+  // elapsed time without contacting Core or depending on the wall clock.
+  {
+    const statusHome = path.join(root, 'durations'), clock = Date.parse('2026-06-01T12:00:00Z');
+    const ago = seconds => new Date(clock - seconds * 1000).toISOString();
+    fs.mkdirSync(path.join(statusHome, 'tasks'), { recursive: true });
+    fs.writeFileSync(path.join(statusHome, 'crew.json'), JSON.stringify({ version: 1, tag: 'durations', projects: {} }));
+    const cases = [
+      { id: 'preparing', state: 'preparing', created: ago(45), seconds: 45, text: '45s' },
+      { id: 'working', state: 'working', spawned: ago(93784), seconds: 93784, text: '1d 2h' },
+      { id: 'minutes', state: 'working', spawned: ago(125), seconds: 125, text: '2m 5s' },
+      { id: 'reported', state: 'reported', spawned: ago(200), reported: ago(75), seconds: 125, text: '2m 5s' },
+      { id: 'stopped', state: 'stopped', spawned: ago(200), stopped: ago(141), seconds: 59, text: '59s' },
+      { id: 'failed', state: 'failed', spawned: ago(7200), updated: ago(3600), seconds: 3600, text: '1h' },
+      { id: 'future', state: 'working', spawned: ago(-60), seconds: 0, text: '0s' },
+      { id: 'unknown', state: 'preparing', created: 'invalid', seconds: null, text: '-' },
+      { id: 'closed', state: 'closed', spawned: ago(7200), closed: ago(3600), seconds: 3600, text: '1h' },
+    ];
+    for (const { seconds, text, ...task } of cases) {
+      const dir = path.join(statusHome, 'tasks', task.id);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'task.json'), JSON.stringify({ created: ago(200000), kind: 'ship', agent: 'pi',
+        project: 'demo', terminal: null, report: path.join(dir, 'report.md'), ...task }));
+    }
+    const oldHome = process.env.CREW_HOME, oldNow = Date.now, oldLog = console.log;
+    const output = [];
+    try {
+      process.env.CREW_HOME = statusHome;
+      Date.now = () => clock;
+      console.log = line => output.push(line);
+      main(['status']);
+      for (const task of cases.filter(t => t.state !== 'closed')) {
+        assert.ok(output.includes(`${task.id}\t${task.state}\tship/pi\tdemo\t-\t${task.text}`), task.id);
+      }
+      assert.ok(!output.some(line => line.startsWith('closed\t')), 'Closed tasks stay hidden by default');
+      output.length = 0;
+      main(['status', '--all', '--json']);
+      const tasks = JSON.parse(output[0]).tasks;
+      for (const task of cases) assert.equal(tasks.find(t => t.id === task.id).elapsedSeconds, task.seconds, task.id);
+      output.length = 0;
+      main(['status', '--all']);
+      assert.ok(output.includes('closed\tclosed\tship/pi\tdemo\t-\t1h'), 'Closed duration stays fixed');
+    } finally {
+      if (oldHome === undefined) delete process.env.CREW_HOME; else process.env.CREW_HOME = oldHome;
+      Date.now = oldNow;
+      console.log = oldLog;
+    }
+  }
+
   fs.mkdirSync(project); git('-C', project, 'init', '-q'); fs.writeFileSync(path.join(project, 'README.md'), 'one\ntwo\n');
   git('-C', project, 'add', '-A'); git('-C', project, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'init');
 
@@ -164,8 +215,78 @@ try {
   const r2 = crew(['spawn', 'td', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' });
   assert.equal(r2.code, 0); assert.match(r2.out, /could not record the working copy as trusted/);
   assert.equal(fs.readFileSync(claudeConfig, 'utf8'), '{ not json');
+  // Remove: refused while an unfinished task uses the project; afterwards the entry goes, the folder stays.
+  r = crew(['project', 'remove', 'demo'], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /used by unfinished tasks: td\[working\]/);
+  assert.match(crew(['project', 'list']).out, /^demo\t/m, 'A refused remove keeps the project');
+  assert.equal(crew(['project', 'remove', 'nope'], { terminal: 'c2' }).code, 2, 'Only a registered project can be removed');
   assert.equal(crew(['finish', 'td', '--force'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command, its folder trust and account choice');
+  r = crew(['project', 'remove', 'demo'], { terminal: 'c2' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /project demo removed/);
+  assert.equal(crew(['project', 'list']).out.trim(), '');
+  assert.ok(fs.existsSync(path.join(project, 'README.md')), 'The project folder is untouched');
+  assert.equal(crew(['spawn', 'te', '--project', 'demo', 'x'], { terminal: 'c2' }).code, 2, 'A removed project cannot be used');
+
+  // --- the five reviewed defects -------------------------------------------------------
+  const setWorld = patch => { const w = readWorld(); Object.assign(w, patch); fs.writeFileSync(world, JSON.stringify(w)); };
+  const other = path.join(root, 'other'); fs.mkdirSync(other); git('-C', other, 'init', '-q');
+  assert.equal(crew(['project', 'add', 'demo', project], { terminal: 'c2' }).code, 0);
+  // (4) The project list belongs to the session that holds the home, and a name is only
+  // pointed elsewhere on request and never under an unfinished task.
+  r = crew(['project', 'add', 'demo', other], { terminal: 'c1' }); assert.equal(r.code, 3); assert.match(r.out, /Only that session may change its projects/);
+  r = crew(['project', 'remove', 'demo'], { terminal: 'c1' }); assert.equal(r.code, 3);
+  r = crew(['project', 'add', 'demo', other], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /Pass --replace/);
+  assert.equal(crew(['project', 'add', 'demo', project], { terminal: 'c2' }).code, 0, 'Adding the same folder again is not a replacement');
+  assert.equal(crew(['spawn', 'f1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
+  r = crew(['project', 'add', 'demo', other, '--replace'], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /used by unfinished tasks: f1/);
+  const f1 = JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f1', 'task.json'), 'utf8')), f1copy = path.join(copies, 'f1');
+
+  // (1) A Core that does not answer is not a terminal that is gone: nothing is taken over,
+  // failed, stopped or deleted on a failed query.
+  setTerminal(f1.terminal, { status: { app: 'pi', state: 'working' } });
+  setWorld({ silent: true });
+  r = crew(['finish', 'f1'], { terminal: 'c2' }); assert.equal(r.code, 4); assert.match(r.out, /Core did not answer about terminal/);
+  assert.ok(fs.existsSync(path.join(f1copy, 'README.md')), 'The busy worker kept its files');
+  r = crew(['stop', 'f1', '--force'], { terminal: 'c2' }); assert.equal(r.code, 4);
+  r = crew(['wait', 'f1', '--timeout', '7'], { terminal: 'c2' }); assert.equal(r.code, 124, 'An unanswered query does not fail a healthy worker');
+  r = crew(['start'], { terminal: 'c1' }); assert.equal(r.code, 4); assert.match(r.out, /was not taken over/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(homeDir, 'owner.json'), 'utf8')).terminal, 'c2');
+  setWorld({ silent: false });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f1', 'task.json'), 'utf8')).state, 'working');
+
+  // (3) stop really stops, and says so only when Core shows the terminal ended.
+  setWorld({ unkillable: true });
+  r = crew(['stop', 'f1', '--force'], { terminal: 'c2' }); assert.equal(r.code, 6); assert.match(r.out, /not stopped f1: Core still shows the terminal as live/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f1', 'task.json'), 'utf8')).state, 'working', 'A stop that did not happen is not recorded');
+  setWorld({ unkillable: false });
+  r = crew(['stop', 'f1', '--force'], { terminal: 'c2' }); assert.equal(r.code, 0); assert.match(r.out, /stopped f1: cancelled; terminal ended/);
+  assert.equal(readWorld().terminals[f1.terminal].state, 'finished');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f1', 'task.json'), 'utf8')).state, 'stopped');
+
+  // (2) A ship task's uncommitted work is not thrown away by an ordinary finish.
+  fs.writeFileSync(path.join(f1copy, 'half-done.txt'), 'unsaved');
+  r = crew(['finish', 'f1'], { terminal: 'c2' }); assert.equal(r.code, 6); assert.match(r.out, /has uncommitted work .*half-done\.txt/);
+  assert.equal(fs.readFileSync(path.join(f1copy, 'half-done.txt'), 'utf8'), 'unsaved');
+  assert.equal(crew(['finish', 'f1', '--force'], { terminal: 'c2' }).code, 0);
+  assert.ok(!fs.existsSync(f1copy), 'Discarding was asked for');
+  assert.ok(git('-C', project, 'branch', '--list', 'crew/f1').includes('crew/f1'), 'The branch stays');
+  // A scout's leftovers are scratch.
+  assert.equal(crew(['spawn', 'f2', '--project', 'demo', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
+  fs.writeFileSync(path.join(copies, 'f2', 'notes.tmp'), 'x');
+  assert.equal(crew(['finish', 'f2'], { terminal: 'c2' }).code, 0);
+
+  // (5) A report accepted while spawn was still waiting for Core is not overwritten.
+  fs.writeFileSync(fake, fs.readFileSync(fake, 'utf8').replace("if (a[0] === 'run') {", `if (a[0] === 'run' && w.reportDuringRun) {
+  const dir = ${JSON.stringify(path.join(homeDir, 'tasks'))} + '/' + w.reportDuringRun, file = dir + '/task.json';
+  const task = JSON.parse(fs.readFileSync(file, 'utf8')); fs.writeFileSync(dir + '/report.md', 'early');
+  fs.writeFileSync(file, JSON.stringify({ ...task, state: 'reported', reported: 'early' }));
+}
+if (a[0] === 'run') {`));
+  setWorld({ reportDuringRun: 'f3' });
+  assert.equal(crew(['spawn', 'f3', '--project', 'demo', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
+  setWorld({ reportDuringRun: null });
+  const f3 = JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f3', 'task.json'), 'utf8'));
+  assert.deepEqual([f3.state, f3.reported, Boolean(f3.terminal)], ['reported', 'early', true]);
+  assert.equal(crew(['finish', 'f3'], { terminal: 'c2' }).code, 0);
+  console.log('PASS: crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
