@@ -184,7 +184,9 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
    unless they asked you to cancel it.
 
 ## Rules
-- Never work inside \`worktrees/\` yourself and never edit a project directly.
+- Never work in a worker's copy yourself and never edit a project directly.
+- \`crew wait\` saying a worker needs a person: tell the person which terminal is waiting and
+  why; do not finish it. Wait again once they have answered.
 - A worker that failed or went quiet: read \`crew status\`, look at its terminal with
   \`hc read <terminal> --lines 80\`, then either spawn a fresh worker or tell the person.
 - \`crew project list\` shows the projects you may use. Ask before adding one.
@@ -246,6 +248,24 @@ function bashProgram() {
   return candidates.find(p => fs.existsSync(p)) ?? refuse('Git Bash was not found; set CREW_BASH to bash.exe.', 4);
 }
 
+// The shell words that start an agent with one instruction. For Claude Code a saved account
+// can be chosen with CREW_CLAUDE_ACCOUNT (set by the Herdr plugin, or by hand): the worker is
+// then started through the account-switcher launcher as that account, exactly as the
+// person's own `claude` wrapper does plus `--as`. Without the variable, or without that
+// launcher on the machine, plain `claude` runs (the wrapper's default account).
+export function agentCommand(name, agent, instruction, env = process.env) {
+  const plain = [agent.command, instruction, ...(agent.args ?? [])].map(shq).join(' ');
+  const account = name === 'claude' ? String(env.CREW_CLAUDE_ACCOUNT ?? '').trim() : '';
+  if (!account) return plain;
+  if (!/^[A-Za-z0-9._@+-]{1,100}$/.test(account)) refuse(`Not an account name: ${account}`);
+  const launcher = env.CREW_CLAUDE_LAUNCHER || path.join(os.homedir(), '.claude', 'plugins-local', 'account-switcher', 'bin', 'claude-as.sh');
+  if (!fs.existsSync(launcher)) {
+    console.error(`crew: CREW_CLAUDE_ACCOUNT is set, but the account launcher is not on this machine (${slash(launcher)}); starting Claude Code on its default account.`);
+    return plain;
+  }
+  return `bash --noprofile --norc ${shq(bashPath(launcher))} --as ${shq(account)} --command "$(type -P claude || type -P claude.exe)" -- ${[instruction, ...(agent.args ?? [])].map(shq).join(' ')}`;
+}
+
 export function briefText({ id, kind, task, worktree, project, report }) {
   return [
     `# Task ${id} (${kind})`, '', task.trim(), '',
@@ -295,7 +315,7 @@ function cmdSpawn(args) {
   const instruction = `Read the brief at ${brief} and carry it out exactly.`;
   const line = [
     `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
-    [agent.command, instruction, ...(agent.args ?? [])].map(shq).join(' '),
+    agentCommand(opts.agent, agent, instruction),
     'exec bash --login -i',
   ].join('; ');
   const tag = h.config.tag;
@@ -334,7 +354,7 @@ function cmdWait(args) {
   for (let i = 0; i < args.length; i++) { if (args[i] === '--timeout') timeout = Number(args[++i]) || timeout; else ids.push(args[i]); }
   if (!ids.length) refuse('Usage: crew wait <id> [<id>...] [--timeout seconds]');
   ids.forEach(id => loadTask(h, id));
-  const deadline = Date.now() + timeout * 1000, settled = new Map();
+  const deadline = Date.now() + timeout * 1000, settled = new Map(), blocked = new Map();
   for (let tick = 0; settled.size < ids.length && Date.now() < deadline; tick++) {
     for (const id of ids) {
       if (settled.has(id)) continue;
@@ -342,21 +362,29 @@ function cmdWait(args) {
       if (['reported', 'stopped', 'closed', 'failed'].includes(task.state)) { settled.set(id, task.state); continue; }
       // Every few seconds ask Core whether the terminal still exists; a worker that is gone
       // without a report has failed, whatever the reason.
-      if (tick % 5 === 4 && terminal(task.terminal)?.state !== 'live') {
+      if (tick % 5 !== 4) continue;
+      const t = terminal(task.terminal);
+      if (t?.state !== 'live') {
         saveTask(h, { ...task, state: 'failed', error: 'The worker terminal ended without a report.' });
         settled.set(id, 'failed');
+      } else if (t.status?.state === 'blocked') {
+        // The agent itself says it is waiting for a person (a permission or a question).
+        // Waiting longer cannot help; hand that back so somebody looks at the terminal.
+        blocked.set(id, String(t.status.msg ?? t.status.kind ?? 'it is waiting for an answer').slice(0, 120));
+        settled.set(id, 'needs a person');
       }
     }
     if (settled.size < ids.length) sleep(1000);
   }
-  let pending = 0;
+  let pending = 0, stuck = 0;
   for (const id of ids) {
     const task = loadTask(h, id), state = settled.get(id);
     if (!state) { pending++; console.log(`== ${id}: still working after ${timeout}s (terminal ${task.terminal})`); continue; }
+    if (blocked.has(id)) { stuck++; console.log(`== ${id}: needs a person - ${blocked.get(id)} (terminal ${task.terminal}); it is still running`); continue; }
     console.log(`== ${id}: ${state}${task.error ? ` - ${task.error}` : ''}`);
     if (fs.existsSync(task.report)) console.log(fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/).slice(0, 60).join('\n'));
   }
-  if (pending) process.exitCode = 124;
+  if (pending) process.exitCode = 124; else if (stuck) process.exitCode = 7;
 }
 
 // A1's public integration API: exact session and runtime, admitted only when idle.
