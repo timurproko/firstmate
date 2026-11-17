@@ -45,7 +45,10 @@ lib_eval() {  # <fakebin> <expression>
   [ -z "${FM_TEST_SESSION_ID:-}" ] || session_env+=("CLAUDE_CODE_SESSION_ID=$FM_TEST_SESSION_ID")
   [ -z "${FM_TEST_CLAUDE_PID:-}" ] || session_env+=("CLAUDE_PID=$FM_TEST_CLAUDE_PID")
   [ -z "${FM_TEST_PI_PID:-}" ] || session_env+=("FM_PI_SESSION_PID=$FM_TEST_PI_PID")
+  # FM_PROC_ROOT points at an empty directory unless a case stages its own, so
+  # on a Cygwin-family host the fake ps stays the only process table.
   env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID -u FM_PI_SESSION_PID ${session_env[@]+"${session_env[@]}"} \
+    FM_PROC_ROOT="${FM_TEST_PROC_ROOT:-$TMP_ROOT/no-proc}" \
     PATH="$fakebin:$PATH" bash -c "
     . \"\$0\"
     kill() { return \${FM_TEST_KILL_RC:-0}; }
@@ -944,6 +947,41 @@ test_cygwin_ps_without_o_still_resolves_a_local_harness() {
   pass "session-lock: a harness in the local process table resolves untagged when ps has no -o option"
 }
 
+test_cygwin_proc_files_answer_without_spawning_ps() {
+  local dir fakebin proc got want_args
+  dir="$TMP_ROOT/cygwin-proc"
+  fakebin=$(fm_fakebin "$dir")
+  proc="$dir/proc"
+  mkdir -p "$dir/state" "$proc/700" "$proc/4242"
+  # Any ps call is a failure of this route: record it and answer nothing.
+  cat > "$fakebin/ps" <<SH
+#!/usr/bin/env bash
+printf 'ps %s\n' "\$*" >> "$dir/ps.log"
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  printf '9001\n' > "$proc/700/winpid"
+  printf '/c/Program Files/nodejs/node' > "$proc/700/exename"
+  printf '4242\n' > "$proc/700/ppid"
+  printf '%s\0' '/c/Program Files/nodejs/node' '/c/npm/node_modules/@timurproko/a1/bin/cli.js' '--session-color' > "$proc/700/cmdline"
+  want_args='/c/Program Files/nodejs/node /c/npm/node_modules/@timurproko/a1/bin/cli.js --session-color'
+  # Linux's /proc has no winpid file, so a directory without one is never read.
+  printf '/usr/bin/bash' > "$proc/4242/exename"
+  printf '1\n' > "$proc/4242/ppid"
+
+  got=$(FM_TEST_PROC_ROOT="$proc" lib_eval "$fakebin" \
+    'fm_proc_info 700 && printf "%s|%s|%s" "$FM_PROC_COMM" "$FM_PROC_ARGS" "$FM_PROC_PPID"') \
+    || fail "the /proc route did not resolve a staged Cygwin process"
+  [ "$got" = "/c/Program Files/nodejs/node|$want_args|4242" ] || fail "unexpected /proc fields: '$got'"
+  got=$(FM_TEST_PROC_ROOT="$proc" lib_eval "$fakebin" 'fm_ps_comm 700; printf "|"; fm_ps_ppid 700; printf "|"; fm_ps_args 700')
+  [ "$got" = "/c/Program Files/nodejs/node|4242|$want_args" ] || fail "the single-field readers disagree with /proc: '$got'"
+  [ ! -e "$dir/ps.log" ] || fail "the /proc route spawned ps: $(cat "$dir/ps.log")"
+  if FM_TEST_PROC_ROOT="$proc" lib_eval "$fakebin" 'fm_proc_info 4242'; then
+    fail "a /proc entry without winpid must not be read as a Cygwin process"
+  fi
+  pass "session-lock: Cygwin-family /proc files answer comm, args and ppid without spawning ps"
+}
+
 # --- end-to-end layer: the real Stop auto-arm in real process trees ----------
 
 install_autoarm_scripts() {
@@ -1754,6 +1792,7 @@ test_windows_clear_rekeys_the_lock_under_the_same_pid
 test_tagged_lock_is_inert_off_windows
 test_windows_task_lease_follows_a_tagged_lock_holder
 test_cygwin_ps_without_o_still_resolves_a_local_harness
+test_cygwin_proc_files_answer_without_spawning_ps
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock
