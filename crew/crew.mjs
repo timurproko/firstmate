@@ -14,6 +14,9 @@ import { fileURLToPath } from 'node:url';
 export const VERSION = '0.1.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
+// Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
+// Herdr), home/ (the default crew home) and worktrees/ (workers' copies).
+export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'home');
 
 // --- agents ------------------------------------------------------------------
 // The only per-agent knowledge: how to start it with one instruction, and how it can be
@@ -71,12 +74,14 @@ function findHome() {
   if (process.env.CREW_HOME) return path.resolve(process.env.CREW_HOME);
   for (let dir = process.cwd(); ; dir = path.dirname(dir)) {
     if (fs.existsSync(path.join(dir, 'crew.json'))) return dir;
-    if (path.dirname(dir) === dir) return null;
+    if (path.dirname(dir) === dir) break;
   }
+  // Otherwise the per-user home, so `crew` works from any folder on the machine.
+  return fs.existsSync(path.join(DEFAULT_HOME, 'crew.json')) ? DEFAULT_HOME : null;
 }
 function home() {
   const dir = findHome();
-  if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home here. Run `crew init <folder>` once, then work from that folder (or set CREW_HOME).');
+  if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home yet. Run `crew init` once (it creates ~/.crew/home), or `crew init <folder>` for a home elsewhere.');
   const config = readJson(path.join(dir, 'crew.json'));
   if (!config || config.version !== 1) refuse(`${path.join(dir, 'crew.json')} is not a version 1 crew home.`);
   // Working copies live OUTSIDE the home. Agents read instruction files from their folder
@@ -147,7 +152,7 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 `;
 
 function cmdInit(args) {
-  const dir = path.resolve(args[0] ?? '.');
+  const dir = args[0] ? path.resolve(args[0]) : DEFAULT_HOME;
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'crew.json');
   if (fs.existsSync(file)) refuse(`${dir} is already a crew home.`);
@@ -406,7 +411,7 @@ function cmdStatus(args) {
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
-  crew init <folder>                       create a crew home
+  crew init [folder]                       create a crew home (default ~/.crew/home)
   crew project add <name> <git folder>     register a project   (crew project list)
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
