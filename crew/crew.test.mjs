@@ -78,7 +78,7 @@ try {
       { id: 'minutes', state: 'working', spawned: ago(125), seconds: 125, text: '2m 5s' },
       { id: 'reported', state: 'reported', spawned: ago(200), reported: ago(75), seconds: 125, text: '2m 5s' },
       { id: 'stopped', state: 'stopped', spawned: ago(200), stopped: ago(141), seconds: 59, text: '59s' },
-      { id: 'failed', state: 'failed', spawned: ago(7200), updated: ago(3600), seconds: 3600, text: '1h' },
+      { id: 'failed', state: 'failed', spawned: ago(7200), updated: ago(3600), seconds: 3600, text: '1h', pr: 'https://example.invalid/acme/demo/pull/8', error: 'delivery failed' },
       { id: 'future', state: 'working', spawned: ago(-60), seconds: 0, text: '0s' },
       { id: 'unknown', state: 'preparing', created: 'invalid', seconds: null, text: '-' },
       { id: 'closed', state: 'closed', spawned: ago(7200), closed: ago(3600), seconds: 3600, text: '1h' },
@@ -97,13 +97,16 @@ try {
       console.log = line => output.push(line);
       main(['status']);
       for (const task of cases.filter(t => t.state !== 'closed')) {
-        assert.ok(output.includes(`${task.id}\t${task.state}\tship/pi\tdemo\t-\t${task.text}`), task.id);
+        assert.ok(output.includes(`${task.id}\t${task.state}\tship/pi\tdemo\t-\t${task.text}${task.pr ? `\t${task.pr}` : ''}${task.error ? `\t${task.error}` : ''}`), task.id);
       }
       assert.ok(!output.some(line => line.startsWith('closed\t')), 'Closed tasks stay hidden by default');
       output.length = 0;
       main(['status', '--all', '--json']);
       const tasks = JSON.parse(output[0]).tasks;
-      for (const task of cases) assert.equal(tasks.find(t => t.id === task.id).elapsedSeconds, task.seconds, task.id);
+      for (const task of cases) {
+        assert.equal(tasks.find(t => t.id === task.id).elapsedSeconds, task.seconds, task.id);
+        assert.equal(tasks.find(t => t.id === task.id).pr, task.pr ?? null, task.id);
+      }
       output.length = 0;
       main(['status', '--all']);
       assert.ok(output.includes('closed\tclosed\tship/pi\tdemo\t-\t1h'), 'Closed duration stays fixed');
@@ -452,6 +455,10 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.deepEqual(made.a.slice(0, 8), ['pr', 'create', '--base', baseBranch, '--head', 'crew/s1', '--title', 'Add a third line']);
   assert.match(made.body, /# Done\nAdded a line\.[\s\S]*crew task `s1` \(pi\), 1 commit/);
   assert.equal(taskOf('s1').pr, 'https://example.invalid/acme/demo/pull/7');
+  r = own(['status', '--json']); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).tasks.find(t => t.id === 's1').pr, 'https://example.invalid/acme/demo/pull/7');
+  r = own(['status']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /^s1\t[^\r\n]*\thttps:\/\/example\.invalid\/acme\/demo\/pull\/7\r?$/m);
   assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
   for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
 

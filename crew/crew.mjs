@@ -864,12 +864,12 @@ function cmdStatus(args) {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
     return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
-      report: fs.existsSync(t.report) ? t.report : null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime) };
+      report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime) };
   });
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
-  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.agent}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.error ? `\t${t.error}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.agent}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}`);
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
