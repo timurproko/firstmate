@@ -1,2 +1,5 @@
 # Bash parses shell scripts with LF line endings on every supported platform.
 *.sh text eol=lf
+crew/bin/crew text eol=lf
+crew/bin/crew.cmd text eol=crlf
+crew/*.mjs text eol=lf
