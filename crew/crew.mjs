@@ -65,12 +65,19 @@ function hcJson(args) {
   const r = hc(args);
   try { return { code: r.code, value: JSON.parse(r.stdout || r.stderr) }; } catch { return { code: r.code, value: null }; }
 }
-// A terminal as Core sees it now, or null when Core has no such terminal.
-function terminal(address) {
-  if (!address) return null;
+// What Core says about a terminal, in three distinct answers. `absent` only when Core
+// itself says it has no such terminal; any other failed query is `unknown`, and an unknown
+// answer never justifies taking a home over, failing a task or deleting a worker's files.
+function probe(address) {
+  if (!address) return { state: 'absent', t: null };
   const { code, value } = hcJson(['get', '--json', address]);
-  return code === 0 && value && !value.error ? value : null;
+  if (code === 0 && value && !value.error && typeof value.state === 'string') return { state: value.state === 'live' ? 'live' : 'finished', t: value };
+  if (value?.error?.kind === 'not_found') return { state: 'absent', t: null };
+  return { state: 'unknown', t: null };
 }
+// The terminal for display purposes, or null when Core gave no terminal (for any reason).
+const terminal = address => probe(address).t;
+const CORE_SILENT = 'Core did not answer about';
 const me = () => process.env.CREW_TERMINAL || process.env.HC_TERMINAL_ID || null;
 
 // --- home --------------------------------------------------------------------
@@ -115,8 +122,11 @@ function ownerState(h) {
   const owner = readJson(h.owner);
   if (!owner?.terminal) return { owner: null, live: false, mine: false };
   const mine = owner.terminal === me();
-  const live = mine || terminal(owner.terminal)?.state === 'live';
-  return { owner, live, mine };
+  if (mine) return { owner, live: true, mine, unknown: false };
+  // An owner Core could not be asked about is treated as still there: nobody takes over on
+  // a failed query.
+  const state = probe(owner.terminal).state;
+  return { owner, live: state === 'live' || state === 'unknown', mine, unknown: state === 'unknown' };
 }
 function requireOwner(h) {
   const { owner, live, mine } = ownerState(h);
@@ -213,6 +223,12 @@ function cmdProject(args) {
     for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}`);
     return;
   }
+  // The project list decides which repository a task works in and is cleaned up against, so
+  // while another session holds the home it is that session's to change. Before any session
+  // has started (first setup) there is no owner and changes are allowed.
+  const held = ownerState(h);
+  if (held.owner && held.live && !held.mine) refuse(`Read-only: this home is owned by terminal ${held.owner.terminal}. Only that session may change its projects.`, 3);
+  const replace = args.includes('--replace');
   if (verb === 'remove' && validId(name) && !source) {
     if (!h.config.projects[name]) refuse(`Unknown project: ${name}. See \`crew project list\`.`);
     // A task that is not closed still has, or may still have, a working copy of this project;
@@ -224,10 +240,18 @@ function cmdProject(args) {
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source) refuse('Usage: crew project add <name> <git folder> | crew project remove <name> | crew project list');
+  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] | crew project remove <name> | crew project list');
   const folder = path.resolve(source);
   const top = run('git', ['-C', folder, 'rev-parse', '--show-toplevel']);
   if (top.code !== 0) refuse(`${folder} is not a git repository.`);
+  // Pointing an existing name at another repository is a replacement, not an addition: it has
+  // to be asked for, and it waits until no unfinished task still belongs to the old one.
+  const existing = h.config.projects[name];
+  if (existing && existing.path !== slash(folder)) {
+    if (!replace) refuse(`Project ${name} already points at ${existing.path}. Pass --replace to point it at ${slash(folder)} instead.`);
+    const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
+    if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
+  }
   h.config.projects[name] = { path: slash(folder) };
   writeJson(path.join(h.dir, 'crew.json'), h.config);
   console.log(`project ${name}: ${slash(folder)}`);
@@ -237,7 +261,8 @@ function cmdStart() {
   const h = home();
   const mine = me();
   if (!mine) refuse('crew start must run inside a Herdr terminal (no HC_TERMINAL_ID).', 3);
-  const { owner, live } = ownerState(h);
+  const { owner, live, unknown } = ownerState(h);
+  if (owner && unknown && owner.terminal !== mine) refuse(`${CORE_SILENT} the owner terminal ${owner.terminal}, so this home was not taken over. Try again.`, 4);
   if (owner && live && owner.terminal !== mine) refuse(`Read-only: this home is owned by live terminal ${owner.terminal}.`, 3);
   writeJson(h.owner, { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined });
   const open = allTasks(h).filter(t => t.state !== 'closed');
@@ -340,7 +365,11 @@ function cmdSpawn(args) {
     saveTask(h, { ...record, state: 'failed', error: JSON.stringify(started.value).slice(0, 400) });
     refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
   }
-  saveTask(h, { ...record, state: 'working', terminal: address, spawned: now() });
+  // The worker is already running and may have reported before this line (a fast failure
+  // report, or a slow answer from Core). Add the terminal to what is on disk now rather than
+  // writing the record this command started with over an accepted report.
+  const current = readJson(taskFile(h, id)) ?? record;
+  saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
   console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}`);
 }
 
@@ -373,9 +402,10 @@ function cmdWait(args) {
       if (['reported', 'stopped', 'closed', 'failed'].includes(task.state)) { settled.set(id, task.state); continue; }
       // Every few seconds ask Core whether the terminal still exists; a worker that is gone
       // without a report has failed, whatever the reason.
-      if (tick % 5 !== 4) continue;
-      const t = terminal(task.terminal);
-      if (t?.state !== 'live') {
+      if (tick % 5 !== 4 || !task.terminal) continue;
+      const { state: seen, t } = probe(task.terminal);
+      if (seen === 'unknown') continue; // Core did not answer: that says nothing about the worker
+      if (seen !== 'live') {
         saveTask(h, { ...task, state: 'failed', error: 'The worker terminal ended without a report.' });
         settled.set(id, 'failed');
       } else if (t.status?.state === 'blocked') {
@@ -405,16 +435,22 @@ function a1Api(type, target) {
   const r = run(bashProgram(), ['-c', `a1 api ${shq(request)}`], { timeout: 20000, env: { ...process.env, MSYS_NO_PATHCONV: '1' } });
   try { return JSON.parse(r.stdout); } catch { return null; }
 }
+// Makes the worker's agent leave and proves it, or says why not. { stopped, how }.
+// `stopped: true` is returned only for something that was observed: Core says the terminal
+// is finished or gone, or A1 itself says the session no longer exists. A Core that does not
+// answer is never read as "gone".
 function stopWorker(task, { force = false } = {}) {
-  let t = terminal(task.terminal);
-  if (!t || t.state !== 'live') return { stopped: true, how: 'terminal already gone' };
+  let { state, t } = probe(task.terminal);
+  if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
+  if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
   // A worker reports from inside its last turn; give that turn a moment to end before
   // deciding it is still busy.
-  for (let i = 0; task.state === 'reported' && !force && t?.state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
+  for (let i = 0; task.state === 'reported' && !force && state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
     sleep(1000);
-    t = terminal(task.terminal);
+    ({ state, t } = probe(task.terminal));
   }
-  if (!t || t.state !== 'live') return { stopped: true, how: 'terminal already gone' };
+  if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
+  if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
   const working = t.status?.state === 'working';
   if (working && !force) refuse(`Task ${task.id} is still working. Wait for it, or pass --force to cancel it.`, 6);
   if (AGENTS[task.agent]?.exit === 'a1-api' && t.status?.app === 'a1' && t.labels?.['a1.session'] && t.labels?.['a1.runtime']) {
@@ -429,7 +465,16 @@ function stopWorker(task, { force = false } = {}) {
     }
     if (!force) refuse(`A1 refused to exit (${reply?.error?.code ?? 'no answer'}). Nothing was closed.`, 6);
   }
-  return { stopped: true, how: working ? 'cancelled' : 'idle; terminal will be closed' };
+  // Every other agent (and a forced stop of an A1 that would not leave) is stopped by ending
+  // the terminal's program, then asking Core again: only a terminal seen finished or gone
+  // counts.
+  hc(['kill', task.terminal]);
+  for (let i = 0; i < 10; i++) {
+    const after = probe(task.terminal).state;
+    if (after === 'finished' || after === 'absent') return { stopped: true, how: working ? 'cancelled; terminal ended' : 'terminal ended' };
+    sleep(500);
+  }
+  return { stopped: false, how: 'Core still shows the terminal as live after it was told to end it' };
 }
 
 function cmdStop(args) {
@@ -438,7 +483,7 @@ function cmdStop(args) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   const task = loadTask(h, id);
   const result = stopWorker(task, { force });
-  if (result.stopped && task.state !== 'closed') saveTask(h, { ...task, state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
+  if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
   console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
   if (!result.stopped) process.exitCode = 6;
 }
@@ -451,15 +496,33 @@ function cmdFinish(args) {
   if (task.state === 'closed') { console.log(`${id} is already closed`); return; }
   const result = stopWorker(task, { force });
   if (!result.stopped) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
-  if (task.terminal && terminal(task.terminal)) { hc(['kill', task.terminal]); hc(['rm', task.terminal]); }
-  if (terminal(task.terminal)) refuse(`Core still has terminal ${task.terminal}; the working copy was kept.`, 6);
   const project = h.config.projects[task.project];
-  // Removing a working copy can fail on the first try while the closed terminal's processes
-  // let go of the folder, and a failed try may already have detached it from git. So: ask
-  // git, and whatever it says, make sure the folder is gone and git's list is pruned.
+  // Work that exists only in the working copy is lost when the copy goes: a ship task's
+  // branch keeps commits, nothing keeps uncommitted or untracked files. So a ship task
+  // with such files is not cleaned up unless discarding them was asked for. (A scout is
+  // read-only by its brief; what it leaves behind is scratch.)
+  if (task.kind === 'ship' && !force && fs.existsSync(path.join(task.worktree, '.git'))) {
+    const dirty = run('git', ['-C', task.worktree, 'status', '--porcelain']);
+    if (dirty.code !== 0) refuse(`Could not check ${task.worktree} for uncommitted work; nothing was removed. Pass --force to discard it unseen.`, 6);
+    const files = dirty.stdout.split(/\r?\n/).filter(Boolean);
+    if (files.length) refuse(`Task ${id} has uncommitted work in ${task.worktree} (${files.slice(0, 5).map(l => l.slice(3)).join(', ')}${files.length > 5 ? ', …' : ''}). Nothing was removed. Commit it there, or pass --force to discard it.`, 6);
+  }
+  if (task.terminal) {
+    let seen = probe(task.terminal).state;
+    if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; the working copy was kept. Try again.`, 4);
+    if (seen !== 'absent') { hc(['kill', task.terminal]); hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
+    if (seen !== 'absent') refuse(`Core ${seen === 'unknown' ? 'did not confirm that' : 'still has'} terminal ${task.terminal}${seen === 'unknown' ? ' is gone' : ''}; the working copy was kept.`, 6);
+  }
+  // Git removes the copy. A first try can fail while the closed terminal's processes let go
+  // of the folder, so it is retried. The folder is deleted directly only when git no longer
+  // knows it as a working copy (an earlier, half-finished removal) or with --force.
+  let removal = { code: 0, stderr: '' };
   for (let i = 0; fs.existsSync(task.worktree) && i < 8; i++) {
-    if (project) run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
-    if (fs.existsSync(task.worktree)) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { sleep(1000); } }
+    if (project) removal = run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
+    if (!fs.existsSync(task.worktree)) break;
+    const detached = !project || /is not a working tree/i.test(removal.stderr);
+    if (detached || force) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { /* still held: retry */ } }
+    if (fs.existsSync(task.worktree)) sleep(1000);
   }
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
   if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
