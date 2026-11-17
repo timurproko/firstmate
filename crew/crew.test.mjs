@@ -475,6 +475,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   fs.writeFileSync(fakeTasks, `import fs from 'node:fs';
 const a = process.argv.slice(2);
 if (a[0] === '--version') { console.log('0.2.6'); process.exit(0); }
+if (a[0] === '--help') { console.log('usage: tasks-axi [command] [args] [flags]'); process.exit(0); }
 const file = a[a.indexOf('--file') + 1], lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\\n').filter(Boolean) : [];
 const at = lines.findIndex(l => l.startsWith('- [ ] ' + a[1] + ' ') || l.startsWith('- [x] ' + a[1] + ' '));
 const save = () => fs.writeFileSync(file, lines.join('\\n') + '\\n');
@@ -512,6 +513,9 @@ else if (a[0] === 'get') {
   tl(['backlog', 'add', 'g1', 'Ship through the gate']);
   assert.match(tl(['backlog'], 'c1').out, /- \[ \] b1 - Count the lines \(queued\)/);
   assert.equal(tl(['backlog', 'start', 'nope']).code, 1, "tasks-axi's own refusal is passed on");
+  // Help is a question: it reaches nothing. (Seen live: `crew done --help` was read as a task id.)
+  for (const cmd of ['done', 'finish', 'spawn', 'fix', 'land']) { r = tl([cmd, '--help'], 'c1'); assert.equal(r.code, 0, cmd); assert.match(r.out, /crew spawn <id> --project/); }
+  r = tl(['backlog', '--help'], 'c1'); assert.equal(r.code, 0, r.out); assert.ok(!r.out.includes('backlog.md'), 'Its help is asked without the file flag');
   // A task named like a backlog item moves it; any other task leaves the backlog alone.
   r = tl(['spawn', 'b1', '--project', 'demo', '--agent', 'pi', 'Count.'], 'c2', { ...T, CREW_TOOL_GH_AXI: fakeVersion, CREW_TOOL_JQ: fakeVersion });
   assert.equal(r.code, 0, r.out); assert.match(r.out, /backlog: start b1 -> In flight/);
