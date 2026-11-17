@@ -27,6 +27,7 @@ coordinator.
 ```
 crew init [folder]                       create a crew home (default ~/.crew/home)
 crew project add <name> <git folder>     register a project   (crew project list)
+crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session
 crew spawn <id> --project <name> [--kind scout|ship] [--agent a1|pi|claude] "<task>"
 crew wait <id>... [--timeout seconds]    block until each worker reports
