@@ -146,6 +146,8 @@ reaches every machine at its next session; `crew rollback` is per machine.
   worker).
 - Closing a non-A1 agent's terminal can leave helper processes of that agent behind.
 - No merge, queue or hold handling yet; `crew land` ends with an open pull request.
+- Delivery through the no-mistakes gate ends at the open pull request; its CI watch is left
+  out unless the project asks for it.
 - One machine per home. Tested live on Windows with A1 and Pi workers and an A1 coordinator.
 
 ## Tests
