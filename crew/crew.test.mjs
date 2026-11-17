@@ -126,7 +126,13 @@ try {
   setTerminal('c1', { state: 'finished' });
   r = crew(['start'], { terminal: 'c2' }); assert.equal(r.code, 0); assert.match(r.out, /unfinished tasks: t3\[working\]/);
   assert.equal(crew(['finish', 't3'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish and owner takeover');
+  // Claude Code: the instruction comes before its options, and it keeps its permission system.
+  assert.equal(crew(['spawn', 'tc', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' }).code, 0);
+  const claudeLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
+  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,Read,Edit,Write,Glob,Grep'; exec bash"), claudeLine);
+  assert.ok(!claudeLine.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
+  assert.equal(crew(['finish', 'tc', '--force'], { terminal: 'c2' }).code, 0);
+  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover and the Claude worker command');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
