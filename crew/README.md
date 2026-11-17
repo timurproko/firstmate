@@ -88,6 +88,8 @@ A ship task ends with commits on branch `crew/<id>`. From there:
   as its text. If the machine is signed in to GitHub as the repository's owner among several
   accounts, that account is used. crew never merges a project's pull request.
 
+`crew status` shows the pull request link of a delivered task.
+
 ## Crew repairs itself
 
 A defect in crew is handled like any other work: a worker fixes it on a branch, in a copy
