@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -192,6 +192,18 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 4. \`crew finish <id>\` stops the worker and removes its terminal and working copy.
    Finish only after the person has their answer; never finish a task that is still working
    unless they asked you to cancel it.
+
+## Code changes (ship tasks)
+1. After the worker reported, have the change checked unless it is trivial:
+   \`crew review <id>\` starts a reviewer (\`--agent\` picks another agent for a second opinion);
+   \`crew wait <id>-review\`. Its report starts with \`APPROVE\` or \`CHANGES NEEDED\`.
+2. On \`CHANGES NEEDED\`: \`crew tell <id> "<the defects, as the reviewer wrote them>"\`, then
+   \`crew wait <id>\` and review again. After two rounds that still fail, tell the person.
+3. \`crew land <id>\` pushes the branch and opens a pull request. Give the person the link.
+   Never merge a project's pull request yourself unless the person told you to.
+4. Finish the reviewer and the task once the pull request is open.
+- \`crew tell <id> "<message>"\` is also how you answer a worker's question or correct its
+  course; the worker reports again when it has dealt with it.
 
 ## Rules
 - Never work in a worker's copy yourself and never edit a project directly.
@@ -583,6 +595,107 @@ function cmdFinish(args) {
   console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}`);
 }
 
+// --- follow-ups, review and delivery ------------------------------------------------
+// tell: one more round with the same worker, which still has everything in its head.
+function cmdTell(args) {
+  const h = home();
+  requireOwner(h);
+  const [id, ...words] = args, message = words.join(' ').trim();
+  if (!id || !message) refuse('Usage: crew tell <id> "<message for the worker>"');
+  const task = loadTask(h, id);
+  if (!['working', 'reported'].includes(task.state)) refuse(`Task ${id} is ${task.state}; there is no worker to tell. Spawn a new task instead.`);
+  const { state: seen, t } = probe(task.terminal);
+  if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was sent. Try again.`, 4);
+  if (seen !== 'live') refuse(`The worker terminal of ${id} is gone; spawn a new task instead.`, 6);
+  if (t.status?.state === 'blocked') refuse(`The worker of ${id} is waiting for a person (terminal ${task.terminal}); nothing was sent.`, 7);
+  const text = `Message from the coordinator about task ${id}: ${message}\nWhen you have dealt with it, rewrite ${task.report} so it holds the complete, current result, then run \`crew done ${id}\` again and stop.`;
+  // The task is open again BEFORE the message goes out, so a fast worker's new report is
+  // never overwritten by this command.
+  saveTask(h, { ...task, state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
+  const sent = hc(['send', task.terminal, text]);
+  if (sent.code !== 0) {
+    saveTask(h, { ...loadTask(h, id), state: task.state });
+    refuse(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
+  }
+  console.log(`told ${id}; next: crew wait ${id}`);
+}
+
+// review: a second pair of eyes on a ship task's branch, as an ordinary read-only task.
+function cmdReview(args) {
+  const h = home();
+  requireOwner(h);
+  let agentName = null; const rest = [];
+  for (let i = 0; i < args.length; i++) { if (args[i] === '--agent') agentName = args[++i]; else rest.push(args[i]); }
+  const id = rest[0];
+  if (!id) refuse(`Usage: crew review <id> [--agent ${Object.keys(AGENTS).join('|')}]`);
+  const task = loadTask(h, id);
+  if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
+  if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
+  const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
+  const opts = { kind: 'scout', agent: agentName ?? process.env.CREW_REVIEW_AGENT ?? task.agent, project: task.project };
+  const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  let n = 1, reviewId = `${id}-review`.slice(0, 40);
+  while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
+  const text = [
+    `Review the work of task ${id}. It is the branch \`crew/${id}\` of this repository; you are on the commit it started from.`,
+    '', `- See it with \`git log HEAD..crew/${id}\` and \`git diff HEAD...crew/${id}\`. Read the changed files whole where the diff is not enough.`,
+    `- What it was asked to do is in \`${task.brief}\`; what its author says it did is in \`${task.report}\`.`,
+    '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
+    '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
+  ].join('\n');
+  launchWorker(h, { id: reviewId, opts, agent, project, task: text, extra: { reviews: id } });
+  console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
+}
+
+// land: hand a finished ship task to the person as a pull request. Merging stays with them.
+export const githubOwner = url => /github\.com[:/]+([^/]+)\/[^/]+?(?:\.git)?\/?$/.exec(String(url).trim())?.[1] ?? null;
+const GH = process.env.CREW_GH || 'gh';
+const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, ...args], options) : run(GH, args, options));
+function cmdLand(args) {
+  const h = home();
+  requireOwner(h);
+  let title = null; const rest = [];
+  for (let i = 0; i < args.length; i++) { if (args[i] === '--title') title = args[++i]; else rest.push(args[i]); }
+  const id = rest[0];
+  if (!id) refuse('Usage: crew land <id> [--title "<pull request title>"]');
+  const task = loadTask(h, id);
+  if (task.selfFix) refuse(`Task ${id} repairs crew itself; publish it with \`crew selfmerge ${id}\`.`);
+  if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
+  if (task.pr) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
+  if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
+  const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
+  const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
+  const no = (why, code = 6) => refuse(`Task ${id} was not delivered: ${why}`, code);
+  if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone. Its commits are still on branch crew/${id} in ${project.path}.`);
+  const dirty = git('status', '--porcelain');
+  if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). Tell the worker to commit them: crew tell ${id} "..."`);
+  const remote = git('remote', 'get-url', 'origin');
+  if (remote.code !== 0) no(`the project has no \`origin\` to push to. The work stays on branch crew/${id} in ${project.path}.`);
+  // The pull request goes against the branch the project folder is on, if that branch is
+  // published; otherwise against the repository's default branch.
+  const current = run('git', ['-C', project.path, 'rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim();
+  const published = name => name && name !== 'HEAD' && git('ls-remote', '--exit-code', '--heads', 'origin', name).code === 0;
+  const fallback = git('symbolic-ref', '--short', 'refs/remotes/origin/HEAD').stdout.trim().replace(/^origin\//, '');
+  const base = published(current) ? current : published(fallback) ? fallback : no('no published branch to open the pull request against was found.');
+  if (git('fetch', '--quiet', 'origin', base).code !== 0) no('the project\'s origin could not be reached. Try again.', 4);
+  const subjects = git('log', '--reverse', '--format=%s', `FETCH_HEAD..HEAD`).stdout.split(/\r?\n/).filter(Boolean);
+  if (!subjects.length) no(`its branch has no commits beyond ${base}.`);
+  const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/crew/${id}`);
+  if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}).`, 4);
+  const bodyFile = path.join(taskDir(h, id), 'pull-request.md');
+  const report = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/).slice(0, 200).join('\n') : '';
+  fs.writeFileSync(bodyFile, `${report}\n\n---\nWork of crew task \`${id}\` (${task.agent}), ${subjects.length} commit${subjects.length === 1 ? '' : 's'}.\n`);
+  // A machine can be signed in to GitHub as several people. If one of them is the owner of
+  // the repository, the pull request is opened as that one.
+  const owner = githubOwner(remote.stdout), token = owner ? gh(['auth', 'token', '--user', owner]) : null;
+  const env = token?.code === 0 && token.stdout.trim() ? { ...process.env, GH_TOKEN: token.stdout.trim() } : process.env;
+  const made = gh(['pr', 'create', '--base', base, '--head', `crew/${id}`, '--title', title || subjects[0], '--body-file', bodyFile], { cwd: wt, env, timeout: 120000 });
+  const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
+  if (made.error || made.code !== 0 || !url) no(`its branch crew/${id} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
+  saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
+  console.log(`delivered ${id}: ${url} (against ${base}, ${subjects.length} commit${subjects.length === 1 ? '' : 's'}). Merging it is the person's decision.`);
+}
+
 // --- crew maintains itself -------------------------------------------------------
 // A defect in crew is repaired the way any other work is done: by a worker, on a branch, in
 // its own copy - here a copy of crew's own source. `crew selfmerge` is the only gate between
@@ -760,7 +873,7 @@ function cmdStatus(args) {
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
-  fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
+  tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew/home)
   crew project add <name> <git folder>     register a project   (crew project list)
@@ -772,6 +885,9 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew stop <id> [--force]                 ask the worker to leave
   crew finish <id> [--force]               stop it, remove its terminal and working copy
   crew done [<id>]                         (worker) my report is written
+  crew tell <id> "<message>"               send the worker a follow-up; it reports again
+  crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
+  crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
   crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
   crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
   crew update | crew rollback              bring this machine's crew up to date, or back one step`;
