@@ -416,6 +416,7 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
 function cmdDone(args) {
   const h = home();
   const id = args[0] ?? process.env.CREW_TASK;
+  if (!id) refuse('Usage: crew done [<id>]');
   const task = loadTask(h, id);
   const mine = me();
   if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
@@ -521,6 +522,7 @@ function cmdStop(args) {
   const h = home();
   requireOwner(h);
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
+  if (!id) refuse('Usage: crew stop <id> [--force]');
   const task = loadTask(h, id);
   const result = stopWorker(task, { force });
   if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
@@ -532,6 +534,7 @@ function cmdFinish(args) {
   const h = home();
   requireOwner(h);
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
+  if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);
   if (task.state === 'closed') { console.log(`${id} is already closed`); return; }
   const result = stopWorker(task, { force });

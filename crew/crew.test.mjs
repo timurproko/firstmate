@@ -138,6 +138,20 @@ try {
   let r = crew(['start'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /owned by live terminal c1/);
   r = crew(['spawn', 't1', '--project', 'demo', 'x'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /Read-only/);
 
+  // Missing task ids give command-specific usage, including when only --force is passed.
+  for (const [args, usage] of [
+    [['wait'], 'Usage: crew wait <id> [<id>...] [--timeout seconds]'],
+    [['finish'], 'Usage: crew finish <id> [--force]'],
+    [['finish', '--force'], 'Usage: crew finish <id> [--force]'],
+    [['stop'], 'Usage: crew stop <id> [--force]'],
+    [['stop', '--force'], 'Usage: crew stop <id> [--force]'],
+    [['done'], 'Usage: crew done [<id>]'],
+  ]) {
+    const result = crew(args, { terminal: 'c1', env: { CREW_TASK: '' } });
+    assert.equal(result.code, 2, args.join(' '));
+    assert.ok(result.out.includes(usage), result.out);
+  }
+
   // Spawn: its own working copy, a brief, a labelled terminal started with one instruction.
   for (const bad of [['spawn', 'Bad Id', '--project', 'demo', 'x'], ['spawn', 't1', '--project', 'nope', 'x'], ['spawn', 't1', '--project', 'demo', '--agent', 'vim', 'x'], ['spawn', 't1', '--project', 'demo']]) {
     assert.equal(crew(bad, { terminal: 'c1' }).code, 2, bad.join(' '));
@@ -161,6 +175,7 @@ try {
   fs.writeFileSync(path.join(homeDir, 'tasks', 't1', 'report.md'), '# Result\n2 lines\n');
   assert.equal(crew(['done', 't1'], { terminal: 'c2' }).code, 3, 'Another terminal cannot report for it');
   assert.equal(crew(['done', 't1'], { terminal: 't1' }).code, 0);
+  assert.equal(crew(['done'], { terminal: 't1', env: { CREW_TASK: 't1' } }).code, 0, 'done still accepts CREW_TASK instead of an explicit id');
   r = crew(['wait', 't1'], { terminal: 'c1' }); assert.equal(r.code, 0); assert.match(r.out, /== t1: reported\n# Result\n2 lines/);
   assert.match(crew(['status'], { terminal: 'c2' }).out, /owner c1 \(live, you are read-only\)[\s\S]*t1\treported\tscout\/pi\tdemo\tt1/);
 
