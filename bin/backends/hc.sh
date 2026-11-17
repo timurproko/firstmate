@@ -354,11 +354,62 @@ fm_backend_hc_send_text_line() {  # <target> <text> [expected-label]
   fm_backend_hc_cli "$FM_BACKEND_HC_SESSION" send --json "$FM_BACKEND_HC_ADDRESS" -- "$2" >/dev/null 2>&1
 }
 
+# fm_backend_hc_probed_path: ask the terminal's own shell where it is. Prints
+# `$PWD` between two markers unique to this call, then reads only that block
+# back from the capture, joining rows the terminal wrapped. Empty when the
+# shell never answers. The same active probe cmux and zellij use, for the same
+# reason: no passive field follows the shell that actually takes the input.
+fm_backend_hc_probed_path() {  # <target> [expected-label]
+  local target=$1 label=${2:-} nonce begin end out line chunk in_block found="" _
+  nonce="$$_${RANDOM}${RANDOM}"
+  begin="__FM_HC_CWD_${nonce}_BEGIN__"
+  end="__FM_HC_CWD_${nonce}_END__"
+  fm_backend_hc_send_text_line "$target" "printf '%s\n' '$begin'; pwd; printf '%s\n' '$end'" "$label" || return 0
+  for _ in 1 2 3; do
+    sleep 0.3
+    out=$(fm_backend_hc_capture "$target" 200 "$label") || return 0
+    chunk="" in_block=0
+    while IFS= read -r line; do
+      line=${line%$'\r'}
+      line=${line%"${line##*[! ]}"}
+      if [ "$line" = "$begin" ]; then
+        in_block=1
+        chunk=""
+      elif [ "$line" = "$end" ]; then
+        case "$chunk" in /*) [ "$in_block" -eq 0 ] || found=$chunk ;; esac
+        in_block=0
+      elif [ "$in_block" -eq 1 ]; then
+        chunk="$chunk$line"
+      fi
+    done <<EOF
+$out
+EOF
+    [ -z "$found" ] || break
+  done
+  printf '%s' "$found"
+}
+
+# fm_backend_hc_current_path: where the terminal's shell is, or empty when that
+# cannot be proven. hc's foreground `cwd` is the answer wherever hc sees the
+# real foreground process. On native Windows it sees only the shell launcher
+# (`bash.exe`) that started the terminal, whose directory never changes: the
+# shell that ran `cd`, or the one `treehouse get` opened in the worktree, is a
+# descendant hc does not report. There the shell is asked instead, and only
+# while no harness reports native status in the terminal, so the probe is never
+# typed into an agent; with a status present the path is unknown.
 fm_backend_hc_current_path() {  # <target> [expected-label]
-  local json
+  local json mode
   fm_backend_hc_target_ready "$1" "${2:-}" || return 0
   json=$(fm_backend_hc_get "$1") || return 0
-  printf '%s' "$json" | jq -r '.foreground.cwd // .cwd // empty' 2>/dev/null
+  mode=$(printf '%s' "$json" | jq -r '
+    if ((.foreground.name // "") | test("^(ba)?sh\\.exe$"; "i"))
+    then (if .status == null then "probe" else "blind" end)
+    else "native" end' 2>/dev/null)
+  case "$mode" in
+    probe) fm_backend_hc_probed_path "$1" "${2:-}" ;;
+    blind) ;;
+    *) printf '%s' "$json" | jq -r '.foreground.cwd // .cwd // empty' 2>/dev/null ;;
+  esac
 }
 
 fm_backend_hc_composer_caps() {
