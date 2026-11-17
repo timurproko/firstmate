@@ -14,7 +14,7 @@ scouts requested at once): about 1 minute with crew against about 31 minutes wit
 
 ```
 ~/.crew/tool/        this repository, when installed from the Herdr plugin
-~/.crew/home/        the default crew home: crew.json, AGENTS.md, CLAUDE.md, owner.json, tasks/<id>/
+~/.crew/crew/        the default crew home: crew.json, AGENTS.md, CLAUDE.md, owner.json, tasks/<id>/
 ~/.crew/worktrees/   workers' copies: <home tag>/<task id>
 ```
 
@@ -25,7 +25,7 @@ coordinator.
 ## Commands
 
 ```
-crew init [folder]                       create a crew home (default ~/.crew/home)
+crew init [folder]                       create a crew home (default ~/.crew/crew)
 crew project add <name> <git folder>     register a project   (crew project list)
 crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session

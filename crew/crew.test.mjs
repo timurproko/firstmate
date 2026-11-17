@@ -125,8 +125,30 @@ try {
   // A home, with coordinator rules any agent reads, and a registered project.
   assert.match(crew(['status'], { cwd: root }).out, /No crew home yet/);
   // With no folder, the home is the per-user one, and crew then works from anywhere.
-  assert.ok(crew(['init'], { cwd: root }).out.includes('/user/.crew/home'), 'The default home is under the user folder');
-  assert.ok(crew(['status'], { cwd: root }).out.includes('.crew/home - no owner'), 'crew finds the default home from any folder');
+  assert.ok(crew(['init'], { cwd: root }).out.includes('/user/.crew/crew'), 'The default home is under the user folder, in a folder named crew');
+  assert.ok(crew(['status'], { cwd: root }).out.includes('.crew/crew - no owner'), 'crew finds the default home from any folder');
+  // A home from before 0.6 (~/.crew/home) keeps working and is moved once, when nobody uses it.
+  {
+    const now = path.join(fakeUser, '.crew', 'crew'), old = path.join(fakeUser, '.crew', 'home');
+    assert.equal(slash(crew(['home'], { cwd: root }).out.trim()), slash(now));
+    fs.renameSync(now, old);
+    fs.mkdirSync(path.join(old, 'tasks', 'k1'), { recursive: true });
+    fs.writeFileSync(path.join(old, 'tasks', 'k1', 'task.json'), JSON.stringify({ id: 'k1', state: 'closed', report: `${slash(old)}/tasks/k1/report.md`, brief: `${slash(old)}/tasks/k1/brief.md`, worktree: 'C:/elsewhere/k1' }));
+    assert.ok(crew(['status'], { cwd: root }).out.includes('.crew/home - no owner'), 'The old place still works');
+    assert.equal(crew(['init'], { cwd: root }).code, 2, 'No second default home beside the old one');
+    let w0 = readWorld(); w0.terminals.old1 = { address: 'old1', state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w0));
+    fs.writeFileSync(path.join(old, 'owner.json'), JSON.stringify({ terminal: 'old1' }));
+    let m = crew(['home', '--ensure'], { cwd: root });
+    assert.ok(m.out.includes('for now: a session still holds it') && fs.existsSync(old) && !fs.existsSync(now), m.out);
+    w0 = readWorld(); delete w0.terminals.old1; fs.writeFileSync(world, JSON.stringify(w0));
+    m = crew(['home', '--ensure'], { cwd: root });
+    assert.ok(m.out.includes('the home moved to') && !fs.existsSync(old) && fs.existsSync(path.join(now, 'crew.json')), m.out);
+    const k1 = JSON.parse(fs.readFileSync(path.join(now, 'tasks', 'k1', 'task.json'), 'utf8'));
+    assert.deepEqual([k1.report, k1.brief, k1.worktree], [`${slash(now)}/tasks/k1/report.md`, `${slash(now)}/tasks/k1/brief.md`, 'C:/elsewhere/k1'], 'Task records follow the home');
+    fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
+    m = crew(['home', '--ensure'], { cwd: root });
+    assert.ok(m.code === 0 && fs.existsSync(path.join(now, 'crew.json')), 'With no home at all, --ensure creates the default one');
+  }
   fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
   assert.equal(crew(['init', homeDir]).code, 0);
   assert.ok(fs.readFileSync(path.join(homeDir, 'AGENTS.md'), 'utf8').includes('crew spawn'));
@@ -587,7 +609,10 @@ else if (a[0] === 'get') {
   // Herdr's status bar reads, so the person can open it from wherever they sit.
   const fakeLavish = path.join(root, 'fake-lavish.mjs'), page = path.join(root, 'report.html');
   fs.writeFileSync(page, '<h1>Report</h1>');
-  fs.writeFileSync(fakeLavish, `const a = process.argv.slice(2);
+  const lavishArgs = path.join(root, 'lavish-args.txt');
+  fs.writeFileSync(fakeLavish, `import fs from 'node:fs';
+const a = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(lavishArgs)}, a.join(' '));
 if (a[0] === '--version') console.log('0.1.96');
 else if (a[0].endsWith('broken.html')) { console.error('error: the user ended this session'); process.exit(1); }
 else console.log('session: opened\\nurl: "http://127.0.0.1:4387/session/d849b898fa86dff9"\\nfile: ' + a[0]);
@@ -598,9 +623,14 @@ else console.log('session: opened\\nurl: "http://127.0.0.1:4387/session/d849b898
   assert.equal(crew(['show', page], { terminal: 'c2' }).code, 4, 'No lavish-axi, no page');
   r = crew(['show', page], { terminal: 'c2', env: L }); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /shown: http:\/\/127\.0\.0\.1:4387\/session\/d849b898fa86dff9\n.*Lavish link in the status bar/);
-  assert.deepEqual(readWorld().log.filter(a => a[0] === 'label').slice(-2), [['label', 'c2', 'custom.preview.url=http://127.0.0.1:4387/session/d849b898fa86dff9'], ['label', 'c2', 'custom.preview.label=Lavish']]);
+  // In a Herdr terminal no browser is opened on this machine; a timed request label asks
+  // Herdr to open the page where the person is.
+  assert.ok(fs.readFileSync(lavishArgs, 'utf8').endsWith('--no-open'));
+  assert.match(readWorld().log.filter(a => a[0] === 'label').at(-1)[2], /^custom\.preview\.open=\d{13}$/);
+  assert.deepEqual(readWorld().log.filter(a => a[0] === 'label').slice(-3, -1), [['label', 'c2', 'custom.preview.url=http://127.0.0.1:4387/session/d849b898fa86dff9'], ['label', 'c2', 'custom.preview.label=Lavish']]);
   const before = readWorld().log.length;
   r = crew(['show', page], { env: L }); assert.equal(r.code, 0); assert.match(r.out, /not a Herdr terminal/);
+  assert.ok(!fs.readFileSync(lavishArgs, 'utf8').includes('--no-open'), 'Outside Herdr lavish-axi opens the page itself');
   assert.equal(readWorld().log.length, before, 'Outside a terminal nothing is labelled');
   fs.writeFileSync(path.join(root, 'broken.html'), 'x');
   r = crew(['show', path.join(root, 'broken.html')], { terminal: 'c2', env: L }); assert.equal(r.code, 4); assert.match(r.out, /did not open the page: error: the user ended this session/);
