@@ -21,6 +21,11 @@ set -u
 
 TMP_ROOT=$(fm_test_tmproot fm-session-lock-ps-denied)
 
+# Every case here stages its process table through a fake or blocked ps. On a
+# Cygwin-family host the library would read the real /proc first, so point it
+# at an empty root and keep the staged table the only one.
+export FM_PROC_ROOT="$TMP_ROOT/no-proc"
+
 LIB="$ROOT/bin/fm-session-lock-lib.sh"
 
 # A denied ps: refuses to run at all, exactly like the blocked binary.
