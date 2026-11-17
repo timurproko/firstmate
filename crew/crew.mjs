@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.4.1';
+export const VERSION = '0.4.2';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -433,8 +433,10 @@ function cmdBacklog(args) {
   const h = home();
   if (!toolPath('tasks-axi')) refuse('The backlog needs tasks-axi, which is not installed here (Herdr: Settings > Plugins > Crew, or `npm install -g tasks-axi`).', 4);
   const words = args.length ? args : ['list'];
-  if (!BACKLOG_READS.includes(words[0])) requireOwner(h);
-  const r = runTool('tasks-axi', [...words, '--file', backlogFile(h)], { timeout: 60000 });
+  // tasks-axi wants its flags after a command, so a bare help flag is its own help, as it is.
+  const help = words[0].startsWith('-');
+  if (!help && !BACKLOG_READS.includes(words[0])) requireOwner(h);
+  const r = runTool('tasks-axi', help ? ['--help'] : [...words, '--file', backlogFile(h)], { timeout: 60000 });
   process.stdout.write(r.stdout); process.stderr.write(r.stderr);
   process.exitCode = r.code ?? 1;
 }
@@ -1054,6 +1056,8 @@ export function main(argv) {
   const [name, ...args] = argv;
   if (name === '--version') { console.log(VERSION); return; }
   const command = COMMANDS[name];
+  // `crew <command> --help` is a question, never an id or a task text.
+  if (command && name !== 'backlog' && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
   if (!command) { console.log(USAGE); process.exitCode = name && name !== '--help' && name !== 'help' ? 2 : 0; return; }
   try { command(args); } catch (error) {
     if (error instanceof Refusal) {
