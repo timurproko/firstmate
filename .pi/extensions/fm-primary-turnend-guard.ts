@@ -111,6 +111,7 @@ type SessionStartContext = {
   hasUI?: boolean;
   ui?: {
     setWidget?: (key: string, content: readonly string[] | undefined) => void;
+    setStatus?: (key: string, text: string | undefined) => void;
   };
   sessionManager?: {
     getHeader?: () => { timestamp?: unknown } | null | undefined;
@@ -209,15 +210,20 @@ function showSessionstartProgress(
   const ui = ctx.ui;
   if (typeof ui?.setWidget !== "function") return;
   const started = Date.now();
+  // Replacing a widget does not by itself redraw an idle screen on every host
+  // (A1 leaves the old line up until something else renders), so each change
+  // is followed by an empty status update, the redraw fm-calm.ts relies on.
+  const put = (content: readonly string[] | undefined): void => {
+    try {
+      ui.setWidget?.(sessionstartProgressWidgetKey, content);
+      ui.setStatus?.(sessionstartProgressWidgetKey, undefined);
+    } catch {
+    }
+  };
   const paint = (): void => {
     if (!sessionstartGenerationIsLive(generation)) return;
     const seconds = Math.round((Date.now() - started) / 1000);
-    try {
-      ui.setWidget?.(sessionstartProgressWidgetKey, [
-        `Firstmate is starting (${seconds}s). A message sent now runs as soon as it is ready.`,
-      ]);
-    } catch {
-    }
+    put([`Firstmate is starting (${seconds}s). A message sent now runs as soon as it is ready.`]);
   };
   paint();
   const timer = setInterval(paint, sessionstartProgressIntervalMs);
@@ -226,10 +232,7 @@ function showSessionstartProgress(
     clearInterval(timer);
     // A replacement generation has already painted its own line; leave it.
     if (activeSessionstartGeneration && activeSessionstartGeneration !== generation) return;
-    try {
-      ui.setWidget?.(sessionstartProgressWidgetKey, undefined);
-    } catch {
-    }
+    put(undefined);
   });
 }
 
