@@ -17,6 +17,13 @@ type LockOwnership = "owned" | "missing" | "other";
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
 const root = resolve(extensionDir, "../..");
+// Windows cannot walk from a shell back to the Pi-family process that spawned it
+// (bin/fm-session-lock-lib.sh, "Windows process-boundary bridge"), so the primary
+// publishes its own process id and every child - the session-start wrapper, the
+// guard, the model's shells - inherits it. The lock library confirms the pid is a
+// live Pi harness before using it. A harness that scrubs inherited copies at
+// startup (A1) still sees this fresh value because this code runs inside it.
+process.env.FM_PI_SESSION_PID = String(process.pid);
 const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const marker = `${state}/.pi-turnend-extension-loaded`;
