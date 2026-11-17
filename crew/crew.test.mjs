@@ -26,7 +26,7 @@ assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', proje
   const launcher = path.join(root, 'claude-as.sh'); fs.writeFileSync(launcher, '#!/bin/sh');
   const env = { CREW_CLAUDE_ACCOUNT: 'me@example.com', CREW_CLAUDE_LAUNCHER: launcher };
   assert.equal(agentCommand('a1', AGENTS.a1, 'do it', env), "'a1' 'do it'", 'The account applies to Claude Code only');
-  assert.equal(agentCommand('claude', AGENTS.claude, 'do it', {}), "'claude' 'do it' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,Read,Edit,Write,Glob,Grep'");
+  assert.equal(agentCommand('claude', AGENTS.claude, 'do it', {}), "'claude' 'do it' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'");
   const line = agentCommand('claude', AGENTS.claude, "it's", env);
   assert.ok(line.startsWith("bash --noprofile --norc '") && line.includes("claude-as.sh' --as 'me@example.com' --command \"$(type -P claude || type -P claude.exe)\" -- 'it'\\''s' '--permission-mode' 'acceptEdits'"), line);
   assert.throws(() => agentCommand('claude', AGENTS.claude, 'x', { ...env, CREW_CLAUDE_ACCOUNT: "a'; rm -rf ~" }), /Not an account name/);
@@ -219,7 +219,7 @@ try {
   // Claude Code: the instruction comes before its options, and it keeps its permission system.
   assert.equal(crew(['spawn', 'tc', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' }).code, 0);
   const claudeLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
-  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,Read,Edit,Write,Glob,Grep'; exec bash"), claudeLine);
+  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; exec bash"), claudeLine);
   assert.ok(!claudeLine.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
   // Its copy is recorded as trusted in Claude's config, beside what was there; a1/pi copies are not.
   const copyKey = slash(path.join(copies, 'tc'));
