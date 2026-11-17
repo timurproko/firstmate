@@ -121,8 +121,9 @@ try {
   r = crew(['wait', 't2', '--timeout', '1'], { terminal: 'c1' }); assert.equal(r.code, 124); assert.match(r.out, /still working after 1s/);
   // A worker waiting for a person is handed back at once, not waited on.
   setTerminal('t2', { status: { app: 'claude-code', state: 'blocked', kind: 'permission', msg: 'trust this folder' } });
-  r = crew(['wait', 't2', '--timeout', '30'], { terminal: 'c1' }); assert.equal(r.code, 7); assert.match(r.out, /== t2: needs a person - trust this folder (terminal t2); it is still running/);
-  assert.match(crew(['status'], { terminal: 'c1' }).out, /t2	working/, 'Its task is unchanged');
+  r = crew(['wait', 't2', '--timeout', '30'], { terminal: 'c1' }); assert.equal(r.code, 7); assert.ok(r.out.includes('== t2: needs a person - trust this folder (terminal t2); it is still running'), r.out);
+  assert.ok(crew(['status'], { terminal: 'c1' }).out.includes('t2\tworking'), 'Its task is unchanged');
+  setTerminal('t2', { status: { app: 'pi', state: 'working' } });
   setTerminal('t2', { state: 'finished' });
   r = crew(['wait', 't2', '--timeout', '20'], { terminal: 'c1' }); assert.equal(r.code, 0); assert.match(r.out, /== t2: failed - The worker terminal ended without a report/);
 
