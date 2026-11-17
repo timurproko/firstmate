@@ -40,7 +40,7 @@ const setTerminal = (address, patch) => { const w = readWorld(); Object.assign(w
 
 const homeDir = path.join(root, 'home'), project = path.join(root, 'project');
 function crew(args, { terminal, cwd = homeDir } = {}) {
-  const env = { ...process.env, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
+  const env = { ...process.env, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -103,6 +103,10 @@ try {
   setTerminal('t2', { state: 'finished' });
   r = crew(['wait', 't2', '--timeout', '20'], { terminal: 'c1' }); assert.equal(r.code, 0); assert.match(r.out, /== t2: failed - The worker terminal ended without a report/);
 
+  // A reported worker still inside its last turn gets a short grace, then counts as busy.
+  setTerminal('t1', { status: { app: 'pi', state: 'working' } });
+  r = crew(['finish', 't1'], { terminal: 'c1' }); assert.equal(r.code, 6); assert.match(r.out, /still working/);
+  setTerminal('t1', { status: { app: 'pi', state: 'done' } });
   // Finish: terminal and working copy go, the report stays; then the home can be released.
   assert.equal(crew(['finish', 't1'], { terminal: 'c2' }).code, 3);
   r = crew(['finish', 't1'], { terminal: 'c1' }); assert.equal(r.code, 0, r.out);

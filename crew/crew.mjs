@@ -321,7 +321,14 @@ function a1Api(type, target) {
   try { return JSON.parse(r.stdout); } catch { return null; }
 }
 function stopWorker(task, { force = false } = {}) {
-  const t = terminal(task.terminal);
+  let t = terminal(task.terminal);
+  if (!t || t.state !== 'live') return { stopped: true, how: 'terminal already gone' };
+  // A worker reports from inside its last turn; give that turn a moment to end before
+  // deciding it is still busy.
+  for (let i = 0; task.state === 'reported' && !force && t?.state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
+    sleep(1000);
+    t = terminal(task.terminal);
+  }
   if (!t || t.state !== 'live') return { stopped: true, how: 'terminal already gone' };
   const working = t.status?.state === 'working';
   if (working && !force) refuse(`Task ${task.id} is still working. Wait for it, or pass --force to cancel it.`, 6);
