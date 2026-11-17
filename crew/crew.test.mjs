@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, AGENTS, main } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, githubOwner, AGENTS, main } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -394,7 +394,68 @@ if (a[0] === 'run') {`));
   assert.match(crew(['start'], { terminal: 'c2' }).out, /coordinator rules changed/);
   assert.ok(fs.readFileSync(path.join(homeDir, 'AGENTS.md'), 'utf8').includes('crew selfmerge'));
 
-  console.log('PASS: self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  // --- follow-ups, review and delivery ---------------------------------------------------
+  assert.deepEqual(['https://github.com/acme/tool.git', 'git@github.com:acme/tool', 'https://github.com/acme/tool/', path.join(root, 'x.git')].map(githubOwner), ['acme', 'acme', 'acme', null]);
+  const fakeGh = path.join(root, 'fake-gh.mjs'), ghLog = path.join(root, 'gh-log.json'), ghDown = path.join(root, 'gh-down');
+  fs.writeFileSync(ghLog, '[]');
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs';
+const a = process.argv.slice(2), file = ${JSON.stringify(ghLog)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
+log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
+if (a[0] === 'auth') process.exit(1);
+if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
+console.log('https://example.invalid/acme/demo/pull/7');
+`);
+  const own = (args, terminal = 'c2') => crew(args, { terminal, env: { CREW_GH: fakeGh } });
+  assert.equal(own(['spawn', 's1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Change the readme.']).code, 0);
+  assert.equal(own(['spawn', 's2', '--project', 'demo', '--agent', 'pi', 'Look.']).code, 0);
+  const s1 = taskOf('s1'), s1copy = path.join(copies, 's1');
+  // tell: only the owner, only a worker that is there and not waiting for a person.
+  assert.equal(own(['tell', 's1']).code, 2); assert.equal(own(['tell', 's1', 'x'], 'c1').code, 3);
+  assert.equal(own(['tell', 't1', 'x']).code, 2, 'A closed task has no worker');
+  setTerminal(s1.terminal, { status: { app: 'pi', state: 'blocked', msg: 'allow?' } });
+  assert.equal(own(['tell', 's1', 'x']).code, 7);
+  setTerminal(s1.terminal, { status: { app: 'pi', state: 'working' } });
+  r = own(['tell', 's1', 'Keep the first line.']); assert.equal(r.code, 0, r.out); assert.match(r.out, /told s1; next: crew wait s1/);
+  let sent = readWorld().log.filter(a => a[0] === 'send').at(-1);
+  assert.equal(sent[1], s1.terminal); assert.ok(sent[2].includes('Keep the first line.') && sent[2].includes('crew done s1'), sent[2]);
+  // Nothing is reviewed or delivered before the worker reported, and a scout has no branch.
+  for (const verb of ['review', 'land']) { assert.equal(own([verb]).code, 2); assert.equal(own([verb, 's1']).code, 2, verb); assert.equal(own([verb, 's2']).code, 2, verb); assert.equal(own([verb, 's1'], 'c1').code, 3); }
+  commit(s1copy, { 'README.md': 'one\ntwo\nthree\n' }, 'Add a third line');
+  fs.writeFileSync(s1.report, '# Done\nAdded a line.\n'); assert.equal(crew(['done', 's1'], { terminal: s1.terminal }).code, 0);
+  // A follow-up reopens a reported task; the same worker reports again.
+  assert.equal(own(['tell', 's1', 'Also say why.']).code, 0);
+  assert.deepEqual([taskOf('s1').state, taskOf('s1').tells], ['working', 2]);
+  assert.equal(own(['land', 's1']).code, 2, 'Reopened work is not delivered');
+  assert.equal(crew(['done', 's1'], { terminal: s1.terminal }).code, 0);
+  // review: a read-only task for another worker, pointed at the branch.
+  r = own(['review', 's1', '--agent', 'vim']); assert.equal(r.code, 2);
+  r = own(['review', 's1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /spawned s1-review: pi scout[\s\S]*next: crew wait s1-review/);
+  const review = taskOf('s1-review');
+  assert.deepEqual([review.kind, review.reviews, review.project], ['scout', 's1', 'demo']);
+  assert.ok(fs.readFileSync(review.brief, 'utf8').includes('git diff HEAD...crew/s1') && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
+  assert.match(own(['review', 's1', '--agent', 'claude']).out, /spawned s1-review-2: claude scout/);
+  // land: refused with unsaved work, without a place to push to, and honest when GitHub says no.
+  fs.writeFileSync(path.join(s1copy, 'loose.txt'), 'x');
+  r = own(['land', 's1']); assert.equal(r.code, 6); assert.match(r.out, /uncommitted files \(loose\.txt\)/);
+  fs.rmSync(path.join(s1copy, 'loose.txt'));
+  r = own(['land', 's1']); assert.equal(r.code, 6); assert.match(r.out, /no `origin` to push to/);
+  const projectOrigin = path.join(root, 'project-origin.git'); git('clone', '-q', '--bare', project, projectOrigin); git('-C', project, 'remote', 'add', 'origin', projectOrigin);
+  const baseBranch = git('-C', project, 'rev-parse', '--abbrev-ref', 'HEAD').trim();
+  fs.writeFileSync(ghDown, '');
+  r = own(['land', 's1']); assert.equal(r.code, 4); assert.match(r.out, /branch crew\/s1 is pushed, but the pull request was not opened \(gh: not signed in\)/);
+  assert.equal(git('-C', projectOrigin, 'rev-parse', 'crew/s1').trim(), head(s1copy), 'The branch is published');
+  assert.equal(taskOf('s1').pr, undefined);
+  fs.rmSync(ghDown);
+  r = own(['land', 's1']); assert.equal(r.code, 0, r.out);
+  assert.ok(r.out.includes(`delivered s1: https://example.invalid/acme/demo/pull/7 (against ${baseBranch}, 1 commit)`), r.out);
+  const made = JSON.parse(fs.readFileSync(ghLog, 'utf8')).at(-1);
+  assert.deepEqual(made.a.slice(0, 8), ['pr', 'create', '--base', baseBranch, '--head', 'crew/s1', '--title', 'Add a third line']);
+  assert.match(made.body, /# Done\nAdded a line\.[\s\S]*crew task `s1` \(pi\), 1 commit/);
+  assert.equal(taskOf('s1').pr, 'https://example.invalid/acme/demo/pull/7');
+  assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
+  for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
+
+  console.log('PASS: follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

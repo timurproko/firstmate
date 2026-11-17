@@ -35,6 +35,9 @@ crew status [--all] [--json]             tasks and their terminals
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               stop it, remove its terminal and working copy
 crew done [<id>]                         (worker) my report is written
+crew tell <id> "<message>"               send the worker a follow-up; it reports again
+crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
+crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
 crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
 crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
 crew update | crew rollback              bring this machine's crew up to date, or back one step
@@ -69,6 +72,21 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
 | `claude` | `claude "<instruction>"` | terminal closed when idle |
 
 Adding one is a line in `AGENTS` in `crew.mjs`.
+
+## Delivering a code change
+
+A ship task ends with commits on branch `crew/<id>`. From there:
+
+- `crew review <id>` starts a read-only task `<id>-review` whose brief points at that branch.
+  Its report starts with `APPROVE` or `CHANGES NEEDED`. `--agent` (or `CREW_REVIEW_AGENT`)
+  picks a different agent for it.
+- `crew tell <id> "<message>"` pastes a follow-up into the worker's terminal and reopens the
+  task; the worker rewrites its report and runs `crew done` again. Refused when the worker is
+  gone or is waiting for a person.
+- `crew land <id>` pushes the branch to the project's `origin` and opens a pull request with
+  `gh`, against the branch the project folder is on (or the default branch), with the report
+  as its text. If the machine is signed in to GitHub as the repository's owner among several
+  accounts, that account is used. crew never merges a project's pull request.
 
 ## Crew repairs itself
 
@@ -106,7 +124,7 @@ reaches every machine at its next session; `crew rollback` is per machine.
   refuses unsafe operations (second owner, reporting for another terminal, closing a busy
   worker).
 - Closing a non-A1 agent's terminal can leave helper processes of that agent behind.
-- No pull-request, merge, review or hold handling yet; `ship` ends with a local branch.
+- No merge, queue or hold handling yet; `crew land` ends with an open pull request.
 - One machine per home. Tested live on Windows with A1 and Pi workers and an A1 coordinator.
 
 ## Tests
