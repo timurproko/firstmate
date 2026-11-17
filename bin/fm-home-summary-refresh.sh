@@ -23,7 +23,8 @@
 # state/.home-summary-refresh.log when available, with stderr as the bounded
 # fallback, and the command exits zero. Session start, watcher, spawn, and
 # teardown use that mode so this side-band publication can never change their
-# result. Without it, failures are printed and returned to the direct caller
+# result. With FM_HOME_SUMMARY_DETACH=1 in the environment such a trigger
+# also does not wait: it starts a detached copy of itself and returns. Without it, failures are printed and returned to the direct caller
 # for tests and diagnostics.
 set -u
 
@@ -67,6 +68,15 @@ case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
+# FM_HOME_SUMMARY_DETACH=1 lets a --best-effort trigger return at once and
+# publish from a detached copy of this script. The publication is side-band by
+# contract and already serialized by its refresh lock, so only the caller's wait
+# changes; the detached copy logs failures exactly as before. Opt-in for hosts
+# where the producer is slow enough to dominate spawn and teardown.
+if [ "$HOME_SUMMARY_MODE" = parent ] && [ "$BEST_EFFORT" -eq 1 ]   && [ "${FM_HOME_SUMMARY_DETACH:-0}" = 1 ]; then
+  FM_HOME_SUMMARY_DETACH=0 "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort     </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
 case "$ERROR_LOG_MAX_BYTES" in
   ''|*[!0-9]*|0) ERROR_LOG_MAX_BYTES=65536 ;;
 esac

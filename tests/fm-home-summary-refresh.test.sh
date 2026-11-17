@@ -457,6 +457,30 @@ grep -F 'summary producer failed' "$HOME_DIR/state/.home-summary-refresh.log" >/
   || fail "best-effort refresh did not log its failure"
 pass "best-effort publication logs and continues"
 
+# FM_HOME_SUMMARY_DETACH=1 makes a best-effort trigger return before the slow
+# producer finishes; the detached copy still publishes. Without --best-effort
+# the switch is ignored.
+SLOWBIN="$TMP_ROOT/slowbin"
+mkdir -p "$SLOWBIN"
+REAL_JQ=$(command -v jq)
+cat > "$SLOWBIN/jq" <<SH
+#!/usr/bin/env bash
+sleep 2
+exec "$REAL_JQ" "$@"
+SH
+chmod +x "$SLOWBIN/jq"
+rm -f "$HOME_DIR/state/home-summary.json"
+detach_started=$SECONDS
+PATH="$SLOWBIN:$FAKEBIN:$PATH"   FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_HOME_SUMMARY_DETACH=1   "$WRITER" --best-effort   || fail "a detached best-effort refresh changed the caller result"
+[ $((SECONDS - detach_started)) -lt 2 ] || fail "a detached refresh made its caller wait for the producer"
+[ ! -e "$HOME_DIR/state/home-summary.json" ] || fail "the detached refresh published before its slow producer could finish"
+for _ in $(seq 1 240); do
+  [ -s "$HOME_DIR/state/home-summary.json" ] && break
+  sleep 0.5
+done
+jq -e '.generated_epoch' "$HOME_DIR/state/home-summary.json" >/dev/null   || fail "the detached refresh never published the ledger"
+pass "FM_HOME_SUMMARY_DETACH=1 publishes from a detached refresh without holding the caller"
+
 LOCK_MARKER="$TMP_ROOT/lock-held"
 rm -f "$HOME_DIR/state/.home-summary-refresh.log"
 FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" bash -c '
