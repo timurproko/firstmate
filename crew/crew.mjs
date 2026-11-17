@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.4.2';
+export const VERSION = '0.5.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -228,7 +228,11 @@ is required. For any of them, read its \`--help\` before the first use instead o
   pull requests itself.
 - **Browser** (\`chrome-devtools-axi\`): for looking at a web page. Workers are told about it.
 - **Showing instead of telling** (\`lavish-axi\`): when the person must choose between several
-  options, or a report is long, show it as a page with it. A yes-or-no question stays in chat.
+  options, or a report is long, write it as a page (\`lavish-axi --help\` says how) and open
+  it with \`crew show <page.html>\`, never with \`lavish-axi <page.html>\` directly: the person
+  may be at another machine, and \`crew show\` also puts a Lavish link in the status bar of
+  your terminal that opens the page where they are. Say that the link is there. Wait for
+  their answer with \`lavish-axi poll <page.html>\`. A yes-or-no question stays in chat.
 - **treehouse**: a project added with \`crew project add <name> <folder> --treehouse\` gives
   its workers prepared copies from the treehouse pool. Nothing else changes for you.
 - **no-mistakes**: a project that has its gate is delivered through it. The worker runs the
@@ -381,7 +385,7 @@ export const TOOLS = [
   { id: 'gh', crew: '`crew land` opens the pull request with it' },
   { id: 'gh-axi', crew: 'agents read and write GitHub with it', brief: 'For GitHub (issues, pull requests, checks) use `gh-axi`; run `gh-axi --help` first.' },
   { id: 'chrome-devtools-axi', crew: 'agents look at web pages with it', brief: 'To look at a web page or check something in a browser use `chrome-devtools-axi`; run `chrome-devtools-axi --help` first.' },
-  { id: 'lavish-axi', crew: 'the coordinator shows a decision or a long report as a page' },
+  { id: 'lavish-axi', crew: '`crew show` opens a decision or a long report as a page, with a link in the Herdr status bar' },
   { id: 'tasks-axi', crew: '`crew backlog` keeps the queue with it; spawn, land and finish move the item' },
   { id: 'quota-axi', crew: 'the coordinator checks which agent has room before a batch' },
   { id: 'treehouse', crew: 'worker copies of a project added with --treehouse come from its pool' },
@@ -423,6 +427,28 @@ function cmdTools(args) {
   if (args.includes('--json')) { console.log(JSON.stringify({ tools: rows })); return; }
   for (const r of rows) console.log(`${r.id.padEnd(20)}${(r.version ?? 'not installed').padEnd(15)}${r.use}`);
   if (rows.some(r => !r.installed)) console.log('Missing tools are optional. Install them in Herdr: Settings > Plugins > Crew.');
+}
+
+// show: a page for the person. lavish-axi serves it on this machine only (127.0.0.1), and the
+// person may be sitting at another one, with this machine reached over SSH. So the page's
+// address is also put on this terminal as a label Herdr understands: its status bar then
+// shows a "Lavish" link for this terminal that opens the page on the person's own machine
+// (through an SSH forward when this one is remote), at any time, not only when it was made.
+const PAGE_URL = /https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?:\/[^\s"'<>)\]]*)?/;
+function cmdShow(args) {
+  const file = args.find(a => !a.startsWith('--')), mine = me();
+  if (!file) refuse('Usage: crew show <page.html> [--reopen]');
+  if (!fs.existsSync(file)) refuse(`No such page: ${file}`);
+  if (!toolPath('lavish-axi')) refuse('Showing a page needs lavish-axi, which is not installed here (Herdr: Settings > Plugins > Crew, or `npm install -g lavish-axi`).', 4);
+  const opened = runTool('lavish-axi', [path.resolve(file), ...(args.includes('--reopen') ? ['--reopen'] : [])], { timeout: 120000 });
+  const said = `${opened.stdout}\n${opened.stderr}`, url = PAGE_URL.exec(said)?.[0];
+  if (opened.code !== 0 || !url) refuse(`lavish-axi did not open the page: ${lastLine(said)}`, 4);
+  console.log(`shown: ${url}`);
+  if (!mine) { console.log('This is not a Herdr terminal, so no link was added to a status bar.'); return; }
+  const labelled = [`custom.preview.url=${url}`, 'custom.preview.label=Lavish'].map(label => hc(['label', mine, label]));
+  console.log(labelled.every(r => r.code === 0)
+    ? 'The person opens it with the Lavish link in the status bar of this terminal, from their own machine too. Tell them it is there.'
+    : `Core did not label this terminal (${lastLine(labelled.find(r => r.code !== 0).stderr)}); give the person the address instead.`);
 }
 
 // The backlog is one Markdown file in the home, kept by tasks-axi. A crew task with the
@@ -1031,7 +1057,7 @@ function cmdStatus(args) {
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
-  tools: cmdTools, backlog: cmdBacklog, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
+  tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew/home)
   crew project add <name> <git folder> [--treehouse]   register a project   (crew project list)
@@ -1048,6 +1074,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
   crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
+  crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
   crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
   crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
   crew update | crew rollback              bring this machine's crew up to date, or back one step`;
