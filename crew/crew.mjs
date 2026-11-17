@@ -377,9 +377,15 @@ function cmdFinish(args) {
     if (fs.existsSync(task.worktree)) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { sleep(1000); } }
   }
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
-  if (fs.existsSync(task.worktree)) refuse(`The terminal is closed, but the working copy is still in use and could not be removed: ${task.worktree}`, 6);
+  // An emptied folder that something still sits in (a helper process the agent left behind)
+  // is not worth failing for: the work is gone from disk and from git; say so and move on.
+  let leftover = '';
+  if (fs.existsSync(task.worktree)) {
+    if (fs.readdirSync(task.worktree).length) refuse(`The terminal is closed, but the working copy is still in use and could not be removed: ${task.worktree}`, 6);
+    leftover = `; its empty folder is still held by another process (${task.worktree})`;
+  }
   saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
-  console.log(`finished ${id} (${result.how}); report kept at ${task.report}`);
+  console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}`);
 }
 
 function cmdStatus(args) {
