@@ -80,8 +80,39 @@ fm_harness_path_name() {  # <path>
 #   ps -f -p PID  UID PID PPID TTY STIME COMMAND               (full argv)
 # A genuinely dead or inaccessible pid still fails both paths, so this widens
 # nothing: it only stops a supported platform from failing on ps syntax alone.
+#
+# The Cygwin family also publishes the same three facts as files under
+# /proc/<pid>: `exename` (the executable path ps prints as COMMAND), `cmdline`
+# (NUL-separated argv) and `ppid`. They are read first there, with shell
+# builtins only. Each ps fallback costs two or three process spawns per field,
+# which an ancestry walk repeats for every hop, and its fixed-column parse
+# misreads any process started on an earlier day, whose STIME is two words
+# ("Nov 14") and shifts the command one column to the right.
+# `/proc/<pid>/winpid` exists only on that family, so its presence selects the
+# route without asking uname and never matches Linux's /proc. FM_PROC_ROOT
+# moves the root for tests, which must keep a staged ps table authoritative.
+_fm_cyg_proc() {  # <pid> <comm|args|ppid> -> FM_CYG_PROC_VALUE
+  local dir="${FM_PROC_ROOT:-/proc}/$1" word
+  FM_CYG_PROC_VALUE=''
+  [ -r "$dir/winpid" ] || return 1
+  case "$2" in
+    comm) { IFS= read -r FM_CYG_PROC_VALUE < "$dir/exename" || :; } 2>/dev/null ;;
+    ppid) { IFS= read -r FM_CYG_PROC_VALUE < "$dir/ppid" || :; } 2>/dev/null ;;
+    args)
+      {
+        while IFS= read -r -d '' word || [ -n "$word" ]; do
+          FM_CYG_PROC_VALUE="${FM_CYG_PROC_VALUE:+$FM_CYG_PROC_VALUE }$word"
+        done < "$dir/cmdline"
+      } 2>/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+  [ -n "$FM_CYG_PROC_VALUE" ]
+}
+
 fm_ps_comm() {  # <pid> -> executable name or path
   local pid=$1 out
+  if _fm_cyg_proc "$pid" comm; then printf '%s' "$FM_CYG_PROC_VALUE"; return 0; fi
   out=$(ps -o comm= -p "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
   out=$(ps -p "$pid" 2>/dev/null | awk 'NR == 2 { for (i = 8; i <= NF; i++) printf "%s%s", (i > 8 ? " " : ""), $i; exit }')
   [ -n "$out" ] || return 1
@@ -90,6 +121,7 @@ fm_ps_comm() {  # <pid> -> executable name or path
 
 fm_ps_args() {  # <pid> -> full command line
   local pid=$1 out
+  if _fm_cyg_proc "$pid" args; then printf '%s' "$FM_CYG_PROC_VALUE"; return 0; fi
   out=$(ps -o args= -p "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
   out=$(ps -f -p "$pid" 2>/dev/null | awk 'NR == 2 { for (i = 6; i <= NF; i++) printf "%s%s", (i > 6 ? " " : ""), $i; exit }')
   [ -n "$out" ] || return 1
@@ -98,6 +130,7 @@ fm_ps_args() {  # <pid> -> full command line
 
 fm_ps_ppid() {  # <pid> -> parent pid
   local pid=$1 out
+  if _fm_cyg_proc "$pid" ppid; then printf '%s' "$FM_CYG_PROC_VALUE"; return 0; fi
   out=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
   out=$(ps -f -p "$pid" 2>/dev/null | awk 'NR == 2 { print $3; exit }')
   [ -n "$out" ] || return 1
@@ -122,7 +155,8 @@ FM_HARNESS_IS_CLAUDE=0
 fm_harness_process_matches() {  # <comm> <args>
   local comm=$1 args=$2 base argv0 name
   FM_HARNESS_IS_CLAUDE=0
-  base=$(basename -- "$comm")
+  base=${comm%/}
+  base=${base##*/}
   if printf '%s' "$base" | grep -qE "$FM_HARNESS_RE"; then
     case "$base" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
     return 0
@@ -173,10 +207,18 @@ fm_harness_process_matches() {  # <comm> <args>
 FM_WIN_PID_PREFIX='win:'
 
 # True on a Cygwin-family userspace, where the boundary above applies.
+#
+# The answer cannot change within one shell, and every reader of a lock value
+# asks, so it is computed once per shell rather than spawning uname each time.
 fm_win_boundary_applies() {
-  case "$(uname -s 2>/dev/null)" in
-    CYGWIN*|MINGW*|MSYS*) return 0 ;;
+  case "${FM_WIN_BOUNDARY_KNOWN:-}" in
+    yes) return 0 ;;
+    no) return 1 ;;
   esac
+  case "$(uname -s 2>/dev/null)" in
+    CYGWIN*|MINGW*|MSYS*) FM_WIN_BOUNDARY_KNOWN=yes; return 0 ;;
+  esac
+  FM_WIN_BOUNDARY_KNOWN=no
   return 1
 }
 
@@ -499,6 +541,20 @@ _fm_ps_exec_denied() {
 fm_proc_info() {  # <pid>
   local pid=$1 rc=0 out comm args ppid
   FM_PROC_COMM='' FM_PROC_ARGS='' FM_PROC_PPID=''
+  # Cygwin family: all three fields straight from /proc, with no process
+  # spawned. A field that cannot be read falls through to the ps routes below.
+  if _fm_cyg_proc "$pid" comm; then
+    comm=$FM_CYG_PROC_VALUE
+    if _fm_cyg_proc "$pid" args; then
+      args=$FM_CYG_PROC_VALUE
+      if _fm_cyg_proc "$pid" ppid; then
+        case "$FM_CYG_PROC_VALUE" in
+          *[!0-9]*) ;;
+          *) FM_PROC_COMM=$comm FM_PROC_ARGS=$args FM_PROC_PPID=$FM_CYG_PROC_VALUE; return 0 ;;
+        esac
+      fi
+    fi
+  fi
   out=$(ps -o comm= -p "$pid" 2>/dev/null) || rc=$?
   case $rc in
     0) ;;
