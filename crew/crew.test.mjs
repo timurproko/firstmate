@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, githubOwner, AGENTS, main } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, githubOwner, AGENTS, TOOLS, main } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -57,7 +57,9 @@ fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
 function crew(args, { terminal, cwd = homeDir, env: extra = {} } = {}) {
-  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '', ...extra };
+  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '',
+    // No tool of the machine the suite runs on is seen, unless a test names a fake one.
+    CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -462,7 +464,108 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
   for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
 
-  console.log('PASS: follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  // --- the tools Firstmate works with ----------------------------------------------------
+  assert.deepEqual(TOOLS.map(t => t.id), ['gh', 'gh-axi', 'chrome-devtools-axi', 'lavish-axi', 'tasks-axi', 'quota-axi', 'treehouse', 'no-mistakes', 'jq']);
+  const fakeTasks = path.join(root, 'fake-tasks-axi.mjs'), fakeTree = path.join(root, 'fake-treehouse.mjs'), fakeVersion = path.join(root, 'fake-version.mjs');
+  const treeLog = path.join(root, 'treehouse-log.json'), poolDir = path.join(root, 'pool');
+  fs.writeFileSync(fakeVersion, "console.log('tool version v1.106.1');\n");
+  // A backlog like tasks-axi keeps it: one "- [ ] <id> - <title> (<state>)" line per item.
+  fs.writeFileSync(fakeTasks, `import fs from 'node:fs';
+const a = process.argv.slice(2);
+if (a[0] === '--version') { console.log('0.2.6'); process.exit(0); }
+const file = a[a.indexOf('--file') + 1], lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\\n').filter(Boolean) : [];
+const at = lines.findIndex(l => l.startsWith('- [ ] ' + a[1] + ' ') || l.startsWith('- [x] ' + a[1] + ' '));
+const save = () => fs.writeFileSync(file, lines.join('\\n') + '\\n');
+if (a[0] === 'add') { lines.push('- [ ] ' + a[1] + ' - ' + a[2] + ' (queued)'); save(); console.log('ok: added ' + a[1] + ' -> Queued'); }
+else if (a[0] === 'list') console.log(lines.join('\\n'));
+else if (at < 0) { console.error('error: "Task not found in this backlog"'); process.exit(1); }
+else if (a[0] === 'start') { lines[at] = lines[at].replace('(queued)', '(in flight)'); save(); console.log('ok: start ' + a[1] + ' -> In flight'); }
+else if (a[0] === 'done') { lines[at] = lines[at].replace('- [ ]', '- [x]').replace('(in flight)', '(done' + (a.includes('--pr') ? ' ' + a[a.indexOf('--pr') + 1] : '') + ')'); save(); console.log('ok: done ' + a[1] + ' -> Done'); }
+`);
+  // A pool like treehouse's: \`get --lease --json\` hands out a slot outside the repository.
+  fs.writeFileSync(treeLog, '[]');
+  fs.writeFileSync(fakeTree, `import fs from 'node:fs'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
+const a = process.argv.slice(2), file = ${JSON.stringify(treeLog)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
+log.push({ a, cwd: process.cwd() }); fs.writeFileSync(file, JSON.stringify(log));
+if (a[0] === '--version') console.log('v3.1.8');
+else if (a[0] === 'get') {
+  const slot = path.join(${JSON.stringify(poolDir)}, String(log.length), 'demo'), b = a.indexOf('-b');
+  const r = spawnSync('git', ['worktree', 'add', ...(b < 0 ? ['--detach'] : ['-b', a[b + 1]]), slot, 'HEAD'], { encoding: 'utf8' });
+  if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
+  console.error('Leased worktree'); console.log(JSON.stringify({ path: slot, lease_id: 'x' }));
+} else if (a[0] === 'return' && fs.existsSync(${JSON.stringify(path.join(root, 'pool-stuck'))})) { console.error('foreign process remains'); process.exit(1); }
+`);
+  const T = { CREW_GH: fakeGh, CREW_TOOL_TASKS_AXI: fakeTasks, CREW_TOOL_TREEHOUSE: fakeTree, CREW_TOOL_NO_MISTAKES: fakeVersion };
+  const tl = (args, terminal = 'c2', env = T) => crew(args, { terminal, env });
+  // tools: what is here and what crew does with it; nothing is required.
+  r = crew(['tools'], { terminal: 'c2' }); assert.equal(r.code, 0);
+  assert.equal(r.out.split('\n').filter(l => l.includes('not installed')).length, 9, r.out); assert.match(r.out, /Missing tools are optional/);
+  const seen = JSON.parse(tl(['tools', '--json']).out).tools;
+  assert.deepEqual(seen.filter(t => t.installed).map(t => [t.id, t.version]), [['tasks-axi', '0.2.6'], ['treehouse', '3.1.8'], ['no-mistakes', '1.106.1']]);
+
+  // backlog: kept in the home by tasks-axi; reading is free, changing it is the owner's.
+  assert.equal(crew(['backlog'], { terminal: 'c2' }).code, 4, 'No tasks-axi, no backlog');
+  assert.equal(tl(['backlog', 'add', 'b1', 'Count the lines'], 'c1').code, 3);
+  r = tl(['backlog', 'add', 'b1', 'Count the lines']); assert.equal(r.code, 0, r.out); assert.match(r.out, /ok: added b1 -> Queued/);
+  tl(['backlog', 'add', 'g1', 'Ship through the gate']);
+  assert.match(tl(['backlog'], 'c1').out, /- \[ \] b1 - Count the lines \(queued\)/);
+  assert.equal(tl(['backlog', 'start', 'nope']).code, 1, "tasks-axi's own refusal is passed on");
+  // A task named like a backlog item moves it; any other task leaves the backlog alone.
+  r = tl(['spawn', 'b1', '--project', 'demo', '--agent', 'pi', 'Count.'], 'c2', { ...T, CREW_TOOL_GH_AXI: fakeVersion, CREW_TOOL_JQ: fakeVersion });
+  assert.equal(r.code, 0, r.out); assert.match(r.out, /backlog: start b1 -> In flight/);
+  const b1 = taskOf('b1'), b1brief = fs.readFileSync(b1.brief, 'utf8');
+  assert.ok(b1brief.includes('## Tools on this machine') && b1brief.includes('`gh-axi --help`') && b1brief.includes('`jq`') && !b1brief.includes('chrome-devtools-axi'), b1brief);
+  r = tl(['spawn', 'b2', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(r.code, 0); assert.ok(!r.out.includes('backlog:'));
+  assert.ok(!fs.readFileSync(taskOf('b2').brief, 'utf8').includes('Tools on this machine'), 'No tool, no hint');
+  fs.writeFileSync(b1.report, 'two'); assert.equal(crew(['done', 'b1'], { terminal: b1.terminal }).code, 0);
+  r = tl(['finish', 'b1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /backlog: done b1 -> Done/);
+  assert.match(fs.readFileSync(path.join(homeDir, 'backlog.md'), 'utf8'), /- \[x\] b1 - Count the lines \(done\)/);
+  assert.equal(tl(['finish', 'b2', '--force']).code, 0);
+
+  // treehouse: a project can take its working copies from the pool, and gives them back.
+  r = crew(['project', 'add', 'pooled', project, '--treehouse'], { terminal: 'c2' }); assert.equal(r.code, 4); assert.match(r.out, /treehouse is not installed/);
+  r = tl(['project', 'add', 'pooled', project, '--treehouse']); assert.equal(r.code, 0, r.out);
+  assert.match(tl(['project', 'list']).out, /^pooled\t.*\ttreehouse$/m);
+  r = crew(['spawn', 'p0', '--project', 'pooled', '--agent', 'pi', 'x'], { terminal: 'c2' }); assert.equal(r.code, 5); assert.match(r.out, /treehouse, which is not installed/);
+  r = tl(['spawn', 'p1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Change it.']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(treehouse\)/);
+  const p1 = taskOf('p1');
+  assert.equal(p1.pool, 'treehouse'); assert.ok(p1.worktree.startsWith(slash(poolDir)) && p1.worktree.endsWith('/demo'), p1.worktree);
+  assert.equal(git('-C', p1.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'crew/p1');
+  assert.equal(readWorld().log.filter(a => a[0] === 'run').at(-1)[readWorld().log.filter(a => a[0] === 'run').at(-1).indexOf('--cwd') + 1], p1.worktree);
+  const lease = JSON.parse(fs.readFileSync(treeLog, 'utf8')).find(e => e.a[0] === 'get');
+  assert.deepEqual(lease.a, ['get', '--lease', '--json', '-b', 'crew/p1']); assert.equal(slash(lease.cwd).toLowerCase(), slash(fs.realpathSync(project)).toLowerCase());
+  fs.writeFileSync(path.join(root, 'pool-stuck'), '');
+  r = tl(['finish', 'p1']); assert.equal(r.code, 6); assert.match(r.out, /treehouse did not take the working copy back \(foreign process remains\)/);
+  assert.equal(taskOf('p1').state, 'working', 'A copy that was not returned keeps its task open');
+  fs.rmSync(path.join(root, 'pool-stuck'));
+  r = tl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to treehouse/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', p1.worktree]);
+  assert.equal(taskOf('p1').state, 'closed');
+
+  // no-mistakes: a project with the gate is delivered by it; crew only records the result.
+  git('-C', project, 'remote', 'add', 'no-mistakes', projectOrigin);
+  r = crew(['spawn', 'g0', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x'], { terminal: 'c2' }); assert.equal(r.code, 0);
+  assert.equal(taskOf('g0').gate, undefined, 'Without no-mistakes on the machine the task is an ordinary one');
+  r = tl(['spawn', 'g1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Add a fourth line.']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /delivered through no-mistakes[\s\S]*backlog: start g1/);
+  const g1 = taskOf('g1'), g1brief = fs.readFileSync(g1.brief, 'utf8'), intentFile = slash(path.join(homeDir, 'tasks', 'g1', 'intent.md'));
+  assert.equal(g1.gate, 'no-mistakes');
+  assert.ok(g1brief.includes(`no-mistakes axi run --yes --intent-file ${intentFile}`) && !g1brief.includes('Do not push or open a pull request unless'), g1brief);
+  assert.equal(fs.readFileSync(intentFile, 'utf8'), 'Add a fourth line.\n');
+  r = tl(['spawn', 'g2', '--project', 'demo', '--agent', 'pi', 'Look.']); assert.ok(!fs.readFileSync(taskOf('g2').brief, 'utf8').includes('no-mistakes'), 'A scout is not gated');
+  commit(path.join(copies, 'g1'), { 'README.md': 'one\ntwo\nthree\nfour\n' }, 'Add a fourth line');
+  fs.writeFileSync(g1.report, 'The gate stopped.'); assert.equal(crew(['done', 'g1'], { terminal: g1.terminal }).code, 0);
+  fs.writeFileSync(ghDown, '');
+  r = tl(['land', 'g1']); assert.equal(r.code, 6); assert.match(r.out, /gate has not opened a pull request for it yet/);
+  fs.writeFileSync(g1.report, 'Done: https://github.com/acme/demo/pull/9 is open.');
+  r = tl(['land', 'g1']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /delivered g1 through no-mistakes: https:\/\/github\.com\/acme\/demo\/pull\/9\.[\s\S]*backlog: done g1 -> Done/);
+  assert.notEqual(spawnSync('git', ['-C', projectOrigin, 'rev-parse', '--verify', '-q', 'crew/g1']).status, 0, 'crew pushed nothing itself');
+  assert.match(fs.readFileSync(path.join(homeDir, 'backlog.md'), 'utf8'), /- \[x\] g1 .*\(done https:\/\/github\.com\/acme\/demo\/pull\/9\)/);
+  fs.rmSync(ghDown);
+  for (const id of ['g0', 'g1', 'g2']) assert.equal(tl(['finish', id, '--force']).code, 0, id);
+
+  console.log('PASS: Firstmate\'s tools (list, backlog, treehouse copies, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

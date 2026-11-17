@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -214,6 +214,27 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 - \`crew project list\` shows the projects you may use. Ask before adding one.
 - When you are done for the session, run \`crew end\`.
 
+## Tools
+\`crew tools\` shows which of these are installed on this machine. Use the ones that are; none
+is required. For any of them, read its \`--help\` before the first use instead of guessing.
+- **Backlog** (\`tasks-axi\`): \`crew backlog\` is the durable list of work, kept in this home.
+  \`crew backlog add <id> "<title>"\` queues something the person mentions for later;
+  \`crew backlog ready\` shows what can be started. Give a task the same id as its backlog
+  item and crew moves the item itself: In flight at spawn, Done at land (ship) or finish
+  (scout). A decision that waits for the person: \`crew backlog hold <id> --reason "<why>"\`.
+- **Quota** (\`quota-axi\`): before starting several workers at once, run \`quota-axi\` and give
+  the work to an agent whose account has room (\`--agent\`). Skip it for a single small task.
+- **GitHub** (\`gh-axi\`): read issues, pull requests and checks with it. \`crew land\` opens
+  pull requests itself.
+- **Browser** (\`chrome-devtools-axi\`): for looking at a web page. Workers are told about it.
+- **Showing instead of telling** (\`lavish-axi\`): when the person must choose between several
+  options, or a report is long, show it as a page with it. A yes-or-no question stays in chat.
+- **treehouse**: a project added with \`crew project add <name> <folder> --treehouse\` gives
+  its workers prepared copies from the treehouse pool. Nothing else changes for you.
+- **no-mistakes**: a project that has its gate is delivered through it. The worker runs the
+  gate, which reviews, tests, pushes and opens the pull request; skip \`crew review\` for such
+  a task, and \`crew land <id>\` then only records the pull request the gate opened.
+
 ## When crew itself is wrong
 A crew command that prints \`internal error\`, or that plainly does something other than what
 these rules and \`crew --help\` say, is a defect in crew, not in the project. Do not work
@@ -247,7 +268,7 @@ function cmdProject(args) {
   const h = home();
   const [verb, name, source] = args;
   if (verb === 'list' || !verb) {
-    for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}`);
+    for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}${p.worktrees ? `\t${p.worktrees}` : ''}`);
     return;
   }
   // The project list decides which repository a task works in and is cleaned up against, so
@@ -267,7 +288,9 @@ function cmdProject(args) {
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] | crew project remove <name> | crew project list');
+  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--treehouse] | crew project remove <name> | crew project list');
+  const pooled = args.includes('--treehouse');
+  if (pooled && !toolPath('treehouse')) refuse('treehouse is not installed on this machine (Herdr: Settings > Plugins > Crew).', 4);
   const folder = path.resolve(source);
   const top = run('git', ['-C', folder, 'rev-parse', '--show-toplevel']);
   if (top.code !== 0) refuse(`${folder} is not a git repository.`);
@@ -279,9 +302,9 @@ function cmdProject(args) {
     const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
     if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
   }
-  h.config.projects[name] = { path: slash(folder) };
+  h.config.projects[name] = { path: slash(folder), ...(pooled ? { worktrees: 'treehouse' } : {}) };
   writeJson(path.join(h.dir, 'crew.json'), h.config);
-  console.log(`project ${name}: ${slash(folder)}`);
+  console.log(`project ${name}: ${slash(folder)}${pooled ? ' (working copies from treehouse)' : ''}`);
 }
 
 function cmdStart() {
@@ -350,17 +373,101 @@ export function agentCommand(name, agent, instruction, env = process.env) {
   return `bash --noprofile --norc ${shq(bashPath(launcher))} --as ${shq(account)} --command "$(type -P claude || type -P claude.exe)" -- ${[instruction, ...(agent.args ?? [])].map(shq).join(' ')}`;
 }
 
-export function briefText({ id, kind, task, worktree, project, report }) {
+// --- the tools Firstmate works with -----------------------------------------------
+// crew runs without any of them. Each one that is installed is used for what it is good at:
+// by crew itself (`crew` column) or by the agents, who are told about it in their brief or
+// rules. `brief` is the line a worker gets when the tool is on this machine.
+export const TOOLS = [
+  { id: 'gh', crew: '`crew land` opens the pull request with it' },
+  { id: 'gh-axi', crew: 'agents read and write GitHub with it', brief: 'For GitHub (issues, pull requests, checks) use `gh-axi`; run `gh-axi --help` first.' },
+  { id: 'chrome-devtools-axi', crew: 'agents look at web pages with it', brief: 'To look at a web page or check something in a browser use `chrome-devtools-axi`; run `chrome-devtools-axi --help` first.' },
+  { id: 'lavish-axi', crew: 'the coordinator shows a decision or a long report as a page' },
+  { id: 'tasks-axi', crew: '`crew backlog` keeps the queue with it; spawn, land and finish move the item' },
+  { id: 'quota-axi', crew: 'the coordinator checks which agent has room before a batch' },
+  { id: 'treehouse', crew: 'worker copies of a project added with --treehouse come from its pool' },
+  { id: 'no-mistakes', crew: 'a project with its gate is delivered through it' },
+  { id: 'jq', crew: 'for `crew status --json` in scripts', brief: '`jq` is installed for reading JSON.' },
+];
+// Where a tool is: CREW_TOOL_<NAME> (a .mjs path is run with node, as in the tests), else
+// the first hit on PATH (CREW_TOOL_PATH replaces PATH for this lookup). No process is started.
+export function toolPath(id, env = process.env) {
+  const named = env[`CREW_TOOL_${id.toUpperCase().replace(/-/g, '_')}`];
+  if (named) return fs.existsSync(named) ? named : null;
+  const names = WINDOWS ? [`${id}.exe`, `${id}.cmd`, `${id}.bat`] : [id];
+  for (const dir of String(env.CREW_TOOL_PATH ?? env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+    for (const name of names) { const file = path.join(dir, name); if (fs.existsSync(file)) return file; }
+  }
+  return null;
+}
+// Runs an installed tool; null when it is not installed. An npm tool on Windows is a .cmd
+// shim, which mangles arguments; its sh twin beside it is run through Git Bash instead.
+function runTool(id, args, options = {}) {
+  const file = toolPath(id);
+  if (!file) return null;
+  if (file.endsWith('.mjs')) return run(process.execPath, [file, ...args], options);
+  if (WINDOWS && /\.(cmd|bat)$/i.test(file)) {
+    const twin = file.replace(/\.(cmd|bat)$/i, '');
+    return fs.existsSync(twin) ? run(bashProgram(), [bashPath(twin), ...args], options) : run(`"${file}"`, args, { ...options, shell: true });
+  }
+  return run(file, args, options);
+}
+const installedTools = () => TOOLS.filter(t => toolPath(t.id)).map(t => t.id);
+
+function cmdTools(args) {
+  const rows = TOOLS.map(t => {
+    const file = toolPath(t.id);
+    const said = file ? runTool(t.id, ['--version'], { timeout: 20000 }) : null;
+    const version = said ? (/\d+\.\d+(\.\d+)?/.exec(`${said.stdout} ${said.stderr}`)?.[0] ?? 'installed') : null;
+    return { id: t.id, installed: Boolean(file), version, path: file ? slash(file) : null, use: t.crew };
+  });
+  if (args.includes('--json')) { console.log(JSON.stringify({ tools: rows })); return; }
+  for (const r of rows) console.log(`${r.id.padEnd(20)}${(r.version ?? 'not installed').padEnd(15)}${r.use}`);
+  if (rows.some(r => !r.installed)) console.log('Missing tools are optional. Install them in Herdr: Settings > Plugins > Crew.');
+}
+
+// The backlog is one Markdown file in the home, kept by tasks-axi. A crew task with the
+// same id as a backlog item moves that item: In flight at spawn, Done at land or finish.
+const backlogFile = h => path.join(h.dir, 'backlog.md');
+const BACKLOG_READS = ['list', 'show', 'ready', 'render'];
+function cmdBacklog(args) {
+  const h = home();
+  if (!toolPath('tasks-axi')) refuse('The backlog needs tasks-axi, which is not installed here (Herdr: Settings > Plugins > Crew, or `npm install -g tasks-axi`).', 4);
+  const words = args.length ? args : ['list'];
+  if (!BACKLOG_READS.includes(words[0])) requireOwner(h);
+  const r = runTool('tasks-axi', [...words, '--file', backlogFile(h)], { timeout: 60000 });
+  process.stdout.write(r.stdout); process.stderr.write(r.stderr);
+  process.exitCode = r.code ?? 1;
+}
+// Best effort: a task without a backlog item, or a machine without tasks-axi, is fine.
+function backlogMove(h, id, verb, more = []) {
+  try {
+    const file = backlogFile(h);
+    if (!fs.existsSync(file) || !new RegExp(`^- \\[.\\] ${id} `, 'm').test(fs.readFileSync(file, 'utf8'))) return;
+    const r = runTool('tasks-axi', [verb, id, ...more, '--file', file], { timeout: 60000 });
+    if (r?.code === 0) console.log(`backlog: ${r.stdout.trim().split(/\r?\n/)[0].replace(/^ok: /, '')}`);
+    else if (r) console.error(`crew: the backlog item ${id} was not moved (${lastLine(r.stderr || r.stdout)})`);
+  } catch { /* the backlog never stops the work */ }
+}
+
+export function briefText({ id, kind, task, worktree, project, report, tools = [], gate = null }) {
+  const hints = TOOLS.filter(t => t.brief && tools.includes(t.id)).map(t => `- ${t.brief}`);
   return [
     `# Task ${id} (${kind})`, '', task.trim(), '',
     '## Rules',
     `- Work only inside \`${worktree}\`. It is your own copy of the project \`${project}\`; nobody else uses it.`,
     kind === 'scout'
       ? '- This is a read-only investigation: do not change project files, commit, push or open a pull request.'
-      : '- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.',
+      : gate
+        ? '- Make your changes on the branch already checked out here and commit them.'
+        : '- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.',
+    ...(kind === 'ship' && gate ? [
+      `- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file ${gate}\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. Do not push or open a pull request any other way.`,
+      '- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.',
+    ] : []),
     `- When you are finished, write your result to \`${report}\` in Markdown, with the answer in the first lines.`,
     `- Then run \`crew done ${id}\` and stop. Do not start any other work.`,
     '- If you cannot finish, write what blocked you to the same file and still run the command.', '',
+    ...(hints.length ? ['## Tools on this machine', ...hints, ''] : []),
   ].join('\n');
 }
 
@@ -384,17 +491,38 @@ function cmdSpawn(args) {
 
 // Creates the task, its working copy and its terminal. `extra` is kept on the task record.
 function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
-  const dir = taskDir(h, id), worktree = slash(path.join(h.worktrees, id)), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
+  const dir = taskDir(h, id), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
+  let worktree = slash(path.join(h.worktrees, id));
+  // A project added with --treehouse takes its copies from the treehouse pool (already set
+  // up, dependencies and all) instead of a fresh git worktree.
+  const pool = project.worktrees === 'treehouse' ? 'treehouse' : null;
+  if (pool && !toolPath('treehouse')) refuse(`Project ${opts.project} takes its working copies from treehouse, which is not installed on this machine.`, 5);
+  // A project with the no-mistakes gate (its `no-mistakes` remote) is delivered through it.
+  const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;
+  const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
-  const record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null, ...extra };
+  let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
+    ...(pool ? { pool } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
   saveTask(h, record);
 
-  const wt = opts.kind === 'ship'
-    ? run('git', ['-C', project.path, 'worktree', 'add', '-b', `crew/${id}`, worktree, 'HEAD'])
-    : run('git', ['-C', project.path, 'worktree', 'add', '--detach', worktree, 'HEAD']);
-  if (wt.code !== 0) { saveTask(h, { ...record, state: 'failed', error: wt.stderr.trim().slice(0, 400) }); refuse(`Could not create the working copy: ${wt.stderr.trim()}`, 5); }
-  fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report }));
+  const failed = why => { saveTask(h, { ...record, state: 'failed', error: why.slice(0, 400) }); refuse(`Could not create the working copy: ${why}`, 5); };
+  if (pool) {
+    const got = runTool('treehouse', ['get', '--lease', '--json', ...(opts.kind === 'ship' ? ['-b', `crew/${id}`] : [])], { cwd: project.path, timeout: 600000 });
+    let leased = null;
+    try { leased = JSON.parse(got.stdout).path; } catch { /* reported below */ }
+    if (got.code !== 0 || !leased) failed(`treehouse gave no working copy (${lastLine(got.stderr || got.stdout)})`);
+    worktree = slash(leased);
+    record = { ...record, worktree };
+    saveTask(h, record);
+  } else {
+    const wt = opts.kind === 'ship'
+      ? run('git', ['-C', project.path, 'worktree', 'add', '-b', `crew/${id}`, worktree, 'HEAD'])
+      : run('git', ['-C', project.path, 'worktree', 'add', '--detach', worktree, 'HEAD']);
+    if (wt.code !== 0) failed(wt.stderr.trim());
+  }
+  if (intent) fs.writeFileSync(intent, `${task.trim()}\n`);
+  fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent }));
 
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   // The agent starts with one instruction as its argument, so nothing is typed into it and
@@ -413,7 +541,8 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
     '--', bashProgram(), '--login', '-i', '-c', line]);
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
-    run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
+    if (pool) runTool('treehouse', ['return', worktree], { cwd: project.path, timeout: 120000 });
+    else run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
     saveTask(h, { ...record, state: 'failed', error: JSON.stringify(started.value).slice(0, 400) });
     refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
   }
@@ -422,7 +551,8 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   // writing the record this command started with over an accepted report.
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
-  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}`);
+  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${pool ? ' (treehouse)' : ''}${gated ? '; delivered through no-mistakes' : ''}`);
+  backlogMove(h, id, 'start');
 }
 
 function cmdDone(args) {
@@ -573,6 +703,17 @@ function cmdFinish(args) {
   // of the folder, so it is retried. The folder is deleted directly only when git no longer
   // knows it as a working copy (an earlier, half-finished removal) or with --force.
   let removal = { code: 0, stderr: '' };
+  if (task.pool === 'treehouse') {
+    // The copy is a pool slot: it goes back to treehouse, which cleans it and keeps it.
+    const back = runTool('treehouse', ['return', task.worktree], { cwd: project?.path, timeout: 180000 });
+    if (!back) refuse(`Task ${id} uses a treehouse working copy, and treehouse is not installed here; nothing was returned.`, 6);
+    if (back.code !== 0 && fs.existsSync(task.worktree)) refuse(`treehouse did not take the working copy back (${lastLine(back.stderr || back.stdout)}); it was kept: ${task.worktree}`, 6);
+    if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
+    saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
+    console.log(`finished ${id} (${result.how}); working copy returned to treehouse; report kept at ${task.report}`);
+    if (task.kind === 'scout' && task.state === 'reported') backlogMove(h, id, 'done');
+    return;
+  }
   for (let i = 0; fs.existsSync(task.worktree) && i < 8; i++) {
     if (project) removal = run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
     if (!fs.existsSync(task.worktree)) break;
@@ -593,6 +734,7 @@ function cmdFinish(args) {
   }
   saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
   console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}`);
+  if (task.kind === 'scout' && task.state === 'reported' && !task.reviews) backlogMove(h, id, 'done');
 }
 
 // --- follow-ups, review and delivery ------------------------------------------------
@@ -670,6 +812,18 @@ function cmdLand(args) {
   const dirty = git('status', '--porcelain');
   if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). Tell the worker to commit them: crew tell ${id} "..."`);
   const remote = git('remote', 'get-url', 'origin');
+  if (task.gate === 'no-mistakes') {
+    // The gate reviewed, pushed and opened the pull request while the worker drove it; what
+    // is left is to find that pull request: in the report, or by asking GitHub for the branch.
+    const reported = fs.existsSync(task.report) ? /https:\/\/[^\s)>\]]+\/pulls?\/\d+/.exec(fs.readFileSync(task.report, 'utf8'))?.[0] : null;
+    const asked = reported ? null : gh(['pr', 'view', git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim(), '--json', 'url', '--jq', '.url'], { cwd: wt, timeout: 60000 });
+    const found = reported ?? /https?:\/\/\S+/.exec(asked?.stdout ?? '')?.[0];
+    if (!found) no(`the no-mistakes gate has not opened a pull request for it yet. Ask the worker where the gate stands: crew tell ${id} "run no-mistakes axi status and finish the gate"`);
+    saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
+    console.log(`delivered ${id} through no-mistakes: ${found}. Merging it is the person's decision.`);
+    backlogMove(h, id, 'done', ['--pr', found]);
+    return;
+  }
   if (remote.code !== 0) no(`the project has no \`origin\` to push to. The work stays on branch crew/${id} in ${project.path}.`);
   // The pull request goes against the branch the project folder is on, if that branch is
   // published; otherwise against the repository's default branch.
@@ -694,6 +848,7 @@ function cmdLand(args) {
   if (made.error || made.code !== 0 || !url) no(`its branch crew/${id} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
   console.log(`delivered ${id}: ${url} (against ${base}, ${subjects.length} commit${subjects.length === 1 ? '' : 's'}). Merging it is the person's decision.`);
+  backlogMove(h, id, 'done', ['--pr', url]);
 }
 
 // --- crew maintains itself -------------------------------------------------------
@@ -873,10 +1028,10 @@ function cmdStatus(args) {
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
-  tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
+  tools: cmdTools, backlog: cmdBacklog, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew/home)
-  crew project add <name> <git folder>     register a project   (crew project list)
+  crew project add <name> <git folder> [--treehouse]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
@@ -888,6 +1043,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
   crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
   crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
+  crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
+  crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
   crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
   crew update | crew rollback              bring this machine's crew up to date, or back one step`;

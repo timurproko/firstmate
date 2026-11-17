@@ -35,6 +35,8 @@ crew status [--all] [--json]             tasks and their terminals
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               stop it, remove its terminal and working copy
 crew done [<id>]                         (worker) my report is written
+crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
+crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
 crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
 crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
@@ -87,6 +89,23 @@ A ship task ends with commits on branch `crew/<id>`. From there:
   `gh`, against the branch the project folder is on (or the default branch), with the report
   as its text. If the machine is signed in to GitHub as the repository's owner among several
   accounts, that account is used. crew never merges a project's pull request.
+
+## The tools Firstmate works with
+
+crew runs without any of them and uses each one that is installed. `crew tools` lists them
+with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
+
+| Tool | What crew does with it |
+| --- | --- |
+| `gh` | `crew land` opens the pull request with it. |
+| `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
+| `lavish-axi`, `quota-axi` | The coordinator's rules say when to use them: showing a decision or long report as a page; checking which agent has room before a batch. |
+| `tasks-axi` | `crew backlog <tasks-axi command…>` keeps the durable list of work in `<home>/backlog.md`. A task with the same id as a backlog item moves it: In flight at spawn, Done at `land` (ship, with the pull request) or `finish` (scout). Reading is open to any session; changes are the owner's. |
+| `treehouse` | `crew project add <name> <folder> --treehouse`: that project's workers get a leased copy from the treehouse pool (`treehouse get --lease`), and `crew finish` gives it back (`treehouse return`). The copy is cut from the branch treehouse infers, not from the folder's current commit. |
+| `no-mistakes` | A project that has the gate (a `no-mistakes` remote) is delivered through it: the ship worker's brief tells it to run `no-mistakes axi run --yes --intent-file <task>` and follow it to a pull request. `crew land` then pushes nothing and only records that pull request (from the report, or from `gh pr view`). |
+
+`CREW_TOOL_<NAME>` (for example `CREW_TOOL_TASKS_AXI`) names a tool's program explicitly;
+otherwise it is looked up on `PATH`.
 
 `crew status` shows the pull request link of a delivered task.
 
