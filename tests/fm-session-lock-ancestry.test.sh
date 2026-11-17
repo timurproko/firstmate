@@ -44,7 +44,8 @@ lib_eval() {  # <fakebin> <expression>
   local -a session_env=()
   [ -z "${FM_TEST_SESSION_ID:-}" ] || session_env+=("CLAUDE_CODE_SESSION_ID=$FM_TEST_SESSION_ID")
   [ -z "${FM_TEST_CLAUDE_PID:-}" ] || session_env+=("CLAUDE_PID=$FM_TEST_CLAUDE_PID")
-  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID ${session_env[@]+"${session_env[@]}"} \
+  [ -z "${FM_TEST_PI_PID:-}" ] || session_env+=("FM_PI_SESSION_PID=$FM_TEST_PI_PID")
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID -u FM_PI_SESSION_PID ${session_env[@]+"${session_env[@]}"} \
     PATH="$fakebin:$PATH" bash -c "
     . \"\$0\"
     kill() { return \${FM_TEST_KILL_RC:-0}; }
@@ -495,7 +496,81 @@ else
 fi
 SH
   chmod +x "$fakebin/uname" "$fakebin/ps"
+  # The Windows process table's command lines, answered per pid from
+  # FM_TEST_WIN_CMDLINES ("<winpid>|<command line>" per line). An absent pid
+  # answers nothing, exactly like CIM for a process that is gone.
+  cat > "$fakebin/powershell.exe" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *'Get-CimInstance Win32_Process'*)
+    pid=$(printf '%s' "$*" | sed -n "s/.*ProcessId=\([0-9][0-9]*\).*/\1/p")
+    printf '%s\n' "${FM_TEST_WIN_CMDLINES:-}" | awk -F'|' -v p="$pid" '$1 == p { print $2; exit }'
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/powershell.exe"
   printf '%s\n' "$fakebin"
+}
+
+# An A1 primary is a node process running one of A1's entry scripts; 8100 is
+# that process, 8200 is a node process running something unrelated.
+WIN_TABLE_A1='  4201508       0       0       8100  ?              0 22:24:48 C:\Program Files\nodejs\node.exe
+  4201509       0       0       8200  ?              0 22:24:48 C:\Program Files\nodejs\node.exe
+  4198625       0       0       4321  ?              0 22:24:48 C:\Windows\explorer.exe'
+WIN_CMDLINES_A1='8100|"C:\Program Files\nodejs\node.exe" "C:\Users\u\AppData\Local\a1\releases\0.2.7-dev.1331\bin\ui.js"
+8200|"C:\Program Files\nodejs\node.exe" "C:\tools\a1-notes\bin\ui.js"'
+
+test_a1_process_shapes_are_pi_harnesses() {
+  local dir fakebin node='C:/Program Files/nodejs/node' args
+  dir="$TMP_ROOT/a1-shapes"
+  fakebin=$(fm_fakebin "$dir")
+  for args in \
+    "$node C:/Users/u/AppData/Local/a1/releases/0.2.7-dev.1331/bin/ui.js" \
+    "$node C:/Users/u/AppData/Roaming/npm/node_modules/@timurproko/a1/bin/pi-compatible.js --thinking low" \
+    "$node C:/Users/u/AppData/Roaming/npm/node_modules/@timurproko/a1/bin/cli.js" \
+    "/usr/bin/node /home/u/.local/lib/a1/bin/ui.js" \
+    "$node C:\\Users\\u\\AppData\\Local\\a1\\releases\\0.2.7\\bin\\ui.js"; do
+    lib_eval "$fakebin" "fm_harness_process_matches '$node' '$args'" \
+      || fail "A1 process was not recognized as a Pi harness: $args"
+  done
+  for args in \
+    "$node C:/tools/a1-notes/bin/ui.js" \
+    "$node C:/Users/u/a1/other.js" \
+    "$node C:/Users/u/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"; do
+    if lib_eval "$fakebin" "fm_harness_process_matches '$node' '$args'"; then
+      fail "a lookalike node process was taken for A1: $args"
+    fi
+  done
+  pass "session-lock: A1's release, package and Pi-compatible entry scripts read as a Pi harness; lookalikes do not"
+}
+
+test_windows_pi_session_is_identified_from_its_published_pid() {
+  local dir fakebin got claimed
+  dir="$TMP_ROOT/win-pi-published"
+  fakebin=$(cygwin_fakebin "$dir")
+  mkdir -p "$dir/state"
+  # The extension publishes FM_PI_SESSION_PID from inside the A1 process; the
+  # lock confirms the pid is live AND that its command line is a Pi harness.
+  got=$(FM_TEST_WIN_TABLE="$WIN_TABLE_A1" FM_TEST_WIN_CMDLINES="$WIN_CMDLINES_A1" FM_TEST_PI_PID=8100 lib_eval "$fakebin" 'fm_harness_ancestry_pid') \
+    || fail "an A1 primary was not identified from its published pid"
+  [ "$got" = 'win:8100' ] || fail "expected win:8100, got '$got'"
+  FM_TEST_WIN_TABLE="$WIN_TABLE_A1" FM_TEST_WIN_CMDLINES="$WIN_CMDLINES_A1" lib_eval "$fakebin" 'fm_harness_pid_alive win:8100' \
+    || fail "a live A1 holder was classified as a dead lock owner"
+  printf 'win:8100\n' > "$dir/state/.lock"
+  FM_TEST_WIN_TABLE="$WIN_TABLE_A1" FM_TEST_WIN_CMDLINES="$WIN_CMDLINES_A1" FM_TEST_PI_PID=8100 lib_eval "$fakebin" "fm_session_lock_owned_by_self '$dir/state'" \
+    || fail "the A1 session holding the lock did not recognize itself as the owner"
+  # A node process that is not A1, a dead pid, and a non-node process are all refused.
+  for claimed in 8200 9999 4321; do
+    if FM_TEST_WIN_TABLE="$WIN_TABLE_A1" FM_TEST_WIN_CMDLINES="$WIN_CMDLINES_A1" FM_TEST_PI_PID="$claimed" lib_eval "$fakebin" 'fm_harness_ancestry_pid'; then
+      fail "published pid $claimed was bound as this session's harness without confirmation"
+    fi
+  done
+  # An unreadable command line never promotes a bare interpreter to a harness.
+  if FM_TEST_WIN_TABLE="$WIN_TABLE_A1" FM_TEST_WIN_CMDLINES='' FM_TEST_PI_PID=8100 lib_eval "$fakebin" 'fm_harness_ancestry_pid'; then
+    fail "a node process with an unreadable command line was bound as the harness"
+  fi
+  pass "session-lock: a Windows A1 session is identified from its published Pi pid only after its command line confirms a Pi harness"
 }
 
 # WINPID 7204 is the session harness. 4321 is an ordinary desktop process, and
@@ -1668,6 +1743,8 @@ test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id
 test_windows_session_is_identified_from_its_published_pid
 test_windows_published_pid_is_confirmed_before_it_is_trusted
 test_windows_pid_is_never_resolved_as_a_cygwin_pid
+test_a1_process_shapes_are_pi_harnesses
+test_windows_pi_session_is_identified_from_its_published_pid
 test_a_published_identity_is_accepted_by_the_gates_that_read_the_lock
 test_windows_tagged_holder_is_a_live_foreign_owner
 test_windows_tagged_lock_acquisition_uses_the_shared_owner_verdict

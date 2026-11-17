@@ -34,6 +34,14 @@ unset _FM_SESSION_LOCK_LIB_DIR
 # (verified, omp 18.1.11) and `agy`, and a substring match would claim ompd or
 # comp.
 FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$|^omp$|^agy$'
+# A1 is a pinned-Pi harness whose process is an interpreter running one of its
+# entry scripts (an installed release's bin/ui.js, the package's bin/cli.js, or
+# its Pi-compatible launcher bin/pi-compatible.js). It publishes Pi's own
+# environment marker, so every other owner already treats it as `pi`; the
+# path shape below lets process evidence agree. Paths are matched with forward
+# slashes, which is how ps reports them on POSIX and how the Windows bridge
+# normalizes them.
+FM_A1_SCRIPT_RE='(^|/)(a1/releases/[^/ ]+|@timurproko/a1|a1)/bin/(ui|cli|pi-compatible)[.]js([[:space:]]|$)'
 
 # The same harnesses as exact executable names. Keep in sync with
 # FM_HARNESS_RE. Used only for the stricter path evidence below, where the
@@ -129,6 +137,9 @@ fm_harness_process_matches() {  # <comm> <args>
     *node*|*python*)
       if printf '%s' "$args" | grep -qE "$FM_HARNESS_RE"; then
         case "$args" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
+        return 0
+      fi
+      if printf '%s' "${args//\\//}" | grep -qE "$FM_A1_SCRIPT_RE"; then
         return 0
       fi
       ;;
@@ -229,6 +240,31 @@ fm_win_command() {  # <winpid>
   fm_win_normalize_command "$out"
 }
 
+# Print the normalized command line of live Windows process $1, or return 1.
+# `ps -W` shows only the executable, which for an interpreter (node, python)
+# says nothing about the harness; the script path lives in the command line,
+# which only the Windows process table itself reports.
+fm_win_command_line() {  # <winpid>
+  local winpid=$1 out
+  case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+  out=$(powershell.exe -NoProfile -NonInteractive -Command \
+    "(Get-CimInstance Win32_Process -Filter 'ProcessId=$winpid' -ErrorAction SilentlyContinue).CommandLine" 2>/dev/null | tr -d '\r') || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "${out//\\//}"
+}
+
+# The args evidence the harness matcher gets for Windows process $1 whose
+# executable is $2: the command line for an interpreter, the executable itself
+# otherwise. An unreadable command line falls back to the executable, which an
+# interpreter never matches, so the verdict fails closed rather than guessing.
+fm_win_process_args() {  # <winpid> <comm>
+  local winpid=$1 comm=$2 line
+  case "$comm" in
+    *node|*python*) if line=$(fm_win_command_line "$winpid"); then printf '%s' "$line"; return 0; fi ;;
+  esac
+  printf '%s' "$comm"
+}
+
 # Environment variables through which a verified harness publishes the pid of
 # its own session process. Extend only with a variable confirmed to name the
 # session-long harness process on Windows, because the identity check below is
@@ -252,7 +288,13 @@ fm_win_command() {  # <winpid>
 # same pid refreshes it as on POSIX. A non-Claude primary hand-started from a
 # Claude pane inherits both values and still resolves as that Claude session; no
 # environment signal tells the two apart there.
-FM_WIN_HARNESS_PID_VARS=(CLAUDE_PID)
+#
+# FM_PI_SESSION_PID is published by the tracked Pi extension
+# (.pi/extensions/fm-primary-turnend-guard.ts) from inside the Pi-family
+# process itself, so it names that session's own harness process. It is still
+# only a claim: the pid must be live and its command line must identify a Pi
+# harness (stock Pi or A1) before it is used.
+FM_WIN_HARNESS_PID_VARS=(CLAUDE_PID FM_PI_SESSION_PID)
 
 # Print this session's harness as one tagged Windows pid, or return 1.
 #
@@ -263,7 +305,7 @@ FM_WIN_HARNESS_PID_VARS=(CLAUDE_PID)
 # malformed, stale, or naming a non-harness process is discarded rather than
 # used, so a wrong or recycled pid fails closed instead of binding the lock.
 fm_win_harness_ancestry_pids() {
-  local var winpid comm
+  local var winpid comm args
   for var in "${FM_WIN_HARNESS_PID_VARS[@]}"; do
     winpid=${!var:-}
     case "$winpid" in
@@ -273,7 +315,8 @@ fm_win_harness_ancestry_pids() {
       case "${CLAUDE_CODE_SESSION_ID:-}" in ''|*$'\n'*|*$'\r'*) continue ;; esac
     fi
     comm=$(fm_win_command "$winpid") || continue
-    fm_harness_process_matches "$comm" "$comm" || continue
+    args=$(fm_win_process_args "$winpid" "$comm")
+    fm_harness_process_matches "$comm" "$args" || continue
     printf '%s%s\n' "$FM_WIN_PID_PREFIX" "$winpid"
     return 0
   done
@@ -662,7 +705,7 @@ fm_session_lock_pid_verdict() {
   if winpid=$(fm_win_untag_pid "$pid"); then
     comm=$(fm_win_command "$winpid") || rc=$?
     case $rc in
-      0) FM_PROC_COMM=$comm FM_PROC_ARGS=$comm FM_PROC_PPID=; FM_SESSION_LOCK_PID_VERDICT=readable ;;
+      0) FM_PROC_COMM=$comm FM_PROC_ARGS=$(fm_win_process_args "$winpid" "$comm") FM_PROC_PPID=; FM_SESSION_LOCK_PID_VERDICT=readable ;;
       1) FM_SESSION_LOCK_PID_VERDICT=dead ;;
     esac
     return 0
