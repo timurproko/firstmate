@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.4.0';
+export const VERSION = '0.4.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -536,7 +536,8 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   ].join('; ');
   const tag = h.config.tag;
   const started = hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
-    '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`,
+    // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
+    '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${extra.selfFix ? 'fix' : extra.reviews ? 'review' : opts.kind}`,
     '--label', `herdr.space=fm-crew-${tag}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
     '--', bashProgram(), '--login', '-i', '-c', line]);
   const address = started.value?.address;
