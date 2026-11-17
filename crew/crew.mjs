@@ -213,7 +213,18 @@ function cmdProject(args) {
     for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source) refuse('Usage: crew project add <name> <git folder> | crew project list');
+  if (verb === 'remove' && validId(name) && !source) {
+    if (!h.config.projects[name]) refuse(`Unknown project: ${name}. See \`crew project list\`.`);
+    // A task that is not closed still has, or may still have, a working copy of this project;
+    // `crew finish` needs the project's path to remove it, so the project stays until then.
+    const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
+    if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
+    delete h.config.projects[name];
+    writeJson(path.join(h.dir, 'crew.json'), h.config);
+    console.log(`project ${name} removed (its folder is untouched)`);
+    return;
+  }
+  if (verb !== 'add' || !validId(name) || !source) refuse('Usage: crew project add <name> <git folder> | crew project remove <name> | crew project list');
   const folder = path.resolve(source);
   const top = run('git', ['-C', folder, 'rev-parse', '--show-toplevel']);
   if (top.code !== 0) refuse(`${folder} is not a git repository.`);
@@ -502,6 +513,7 @@ const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmd
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew/home)
   crew project add <name> <git folder>     register a project   (crew project list)
+  crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
   crew wait <id>... [--timeout seconds]    block until each worker reports
