@@ -56,8 +56,8 @@ const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), f
 fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
-function crew(args, { terminal, cwd = homeDir } = {}) {
-  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '' };
+function crew(args, { terminal, cwd = homeDir, env: extra = {} } = {}) {
+  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '', ...extra };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -286,7 +286,100 @@ if (a[0] === 'run') {`));
   const f3 = JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f3', 'task.json'), 'utf8'));
   assert.deepEqual([f3.state, f3.reported, Boolean(f3.terminal)], ['reported', 'early', true]);
   assert.equal(crew(['finish', 'f3'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+
+  // --- crew maintains itself -----------------------------------------------------------
+  // A published source (bare), this machine's installed tool (a clone of it) and another
+  // machine (a second clone). The "suite" is a small script that fails when crew/broken exists.
+  const origin = path.join(root, 'origin.git'), tool = path.join(root, 'tool'), peer = path.join(root, 'peer'), seed = path.join(root, 'seed');
+  const who = ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid'];
+  const commit = (folder, files, message) => {
+    for (const [name, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(folder, name)), { recursive: true }); fs.writeFileSync(path.join(folder, name), text); }
+    git('-C', folder, 'add', '-A'); git('-C', folder, ...who, 'commit', '-q', '-m', message);
+    return git('-C', folder, 'rev-parse', 'HEAD').trim();
+  };
+  fs.mkdirSync(seed); git('-C', seed, 'init', '-q', '-b', 'main');
+  commit(seed, { 'crew/check.mjs': "import fs from 'node:fs'; process.exit(fs.existsSync('crew/broken') ? 1 : 0);\n", 'crew/tool.txt': 'one\n', 'README.md': 'outside\n' }, 'seed');
+  git('clone', '-q', '--bare', seed, origin); git('clone', '-q', origin, tool); git('clone', '-q', origin, peer);
+  for (const folder of [tool, peer]) { git('-C', folder, 'config', 'user.name', 't'); git('-C', folder, 'config', 'user.email', 't@example.invalid'); }
+  const self = { CREW_TOOL_ROOT: tool, CREW_SELFTEST: 'node crew/check.mjs' };
+  const sm = (args, terminal = 'c2', env = {}) => crew(args, { terminal, env: { ...self, ...env } });
+  const head = folder => git('-C', folder, 'rev-parse', 'HEAD').trim();
+  const taskOf = id => JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', id, 'task.json'), 'utf8'));
+  const first = head(tool);
+
+  // A crash is written down and points at the repair command.
+  const crashHome = path.join(root, 'crash-home'); fs.mkdirSync(crashHome);
+  fs.writeFileSync(path.join(crashHome, 'crew.json'), JSON.stringify({ version: 1, tag: 'crash' }));
+  r = crew(['project', 'list'], { cwd: crashHome }); assert.equal(r.code, 70, r.out);
+  assert.match(r.out, /internal error[\s\S]*defect in crew itself[\s\S]*crew fix "/);
+  const crashFiles = fs.readdirSync(path.join(fakeUser, '.crew', 'crashes'));
+  assert.equal(crashFiles.length, 1);
+  assert.match(fs.readFileSync(path.join(fakeUser, '.crew', 'crashes', crashFiles[0]), 'utf8'), /command: crew project list[\s\S]*TypeError/);
+
+  // fix: only the owner, one at a time, a ship task on crew's own source with the crash attached.
+  assert.equal(sm(['fix', 'x'], 'c1').code, 3);
+  assert.equal(sm(['fix']).code, 2);
+  r = sm(['fix', '--agent', 'pi', 'crew project list crashed', 'instead of printing nothing']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /spawned fix-1: pi ship in terminal (t\d+)[\s\S]*next: crew wait fix-1, then crew selfmerge fix-1/);
+  const fix1 = taskOf('fix-1'), fixCopy = path.join(copies, 'fix-1');
+  assert.deepEqual([fix1.selfFix, fix1.project, fix1.projectPath, fix1.base], [true, 'crew:self', slash(tool), first]);
+  const fixBrief = fs.readFileSync(fix1.brief, 'utf8');
+  assert.ok(fixBrief.includes('crew project list crashed instead of printing nothing') && fixBrief.includes(crashFiles[0]) && fixBrief.includes('under `crew/` only'), fixBrief);
+  assert.equal(git('-C', fixCopy, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'crew/fix-1');
+  r = sm(['fix', 'another']); assert.equal(r.code, 2); assert.match(r.out, /already open: fix-1/);
+
+  // selfmerge: every gate refuses and publishes nothing.
+  assert.equal(sm(['selfmerge', 'fix-1'], 'c1').code, 3);
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 2); assert.match(r.out, /only after its worker reported/);
+  fs.writeFileSync(fix1.report, 'fixed'); assert.equal(crew(['done', 'fix-1'], { terminal: fix1.terminal }).code, 0);
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /changes nothing/);
+  fs.writeFileSync(path.join(fixCopy, 'crew', 'half.txt'), 'x');
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /uncommitted files \(crew\/half\.txt\)/);
+  fs.rmSync(path.join(fixCopy, 'crew', 'half.txt'));
+  commit(fixCopy, { 'README.md': 'changed outside\n', 'crew/tool.txt': 'two\n' }, 'too wide');
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /outside crew\/ \(README\.md\)/);
+  git('-C', fixCopy, 'reset', '-q', '--hard', 'HEAD~1');
+  commit(fixCopy, { 'crew/tool.txt': 'two\n', 'crew/broken': '' }, 'breaks the suite');
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /the test suite fails \(node crew\/check\.mjs, exit 1\)/);
+  assert.deepEqual([head(origin), head(tool)], [first, first], 'A refused repair reaches nobody');
+  git('-C', fixCopy, 'reset', '-q', '--hard', 'HEAD~1');
+  commit(fixCopy, { 'crew/tool.txt': 'two\n' }, 'the repair');
+  // Meanwhile another machine published something else: the repair goes on top of it.
+  const theirs = commit(peer, { 'crew/peer.txt': 'theirs\n' }, 'from another machine'); git('-C', peer, 'push', '-q', 'origin', 'HEAD:main');
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /published fix-1 as [0-9a-f]{8} \(1 file: crew\/tool\.txt\); tests passed[\s\S]*this machine now runs [0-9a-f]{8} \(was [0-9a-f]{8}\)[\s\S]*crew finish fix-1/);
+  const second = head(origin);
+  assert.equal(head(tool), second, 'The installed tool is updated at once');
+  assert.equal(git('-C', origin, 'rev-parse', 'HEAD~1').trim(), theirs, 'On top of what the other machine published');
+  assert.equal(fs.readFileSync(path.join(tool, 'crew', 'tool.txt'), 'utf8').replace(/\r/g, ''), 'two\n');
+  assert.equal(taskOf('fix-1').merged, second);
+  assert.match(sm(['selfmerge', 'fix-1']).out, /already published/);
+  assert.equal(sm(['finish', 'fix-1']).code, 0);
+  assert.equal(git('-C', tool, 'branch', '--list', 'crew/fix-1').trim(), '', 'A published repair leaves no branch behind');
+  assert.equal(crew(['spawn', 'no', '--project', 'crew:self', 'x'], { terminal: 'c2' }).code, 2, "crew's own source is not a project for ordinary tasks");
+
+  // rollback: this machine goes back one step and stays there while that revision is the latest.
+  r = sm(['rollback']); assert.equal(r.code, 0, r.out); assert.equal(head(tool), first);
+  assert.equal(sm(['rollback']).code, 2, 'One step only');
+  r = sm(['start'], 'c2', { CREW_AUTO_UPDATE: '1' }); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /crew stays at [0-9a-f]{8} after a rollback/); assert.equal(head(tool), first);
+  // A developer's checkout (not the installed copy) never updates itself.
+  git('-C', peer, 'pull', '-q', 'origin', 'main'); const third = commit(peer, { 'crew/peer.txt': 'newer\n' }, 'newer'); git('-C', peer, 'push', '-q', 'origin', 'HEAD:main');
+  r = sm(['start']); assert.equal(r.code, 0); assert.equal(head(tool), first);
+  // Something newer than the bad revision releases the hold; start updates and runs again.
+  r = sm(['start'], 'c2', { CREW_AUTO_UPDATE: '1' }); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /crew updated itself [0-9a-f]{8} -> [0-9a-f]{8}[\s\S]*you hold /); assert.equal(head(tool), third);
+  assert.match(sm(['update']).out, /crew is up to date/);
+  // An unreachable source never blocks a session.
+  git('-C', tool, 'remote', 'set-url', 'origin', path.join(root, 'nowhere.git'));
+  r = sm(['start'], 'c2', { CREW_AUTO_UPDATE: '1' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /did not check for updates[\s\S]*you hold /);
+  assert.equal(sm(['update']).code, 4);
+  // A newer crew brings its coordinator rules into an existing home.
+  fs.writeFileSync(path.join(homeDir, 'AGENTS.md'), 'old rules');
+  assert.match(crew(['start'], { terminal: 'c2' }).out, /coordinator rules changed/);
+  assert.ok(fs.readFileSync(path.join(homeDir, 'AGENTS.md'), 'utf8').includes('crew selfmerge'));
+
+  console.log('PASS: self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
