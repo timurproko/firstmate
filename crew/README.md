@@ -10,6 +10,8 @@ It exists because Firstmate's shell runtime starts thousands of small processes 
 which is slow on Windows (Git Bash). Measured on the same machine and task (three read-only
 scouts requested at once): about 1 minute with crew against about 31 minutes with Firstmate.
 
+Where the work stands, why it went this way and what is left: [`docs/plan.md`](docs/plan.md).
+
 ## Layout on a machine
 
 ```
