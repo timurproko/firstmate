@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.5.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
@@ -237,7 +237,10 @@ is required. For any of them, read its \`--help\` before the first use instead o
   its workers prepared copies from the treehouse pool. Nothing else changes for you.
 - **no-mistakes**: a project that has its gate is delivered through it. The worker runs the
   gate, which reviews, tests, pushes and opens the pull request; skip \`crew review\` for such
-  a task, and \`crew land <id>\` then only records the pull request the gate opened.
+  a task, and \`crew land <id>\` then only records the pull request the gate opened. The gate
+  stops at the open pull request; it does not watch the checks unless the project was added
+  with \`--gate-skip none\`. A project whose lint or tests cannot run on this machine is added
+  with \`--gate-skip ci,lint\` (ask the person before leaving a step out).
 
 ## When crew itself is wrong
 A crew command that prints \`internal error\`, or that plainly does something other than what
@@ -292,8 +295,12 @@ function cmdProject(args) {
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--treehouse] | crew project remove <name> | crew project list');
+  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--treehouse] [--gate-skip <steps>|none] | crew project remove <name> | crew project list');
   const pooled = args.includes('--treehouse');
+  // Which steps of the no-mistakes gate are left out for this project (see gateSkipOf).
+  const skipAt = args.indexOf('--gate-skip'), skipText = skipAt < 0 ? null : String(args[skipAt + 1] ?? '');
+  const gateSkip = skipText === null ? null : skipText === 'none' ? [] : skipText.split(',').map(s => s.trim()).filter(Boolean);
+  if (gateSkip && (!skipText || gateSkip.some(s => !GATE_STEPS.includes(s)))) refuse(`--gate-skip takes ${GATE_STEPS.join(', ')} (comma-separated), or none. Push and pull request cannot be skipped: they are the delivery.`);
   if (pooled && !toolPath('treehouse')) refuse('treehouse is not installed on this machine (Herdr: Settings > Plugins > Crew).', 4);
   const folder = path.resolve(source);
   const top = run('git', ['-C', folder, 'rev-parse', '--show-toplevel']);
@@ -306,10 +313,18 @@ function cmdProject(args) {
     const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
     if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
   }
-  h.config.projects[name] = { path: slash(folder), ...(pooled ? { worktrees: 'treehouse' } : {}) };
+  h.config.projects[name] = { path: slash(folder), ...(pooled ? { worktrees: 'treehouse' } : {}), ...(gateSkip ? { gateSkip } : {}) };
   writeJson(path.join(h.dir, 'crew.json'), h.config);
-  console.log(`project ${name}: ${slash(folder)}${pooled ? ' (working copies from treehouse)' : ''}`);
+  console.log(`project ${name}: ${slash(folder)}${pooled ? ' (working copies from treehouse)' : ''}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}`);
 }
+
+// The gate's steps a project may leave out. Unless a project says otherwise, the gate's CI
+// watch is left out: for crew a change is delivered when its pull request is open, the person
+// reads the checks there and merges, and a gate that keeps watching (for days, by default)
+// would hold the worker and its copy for nothing. A project whose lint or tests cannot run on
+// this machine names those too: `crew project add <name> <folder> --gate-skip ci,lint`.
+const GATE_STEPS = ['rebase', 'review', 'test', 'document', 'lint', 'ci'];
+const gateSkipOf = project => (Array.isArray(project?.gateSkip) ? project.gateSkip.filter(s => GATE_STEPS.includes(s)) : ['ci']);
 
 function cmdStart() {
   const h = home();
@@ -477,7 +492,8 @@ function backlogMove(h, id, verb, more = []) {
   } catch { /* the backlog never stops the work */ }
 }
 
-export function briefText({ id, kind, task, worktree, project, report, tools = [], gate = null }) {
+export function briefText({ id, kind, task, worktree, project, report, tools = [], gate = null, gateSkip = [] }) {
+  const skip = gateSkip.length ? ` --skip ${gateSkip.join(',')}` : '', watched = !gateSkip.includes('ci');
   const hints = TOOLS.filter(t => t.brief && tools.includes(t.id)).map(t => `- ${t.brief}`);
   return [
     `# Task ${id} (${kind})`, '', task.trim(), '',
@@ -489,7 +505,10 @@ export function briefText({ id, kind, task, worktree, project, report, tools = [
         ? '- Make your changes on the branch already checked out here and commit them.'
         : '- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.',
     ...(kind === 'ship' && gate ? [
-      `- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file ${gate}\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. Do not push or open a pull request any other way.`,
+      `- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file ${gate}${skip}\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.`,
+      watched
+        ? '- The gate also watches the pull request\'s checks. Once they have passed, end its watch with `no-mistakes axi handoff`; if no check has appeared ten minutes after the pull request opened, say so in the report and stop waiting.'
+        : '- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.',
       '- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.',
     ] : []),
     `- When you are finished, write your result to \`${report}\` in Markdown, with the answer in the first lines.`,
@@ -550,7 +569,7 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
     if (wt.code !== 0) failed(wt.stderr.trim());
   }
   if (intent) fs.writeFileSync(intent, `${task.trim()}\n`);
-  fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent }));
+  fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project) }));
 
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   // The agent starts with one instruction as its argument, so nothing is typed into it and
@@ -1060,7 +1079,7 @@ const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmd
   tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew/home)
-  crew project add <name> <git folder> [--treehouse]   register a project   (crew project list)
+  crew project add <name> <git folder> [--treehouse] [--gate-skip <steps>|none]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
