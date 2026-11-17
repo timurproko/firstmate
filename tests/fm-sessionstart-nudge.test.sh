@@ -453,6 +453,62 @@ JS
   pass "Pi distinguishes header-proven restored CLI sessions from named create-if-missing startups"
 }
 
+test_pi_startup_shows_progress_until_the_digest_lands() {
+  local fixture out status=0
+  command -v node >/dev/null 2>&1 || {
+    echo "skip: node not found for Pi startup progress test"
+    return 0
+  }
+  fixture="$TMP_ROOT/pi-startup-progress"
+  mkdir -p "$fixture/.pi/extensions/lib" "$fixture/bin" "$fixture/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$fixture/.pi/extensions/"
+  cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" \
+    "$ROOT/.pi/extensions/lib/fm-sessionstart-supervisor.mjs" "$fixture/.pi/extensions/lib/"
+  cat > "$fixture/bin/fm-sessionstart-run.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+printf 'digest\n'
+SH
+  cat > "$fixture/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fixture/bin/"*.sh
+
+  out=$(EXT="$fixture/.pi/extensions/fm-primary-turnend-guard.ts" \
+    FM_HOME="$fixture" FM_ROOT_OVERRIDE="$fixture" \
+    node --input-type=module 2>&1 <<'JS'
+import { pathToFileURL } from "node:url";
+const handlers = new Map();
+const pi = { on(event, handler) { handlers.set(event, handler); }, sendMessage() {} };
+const extension = await import(`${pathToFileURL(process.env.EXT).href}?progress=${Date.now()}`);
+extension.default(pi);
+const widget = [];
+const session = (ui) => ({
+  ...ui,
+  sessionManager: { getEntries: () => [], getHeader: () => ({ timestamp: new Date().toISOString() }), getSessionId: () => "progress" },
+});
+const ctx = session({ hasUI: true, ui: { setWidget: (key, content) => widget.push([key, content]) } });
+handlers.get("session_start")({ reason: "startup" }, ctx);
+const shown = widget.length === 1 && widget[0][0] === "firstmate-sessionstart" &&
+  /^Firstmate is starting \(\d+s\)\./.test(widget[0][1]?.[0] ?? "");
+await handlers.get("before_agent_start")({ prompt: "test" }, ctx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+const last = widget[widget.length - 1];
+console.log(`shown=${shown} cleared=${last[0] === "firstmate-sessionstart" && last[1] === undefined}`);
+// A session without a UI, or one whose widget call throws, starts exactly the same.
+handlers.get("session_start")({ reason: "startup" }, session({ hasUI: false, ui: { setWidget: () => { throw new Error("no ui"); } } }));
+handlers.get("session_start")({ reason: "startup" }, session({ ui: { setWidget: () => { throw new Error("broken"); } } }));
+await handlers.get("session_shutdown")();
+console.log("headless=ok");
+JS
+  ) || status=$?
+  expect_code 0 "$status" "Pi startup progress"
+  assert_contains "$out" "shown=true cleared=true" "the startup line was not shown and then removed: $out"
+  assert_contains "$out" "headless=ok" "a missing or failing UI changed session start: $out"
+  pass "Pi shows a startup line above the editor until the session-start digest lands"
+}
+
 test_pi_sessionstart_generation_prerequisite() {
   local fixture out status=0
   command -v node >/dev/null 2>&1 || {
@@ -1117,6 +1173,7 @@ test_run_creates_missing_state_on_a_fresh_primary
 test_run_reports_a_state_dir_it_cannot_create
 test_run_reports_a_failed_session_start_as_digest_text
 test_pi_startup_classifies_cli_continuations
+test_pi_startup_shows_progress_until_the_digest_lands
 test_pi_sessionstart_generation_prerequisite
 test_pi_reload_releases_sessionstart_exit_listener
 test_pi_large_sessionstart_digest_is_delivered_loudly
