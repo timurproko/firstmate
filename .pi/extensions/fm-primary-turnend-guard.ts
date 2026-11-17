@@ -107,10 +107,16 @@ function markLoaded(): void {
 // while reload, resume, and fork all keep prior context.
 const sessionstartDeliveryBytes = 512 * 1024;
 
+type SessionstartWidgetTui = { requestRender?: () => void };
 type SessionStartContext = {
   hasUI?: boolean;
   ui?: {
-    setWidget?: (key: string, content: readonly string[] | undefined) => void;
+    setWidget?: (
+      key: string,
+      content:
+        | ((tui: SessionstartWidgetTui) => { render(width: number): string[]; invalidate(): void })
+        | undefined,
+    ) => void;
   };
   sessionManager?: {
     getHeader?: () => { timestamp?: unknown } | null | undefined;
@@ -209,27 +215,46 @@ function showSessionstartProgress(
   const ui = ctx.ui;
   if (typeof ui?.setWidget !== "function") return;
   const started = Date.now();
-  const paint = (): void => {
-    if (!sessionstartGenerationIsLive(generation)) return;
-    const seconds = Math.round((Date.now() - started) / 1000);
+  // A component, not fixed lines: it reads the clock when it is drawn, and the
+  // factory hands over the host's render handle. Replacing a widget does not
+  // redraw an idle screen on every host (A1 keeps the old rows until something
+  // else renders), so every change asks for the redraw itself.
+  let tui: SessionstartWidgetTui | undefined;
+  const redraw = (): void => {
     try {
-      ui.setWidget?.(sessionstartProgressWidgetKey, [
-        `Firstmate is starting (${seconds}s). A message sent now runs as soon as it is ready.`,
-      ]);
+      tui?.requestRender?.();
     } catch {
     }
   };
-  paint();
-  const timer = setInterval(paint, sessionstartProgressIntervalMs);
+  try {
+    ui.setWidget?.(sessionstartProgressWidgetKey, (host) => {
+      tui = host;
+      return {
+        render: (width: number): string[] => {
+          const seconds = Math.round((Date.now() - started) / 1000);
+          const line = ` Firstmate is starting (${seconds}s). A message sent now runs as soon as it is ready.`;
+          return [line.slice(0, Math.max(0, width))];
+        },
+        invalidate: (): void => {},
+      };
+    });
+  } catch {
+    return;
+  }
+  redraw();
+  const timer = setInterval(() => {
+    if (sessionstartGenerationIsLive(generation)) redraw();
+  }, sessionstartProgressIntervalMs);
   timer.unref?.();
   void generation.result.catch(() => undefined).then(() => {
     clearInterval(timer);
-    // A replacement generation has already painted its own line; leave it.
+    // A replacement generation has already installed its own line; leave it.
     if (activeSessionstartGeneration && activeSessionstartGeneration !== generation) return;
     try {
       ui.setWidget?.(sessionstartProgressWidgetKey, undefined);
     } catch {
     }
+    redraw();
   });
 }
 

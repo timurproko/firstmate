@@ -488,14 +488,19 @@ const session = (ui) => ({
   ...ui,
   sessionManager: { getEntries: () => [], getHeader: () => ({ timestamp: new Date().toISOString() }), getSessionId: () => "progress" },
 });
-const ctx = session({ hasUI: true, ui: { setWidget: (key, content) => widget.push([key, content]) } });
+// The host draws nothing by itself: only a requested render shows a change.
+let renders = 0;
+const tui = { requestRender: () => { renders++; } };
+const ctx = session({ hasUI: true, ui: { setWidget: (key, content) => widget.push([key, typeof content === "function" ? content(tui) : content]) } });
 handlers.get("session_start")({ reason: "startup" }, ctx);
+const rows = widget[0]?.[1]?.render?.(200) ?? [];
 const shown = widget.length === 1 && widget[0][0] === "firstmate-sessionstart" &&
-  /^Firstmate is starting \(\d+s\)\./.test(widget[0][1]?.[0] ?? "");
+  rows.length === 1 && /^ Firstmate is starting \(\d+s\)\./.test(rows[0]) &&
+  widget[0][1].render(10)[0].length === 10 && renders === 1;
 await handlers.get("before_agent_start")({ prompt: "test" }, ctx);
 await new Promise((resolve) => setTimeout(resolve, 50));
 const last = widget[widget.length - 1];
-console.log(`shown=${shown} cleared=${last[0] === "firstmate-sessionstart" && last[1] === undefined}`);
+console.log(`shown=${shown} cleared=${last[0] === "firstmate-sessionstart" && last[1] === undefined && renders === 2}`);
 // A session without a UI, or one whose widget call throws, starts exactly the same.
 handlers.get("session_start")({ reason: "startup" }, session({ hasUI: false, ui: { setWidget: () => { throw new Error("no ui"); } } }));
 handlers.get("session_start")({ reason: "startup" }, session({ ui: { setWidget: () => { throw new Error("broken"); } } }));
