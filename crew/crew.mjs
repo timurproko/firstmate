@@ -21,10 +21,15 @@ export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'home');
 // --- agents ------------------------------------------------------------------
 // The only per-agent knowledge: how to start it with one instruction, and how it can be
 // asked to leave. `close` means the terminal is closed once the agent is no longer working.
+// `args` follow the instruction: Claude Code reads a prompt placed after --allowedTools as
+// one more tool name. A Claude worker keeps its permission system; it is only told up front
+// that editing files and using its ordinary tools inside its own working copy is expected,
+// so it does not stop to ask for each one. Folder trust is Claude's own: a working copy is
+// trusted when a folder above it (the home directory, or ~/.crew/worktrees) already is.
 export const AGENTS = {
   a1: { command: 'a1', exit: 'a1-api' },
   pi: { command: 'pi', exit: 'close' },
-  claude: { command: 'claude', exit: 'close' },
+  claude: { command: 'claude', exit: 'close', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,Read,Edit,Write,Glob,Grep'] },
 };
 
 // --- small helpers -----------------------------------------------------------
@@ -254,7 +259,7 @@ function cmdSpawn(args) {
   const instruction = `Read the brief at ${brief} and carry it out exactly.`;
   const line = [
     `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
-    `${shq(agent.command)} ${shq(instruction)}`,
+    [agent.command, instruction, ...(agent.args ?? [])].map(shq).join(' '),
     'exec bash --login -i',
   ].join('; ');
   const tag = h.config.tag;
