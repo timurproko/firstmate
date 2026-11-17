@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, AGENTS } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, AGENTS } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -20,6 +20,18 @@ assert.deepEqual(Object.keys(AGENTS), ['a1', 'pi', 'claude']);
 const brief = briefText({ id: 't1', kind: 'scout', task: 'Count lines.', worktree: 'W', project: 'p', report: 'R' });
 assert.match(brief, /read-only investigation/); assert.match(brief, /crew done t1/); assert.match(brief, /`R`/);
 assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit them/);
+
+// Claude account choice: only for Claude, only through the launcher, never an unchecked value.
+{
+  const launcher = path.join(root, 'claude-as.sh'); fs.writeFileSync(launcher, '#!/bin/sh');
+  const env = { CREW_CLAUDE_ACCOUNT: 'me@example.com', CREW_CLAUDE_LAUNCHER: launcher };
+  assert.equal(agentCommand('a1', AGENTS.a1, 'do it', env), "'a1' 'do it'", 'The account applies to Claude Code only');
+  assert.equal(agentCommand('claude', AGENTS.claude, 'do it', {}), "'claude' 'do it' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,Read,Edit,Write,Glob,Grep'");
+  const line = agentCommand('claude', AGENTS.claude, "it's", env);
+  assert.ok(line.startsWith("bash --noprofile --norc '") && line.includes("claude-as.sh' --as 'me@example.com' --command \"$(type -P claude || type -P claude.exe)\" -- 'it'\\''s' '--permission-mode' 'acceptEdits'"), line);
+  assert.throws(() => agentCommand('claude', AGENTS.claude, 'x', { ...env, CREW_CLAUDE_ACCOUNT: "a'; rm -rf ~" }), /Not an account name/);
+  assert.equal(agentCommand('claude', AGENTS.claude, 'x', { CREW_CLAUDE_ACCOUNT: 'me@example.com', CREW_CLAUDE_LAUNCHER: path.join(root, 'missing.sh') }).startsWith("'claude' 'x'"), true, 'No launcher: the default account, with a warning');
+}
 
 // A fake Core: terminals live in a JSON file; `run` creates one, `get` reads, `kill`/`rm` remove.
 const fake = path.join(root, 'fake-hc.mjs'), world = path.join(root, 'world.json');
@@ -107,6 +119,10 @@ try {
   r = crew(['finish', 't2'], { terminal: 'c1' }); assert.equal(r.code, 6); assert.match(r.out, /still working/);
   assert.ok(fs.existsSync(path.join(copies, 't2')), 'A refused finish removes nothing');
   r = crew(['wait', 't2', '--timeout', '1'], { terminal: 'c1' }); assert.equal(r.code, 124); assert.match(r.out, /still working after 1s/);
+  // A worker waiting for a person is handed back at once, not waited on.
+  setTerminal('t2', { status: { app: 'claude-code', state: 'blocked', kind: 'permission', msg: 'trust this folder' } });
+  r = crew(['wait', 't2', '--timeout', '30'], { terminal: 'c1' }); assert.equal(r.code, 7); assert.match(r.out, /== t2: needs a person - trust this folder (terminal t2); it is still running/);
+  assert.match(crew(['status'], { terminal: 'c1' }).out, /t2	working/, 'Its task is unchanged');
   setTerminal('t2', { state: 'finished' });
   r = crew(['wait', 't2', '--timeout', '20'], { terminal: 'c1' }); assert.equal(r.code, 0); assert.match(r.out, /== t2: failed - The worker terminal ended without a report/);
 
@@ -148,7 +164,7 @@ try {
   assert.equal(r2.code, 0); assert.match(r2.out, /could not record the working copy as trusted/);
   assert.equal(fs.readFileSync(claudeConfig, 'utf8'), '{ not json');
   assert.equal(crew(['finish', 'td', '--force'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command and its folder trust');
+  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command, its folder trust and account choice');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
