@@ -79,7 +79,10 @@ function home() {
   if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home here. Run `crew init <folder>` once, then work from that folder (or set CREW_HOME).');
   const config = readJson(path.join(dir, 'crew.json'));
   if (!config || config.version !== 1) refuse(`${path.join(dir, 'crew.json')} is not a version 1 crew home.`);
-  return { dir, config, tasks: path.join(dir, 'tasks'), worktrees: path.join(dir, 'worktrees'), owner: path.join(dir, 'owner.json') };
+  // Working copies live OUTSIDE the home. Agents read instruction files from their folder
+  // upwards, so a worker inside the home would load the coordinator's rules and act as one.
+  const worktrees = path.join(process.env.CREW_WORKTREES || path.join(os.homedir(), '.crew', 'worktrees'), String(config.tag));
+  return { dir, config, tasks: path.join(dir, 'tasks'), worktrees, owner: path.join(dir, 'owner.json') };
 }
 const taskDir = (h, id) => path.join(h.tasks, id);
 const taskFile = (h, id) => path.join(taskDir(h, id), 'task.json');
@@ -148,7 +151,7 @@ function cmdInit(args) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'crew.json');
   if (fs.existsSync(file)) refuse(`${dir} is already a crew home.`);
-  for (const name of ['tasks', 'worktrees']) fs.mkdirSync(path.join(dir, name), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'tasks'), { recursive: true });
   writeJson(file, { version: 1, tag: Math.random().toString(16).slice(2, 10), projects: {} });
   for (const [name, text] of [['AGENTS.md', COORDINATOR_RULES], ['CLAUDE.md', '@AGENTS.md\n']]) {
     if (!fs.existsSync(path.join(dir, name))) fs.writeFileSync(path.join(dir, name), text);
@@ -230,6 +233,7 @@ function cmdSpawn(args) {
 
   const dir = taskDir(h, id), worktree = slash(path.join(h.worktrees, id)), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
   fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(h.worktrees, { recursive: true });
   const record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null };
   saveTask(h, record);
 
