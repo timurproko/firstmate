@@ -11,12 +11,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.5.2';
+export const VERSION = '0.6.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
-// Herdr), home/ (the default crew home) and worktrees/ (workers' copies).
-export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'home');
+// Herdr), crew/ (the default crew home) and worktrees/ (workers' copies).
+export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'crew');
 
 // --- agents ------------------------------------------------------------------
 // The only per-agent knowledge: how to start it with one instruction, and how it can be
@@ -90,11 +90,45 @@ function findHome() {
     if (path.dirname(dir) === dir) break;
   }
   // Otherwise the per-user home, so `crew` works from any folder on the machine.
-  return fs.existsSync(path.join(DEFAULT_HOME, 'crew.json')) ? DEFAULT_HOME : null;
+  return [DEFAULT_HOME, LEGACY_HOME].find(dir => fs.existsSync(path.join(dir, 'crew.json'))) ?? null;
+}
+// The default home was ~/.crew/home until 0.6. Herdr names a space after its folder, so the
+// coordinator's space was called "home"; in ~/.crew/crew it is called "crew". An existing
+// home is moved once, and only when nobody can be using it: no live owner, and the folder
+// itself free (a terminal still sitting in it keeps it where it is). Until then the old
+// place keeps working. Task records hold paths into the home, so those are rewritten.
+const LEGACY_HOME = path.join(os.homedir(), '.crew', 'home');
+function moveLegacyHome() {
+  if (!fs.existsSync(path.join(LEGACY_HOME, 'crew.json')) || fs.existsSync(DEFAULT_HOME)) return null;
+  try {
+    const owner = readJson(path.join(LEGACY_HOME, 'owner.json'));
+    if (owner?.terminal && probe(owner.terminal).state !== 'absent' && probe(owner.terminal).state !== 'finished') return 'a session still holds it';
+    fs.renameSync(LEGACY_HOME, DEFAULT_HOME);
+  } catch (error) { return `it is in use (${error.code ?? error.message})`; }
+  const from = slash(LEGACY_HOME), tasks = path.join(DEFAULT_HOME, 'tasks');
+  for (const id of fs.existsSync(tasks) ? fs.readdirSync(tasks) : []) {
+    const file = path.join(tasks, id, 'task.json'), task = readJson(file);
+    if (!task) continue;
+    for (const key of ['report', 'brief']) if (typeof task[key] === 'string' && task[key].startsWith(`${from}/`)) task[key] = slash(DEFAULT_HOME) + task[key].slice(from.length);
+    writeJson(file, task);
+  }
+  return 'moved';
+}
+// `crew home` prints the home in use; `--ensure` first moves an old home to its new place when
+// that is safe and creates the default home when there is none. Herdr runs it before it
+// starts a coordinator, to know which folder to start it in.
+function cmdHome(args) {
+  if (args.includes('--ensure') && !process.env.CREW_HOME) {
+    const moved = moveLegacyHome();
+    if (moved === 'moved') console.error(`crew: the home moved to ${slash(DEFAULT_HOME)}`);
+    else if (moved) console.error(`crew: the home stays at ${slash(LEGACY_HOME)} for now: ${moved}`);
+    if (!fs.existsSync(path.join(DEFAULT_HOME, 'crew.json')) && !fs.existsSync(path.join(LEGACY_HOME, 'crew.json'))) createHome(DEFAULT_HOME);
+  }
+  console.log(slash(home().dir));
 }
 function home() {
   const dir = findHome();
-  if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home yet. Run `crew init` once (it creates ~/.crew/home), or `crew init <folder>` for a home elsewhere.');
+  if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home yet. Run `crew init` once (it creates ~/.crew/crew), or `crew init <folder>` for a home elsewhere.');
   const config = readJson(path.join(dir, 'crew.json'));
   if (!config || config.version !== 1) refuse(`${path.join(dir, 'crew.json')} is not a version 1 crew home.`);
   // Working copies live OUTSIDE the home. Agents read instruction files from their folder
@@ -233,7 +267,7 @@ is required. For any of them, read its \`--help\` before the first use instead o
   options, or a report is long, write it as a page (\`lavish-axi --help\` says how) and open
   it with \`crew show <page.html>\`, never with \`lavish-axi <page.html>\` directly: the person
   may be at another machine, and \`crew show\` also puts a Lavish link in the status bar of
-  your terminal that opens the page where they are. Say that the link is there. Wait for
+  your terminal, and Herdr opens the page in their browser where they are. Say that it is open. Wait for
   their answer with \`lavish-axi poll <page.html>\`. A yes-or-no question stays in chat.
 - **treehouse**: a project added with \`crew project add <name> <folder> --treehouse\` gives
   its workers prepared copies from the treehouse pool. Nothing else changes for you.
@@ -261,7 +295,10 @@ around it by hand and never edit crew's own files yourself.
 `;
 
 function cmdInit(args) {
-  const dir = args[0] ? path.resolve(args[0]) : DEFAULT_HOME;
+  if (!args[0] && fs.existsSync(path.join(LEGACY_HOME, 'crew.json'))) refuse(`There is already a crew home at ${slash(LEGACY_HOME)}. \`crew home --ensure\` moves it to ${slash(DEFAULT_HOME)}.`);
+  createHome(args[0] ? path.resolve(args[0]) : DEFAULT_HOME);
+}
+function createHome(dir) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'crew.json');
   if (fs.existsSync(file)) refuse(`${dir} is already a crew home.`);
@@ -457,14 +494,18 @@ function cmdShow(args) {
   if (!file) refuse('Usage: crew show <page.html> [--reopen]');
   if (!fs.existsSync(file)) refuse(`No such page: ${file}`);
   if (!toolPath('lavish-axi')) refuse('Showing a page needs lavish-axi, which is not installed here (Herdr: Settings > Plugins > Crew, or `npm install -g lavish-axi`).', 4);
-  const opened = runTool('lavish-axi', [path.resolve(file), ...(args.includes('--reopen') ? ['--reopen'] : [])], { timeout: 120000 });
+  // In a Herdr terminal the page is not opened in a browser on this machine (the person may
+  // not be here); the request label below makes Herdr open it where the person is.
+  const opened = runTool('lavish-axi', [path.resolve(file), ...(args.includes('--reopen') ? ['--reopen'] : []), ...(mine ? ['--no-open'] : [])], { timeout: 120000 });
   const said = `${opened.stdout}\n${opened.stderr}`, url = PAGE_URL.exec(said)?.[0];
   if (opened.code !== 0 || !url) refuse(`lavish-axi did not open the page: ${lastLine(said)}`, 4);
   console.log(`shown: ${url}`);
   if (!mine) { console.log('This is not a Herdr terminal, so no link was added to a status bar.'); return; }
-  const labelled = [`custom.preview.url=${url}`, 'custom.preview.label=Lavish'].map(label => hc(['label', mine, label]));
+  // custom.preview.open is a request with its time: Herdr opens the page once for it, in the
+  // browser of the machine its window is on.
+  const labelled = [`custom.preview.url=${url}`, 'custom.preview.label=Lavish', `custom.preview.open=${Date.now()}`].map(label => hc(['label', mine, label]));
   console.log(labelled.every(r => r.code === 0)
-    ? 'The person opens it with the Lavish link in the status bar of this terminal, from their own machine too. Tell them it is there.'
+    ? 'Herdr opens it in the person\'s browser on their own machine, and keeps a Lavish link in the status bar of this terminal for later. Tell them it is there.'
     : `Core did not label this terminal (${lastLine(labelled.find(r => r.code !== 0).stderr)}); give the person the address instead.`);
 }
 
@@ -1078,9 +1119,9 @@ function cmdStatus(args) {
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
-  tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
+  home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
-  crew init [folder]                       create a crew home (default ~/.crew/home)
+  crew init [folder]                       create a crew home (default ~/.crew/crew)
   crew project add <name> <git folder> [--treehouse] [--gate-skip <steps>|none]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
