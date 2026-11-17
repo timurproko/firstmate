@@ -463,20 +463,39 @@ function cmdFinish(args) {
   console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}`);
 }
 
+function taskElapsedSeconds(task, currentTime) {
+  const start = Date.parse(task.spawned ?? task.created);
+  const end = Date.parse(task.state === 'closed' ? task.closed : task.state === 'reported' ? task.reported
+    : task.state === 'stopped' ? task.stopped : task.state === 'failed' ? task.updated : null);
+  if (!Number.isFinite(start)) return null;
+  return Math.max(0, Math.floor(((Number.isFinite(end) ? end : currentTime) - start) / 1000));
+}
+function formatDuration(seconds) {
+  if (seconds === null) return '-';
+  const parts = [];
+  for (const [unit, size] of [['d', 86400], ['h', 3600], ['m', 60], ['s', 1]]) {
+    const count = Math.floor(seconds / size);
+    if (count) parts.push(`${count}${unit}`);
+    seconds %= size;
+  }
+  return parts.slice(0, 2).join(' ') || '0s';
+}
+
 function cmdStatus(args) {
   const h = home();
   const json = args.includes('--json'), all = args.includes('--all');
   const { owner, live, mine } = ownerState(h);
+  const currentTime = Date.now();
   const tasks = allTasks(h).filter(t => all || t.state !== 'closed').map(t => {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
     return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
-      report: fs.existsSync(t.report) ? t.report : null, error: t.error ?? null };
+      report: fs.existsSync(t.report) ? t.report : null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime) };
   });
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
-  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.agent}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}${t.error ? `\t${t.error}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.agent}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.error ? `\t${t.error}` : ''}`);
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus };

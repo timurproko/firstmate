@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, AGENTS } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, AGENTS, main } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -63,6 +63,55 @@ function crew(args, { terminal, cwd = homeDir } = {}) {
 const git = (...args) => { const r = spawnSync('git', args, { encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
 
 try {
+  // Status uses spawn time (creation while preparing), freezes settled tasks, and formats
+  // elapsed time without contacting Core or depending on the wall clock.
+  {
+    const statusHome = path.join(root, 'durations'), clock = Date.parse('2026-06-01T12:00:00Z');
+    const ago = seconds => new Date(clock - seconds * 1000).toISOString();
+    fs.mkdirSync(path.join(statusHome, 'tasks'), { recursive: true });
+    fs.writeFileSync(path.join(statusHome, 'crew.json'), JSON.stringify({ version: 1, tag: 'durations', projects: {} }));
+    const cases = [
+      { id: 'preparing', state: 'preparing', created: ago(45), seconds: 45, text: '45s' },
+      { id: 'working', state: 'working', spawned: ago(93784), seconds: 93784, text: '1d 2h' },
+      { id: 'minutes', state: 'working', spawned: ago(125), seconds: 125, text: '2m 5s' },
+      { id: 'reported', state: 'reported', spawned: ago(200), reported: ago(75), seconds: 125, text: '2m 5s' },
+      { id: 'stopped', state: 'stopped', spawned: ago(200), stopped: ago(141), seconds: 59, text: '59s' },
+      { id: 'failed', state: 'failed', spawned: ago(7200), updated: ago(3600), seconds: 3600, text: '1h' },
+      { id: 'future', state: 'working', spawned: ago(-60), seconds: 0, text: '0s' },
+      { id: 'unknown', state: 'preparing', created: 'invalid', seconds: null, text: '-' },
+      { id: 'closed', state: 'closed', spawned: ago(7200), closed: ago(3600), seconds: 3600, text: '1h' },
+    ];
+    for (const { seconds, text, ...task } of cases) {
+      const dir = path.join(statusHome, 'tasks', task.id);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'task.json'), JSON.stringify({ created: ago(200000), kind: 'ship', agent: 'pi',
+        project: 'demo', terminal: null, report: path.join(dir, 'report.md'), ...task }));
+    }
+    const oldHome = process.env.CREW_HOME, oldNow = Date.now, oldLog = console.log;
+    const output = [];
+    try {
+      process.env.CREW_HOME = statusHome;
+      Date.now = () => clock;
+      console.log = line => output.push(line);
+      main(['status']);
+      for (const task of cases.filter(t => t.state !== 'closed')) {
+        assert.ok(output.includes(`${task.id}\t${task.state}\tship/pi\tdemo\t-\t${task.text}`), task.id);
+      }
+      assert.ok(!output.some(line => line.startsWith('closed\t')), 'Closed tasks stay hidden by default');
+      output.length = 0;
+      main(['status', '--all', '--json']);
+      const tasks = JSON.parse(output[0]).tasks;
+      for (const task of cases) assert.equal(tasks.find(t => t.id === task.id).elapsedSeconds, task.seconds, task.id);
+      output.length = 0;
+      main(['status', '--all']);
+      assert.ok(output.includes('closed\tclosed\tship/pi\tdemo\t-\t1h'), 'Closed duration stays fixed');
+    } finally {
+      if (oldHome === undefined) delete process.env.CREW_HOME; else process.env.CREW_HOME = oldHome;
+      Date.now = oldNow;
+      console.log = oldLog;
+    }
+  }
+
   fs.mkdirSync(project); git('-C', project, 'init', '-q'); fs.writeFileSync(path.join(project, 'README.md'), 'one\ntwo\n');
   git('-C', project, 'add', '-A'); git('-C', project, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'init');
 
@@ -165,7 +214,7 @@ try {
   assert.equal(r2.code, 0); assert.match(r2.out, /could not record the working copy as trusted/);
   assert.equal(fs.readFileSync(claudeConfig, 'utf8'), '{ not json');
   assert.equal(crew(['finish', 'td', '--force'], { terminal: 'c2' }).code, 0);
-  console.log('PASS: crew helpers, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command, its folder trust and account choice');
+  console.log('PASS: crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, the Claude worker command, its folder trust and account choice');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
