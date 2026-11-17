@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# crew launcher for POSIX shells (Git Bash included).
+dir="${BASH_SOURCE[0]%/*}"
+exec node "$dir/../crew.mjs" "$@"
