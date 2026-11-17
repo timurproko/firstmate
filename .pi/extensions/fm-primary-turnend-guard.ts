@@ -108,6 +108,10 @@ function markLoaded(): void {
 const sessionstartDeliveryBytes = 512 * 1024;
 
 type SessionStartContext = {
+  hasUI?: boolean;
+  ui?: {
+    setWidget?: (key: string, content: readonly string[] | undefined) => void;
+  };
   sessionManager?: {
     getHeader?: () => { timestamp?: unknown } | null | undefined;
     getSessionId?: () => unknown;
@@ -188,6 +192,45 @@ function sessionIdFromContext(ctx: SessionStartContext): string {
 
 function sessionstartGenerationIsLive(generation: SessionstartGeneration): boolean {
   return activeSessionstartGeneration === generation && !generation.stopping;
+}
+
+// The startup digest takes seconds to minutes, and Pi shows nothing while
+// before_agent_start waits for it: a prompt submitted meanwhile leaves the
+// editor and nothing else moves until the digest lands, which reads as a hung
+// session. Say what is happening above the editor until this generation
+// settles. Presentation only: it never delays, delivers or cancels anything.
+const sessionstartProgressWidgetKey = "firstmate-sessionstart";
+const sessionstartProgressIntervalMs = 5000;
+function showSessionstartProgress(
+  generation: SessionstartGeneration,
+  ctx: SessionStartContext | undefined,
+): void {
+  if (!ctx || ctx.hasUI === false) return;
+  const ui = ctx.ui;
+  if (typeof ui?.setWidget !== "function") return;
+  const started = Date.now();
+  const paint = (): void => {
+    if (!sessionstartGenerationIsLive(generation)) return;
+    const seconds = Math.round((Date.now() - started) / 1000);
+    try {
+      ui.setWidget?.(sessionstartProgressWidgetKey, [
+        `Firstmate is starting (${seconds}s). A message sent now runs as soon as it is ready.`,
+      ]);
+    } catch {
+    }
+  };
+  paint();
+  const timer = setInterval(paint, sessionstartProgressIntervalMs);
+  timer.unref?.();
+  void generation.result.catch(() => undefined).then(() => {
+    clearInterval(timer);
+    // A replacement generation has already painted its own line; leave it.
+    if (activeSessionstartGeneration && activeSessionstartGeneration !== generation) return;
+    try {
+      ui.setWidget?.(sessionstartProgressWidgetKey, undefined);
+    } catch {
+    }
+  });
 }
 
 function signalSessionstartChild(child: ChildProcess, signal: NodeJS.Signals): void {
@@ -595,6 +638,7 @@ export default function (pi: ExtensionAPI) {
       source as SessionstartSource,
       sessionIdFromContext(ctx),
     );
+    showSessionstartProgress(sessionstartGeneration, ctx);
   });
 
   pi.on?.("before_agent_start", async (_event, ctx) => {
