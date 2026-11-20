@@ -214,6 +214,17 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
 };
 
+gapTests.status = () => {
+  const f = gapFixture('delivery'), ship = f.spawn('ship', ['--kind', 'ship']), scout = f.spawn('scout');
+  for (const [fields, expected] of [[{}, 'plain'], [{ workflow: 'delivery' }, 'workflow'], [{ gate: 'no-mistakes', workflow: 'delivery' }, 'gate']]) {
+    f.save({ ...ship, ...fields });
+    const tasks = JSON.parse(f.call(['status', '--json']).out).tasks;
+    assert.equal(tasks.find(t => t.id === ship.id).deliveryKind, expected);
+    assert.equal(tasks.find(t => t.id === scout.id).deliveryKind, null);
+  }
+  assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
+};
+
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
   for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
