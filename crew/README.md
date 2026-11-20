@@ -301,7 +301,8 @@ branch is dropped. A copy deleted by hand is pruned from git. A failed automatic
 reported but does not fail the triggering command. An explicit `crew finish <closed-id> --force`
 does refuse if Core is silent, a terminal holds the copy, or the return fails.
 
-Finish records changed and untracked file times and the keep marker before stopping. Ignored
+Finish records changed and untracked file times and the keep marker before stopping. The
+non-forced ship refusal uses that same inspection, not an earlier clean result. Ignored
 entries get a stat-only walk, without following symlinks or reading contents. Each ignored
 root stores file count, newest modification time, total size and a metadata digest, so edits,
 additions and removals inside a large folder are visible without storing every file. There
@@ -314,8 +315,10 @@ commit that no branch or tag holds (its own reflog is read, so moving back does 
 task. Stashes and branches made in the copy live in the repository and outlive it. A `--force` given at finish covers only what was there then. `crew finish <id>` on such a
 closed task tries its copy again and says how it stands. `crew finish <id> --force` accepts what
 is there now and can cancel a still-busy worker whose stop was pending, but never another
-terminal. It compares again after any retried stop/removal; newer writes keep waiting.
-Automatic retries never inherit an earlier `--force`. A Core that does not answer keeps every waiting copy and
+terminal. It compares again after any retried stop/removal; known newer writes keep waiting.
+If inspection cannot be completed, the current `--force` authorizes discarding the contents
+unseen instead. Stop/removal confirmation and the other-terminal check still apply; output
+explicitly says when work was discarded unseen. Automatic retries never inherit earlier force. A Core that does not answer keeps every waiting copy and
 says which. A project keeps its registration while a finished task waits for its copy.
 `crew status --all` shows holders, new work, keep/history protections, a free copy, or an
 unanswered Core query. Unconfirmed worker stops and terminal removals are shown as pending,

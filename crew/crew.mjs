@@ -1370,12 +1370,12 @@ const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : 
 
 // Work in a copy that its removal would lose: a ship task's uncommitted or untracked files
 // (its branch keeps only commits) and the shared delivery workflow's keep marker. A scout is
-// read-only by its brief; what it leaves behind is scratch. { dirty: files or null when git
-// could not tell, keep }.
-function workInCopy(task) {
-  let dirty = [];
-  if (task.kind === 'ship' && fs.existsSync(path.join(task.worktree, '.git'))) dirty = gitStatus(task.worktree)?.map(e => e.file) ?? null;
-  return { dirty, keep: fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP')) };
+// read-only by its brief; what it leaves behind is scratch. Derive protection from the exact
+// snapshot that will become the accepted baseline, never an earlier clean inspection.
+// { dirty: files or null when git could not tell, keep }.
+function workInCopy(task, snapshot) {
+  const dirty = task.kind === 'ship' ? snapshot ? Object.keys(snapshot.files) : null : [];
+  return { dirty, keep: snapshot ? snapshot.keep !== null : fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP')) };
 }
 // `git status` of a folder as [{ code, file }], or null when git could not tell. Read with -z:
 // the text form quotes names with non-ASCII or special characters, and such a quoted name is
@@ -1466,11 +1466,12 @@ function commitsOnlyInCopy(folder, before) {
 // is new or changed since finish's snapshot, or a keep marker that was not there then. Only
 // `crew finish <id> --force` on the closed task discards that. { kept, leftovers }: `kept`
 // says why it waits (or null), `leftovers` that finish's accepted files are still there.
-function checkWaitingCopy(task, before = task.copyToReturn?.left) {
+function checkWaitingCopy(task, before = task.copyToReturn?.left, { discardUnseen = false } = {}) {
   const seen = snapshotCopy(task.worktree);
-  if (!seen) return { kept: { why: 'uncommitted work', text: 'it could not be checked for work written since finish' }, leftovers: false };
-  const uncertain = !before ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
-  if (uncertain) return { kept: { why: 'uncommitted work', text: `changes cannot be determined: ${uncertain}` }, leftovers: true };
+  const uncertain = !seen ? 'it could not be checked for work written since finish' : !before ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
+  // Only this invocation's explicit force authorizes discarding unseen contents. A failed
+  // comparison is not proof of new work; without that authority it still protects the copy.
+  if (uncertain) return { kept: discardUnseen ? null : { why: 'uncommitted work', text: !seen ? uncertain : `changes cannot be determined: ${uncertain}` }, leftovers: true, unseen: discardUnseen ? uncertain : null };
   if (seen.keep !== null && seen.keep !== before.keep) return { kept: { why: 'marked to keep', text: 'it was marked to keep by .artifacts/KEEP since finish' }, leftovers: true };
   const ignored = new Set([...Object.keys(before.ignored ?? {}), ...Object.keys(seen.ignored)]);
   const added = [...Object.keys(seen.files).filter(file => !(file in before.files) || before.files[file] !== seen.files[file]),
@@ -1555,13 +1556,13 @@ function returnWaiting(h, task, { force = false } = {}) {
   const holders = otherTerminalsIn(task.worktree, task.terminal);
   if (holders === null) return { state: 'silent', line: `${CORE_SILENT} the terminals in ${task.worktree}; the working copy of ${task.id} was kept. Try again.` };
   if (holders.length) return { state: 'held', line: `the working copy of ${task.id} is still held by ${describeHolders(holders, task.worktree)}; nothing was removed.` };
-  const check = checkWaitingCopy(task, accepted);
-  if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. \`crew finish ${task.id} --force\` discards it and returns the copy.` };
+  const check = checkWaitingCopy(task, accepted, { discardUnseen: force });
+  if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. ${force ? 'The copy changed during this forced attempt; stop writes to it before retrying force.' : `\`crew finish ${task.id} --force\` discards its present contents and returns the copy.`}` };
   // What is left was accepted at finish (or now): discarding it is what was asked.
   const back = returnCopy(task, project, { force: check.leftovers });
   if (!back.ok) return { state: 'failed', line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
-  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}` };
+  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}` };
 }
 
 function cmdFinish(args) {
@@ -1589,14 +1590,14 @@ function cmdFinish(args) {
   // stays until it is free, and everything else is finished. Core is asked before anything is
   // stopped, so a Core that cannot list its terminals still leaves everything as it was.
   if (fs.existsSync(task.worktree) && otherTerminalsIn(task.worktree, task.terminal) === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
-  // Work that exists only in the working copy is lost when the copy goes. These checks can
-  // be made before stopping, so a protective refusal really leaves the worker untouched.
-  const work = force ? { dirty: [], keep: false } : workInCopy(task);
+  // Establish the accepted baseline first, and derive the protective refusal from it.
+  // A separate earlier clean result must never authorize dirty work found by this snapshot.
+  const left = snapshotCopy(task.worktree);
+  const work = force ? { dirty: [], keep: false } : workInCopy(task, left);
   if (work.dirty === null) refuse(`Could not check ${task.worktree} for uncommitted work; nothing was removed. Pass --force to discard it unseen.`, 6);
   if (work.dirty.length) refuse(`Task ${id} has uncommitted work in ${task.worktree} (${listFiles(work.dirty)}). Nothing was removed. Commit it there, or pass --force to discard it.`, 6);
   // A copy marked to keep (the shared delivery workflow's marker) is not removed unasked.
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
-  const left = snapshotCopy(task.worktree);
   let attempted = false, result;
   try { result = stopWorker(task, { force, onStop: () => { attempted = true; } }); }
   catch (error) {
@@ -1616,9 +1617,10 @@ function cmdFinish(args) {
   let reason = cleanup?.text ?? (holders === null ? 'Core did not say which terminals are in it' : holders.length ? `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it` : null);
   // Only after stopping and removing the terminal can we compare everything written while
   // leaving, including ignored files and scout scratch. Even force accepted only the pre-stop
-  // contents. If anything changed, postpone return with the original baseline, never refuse
-  // with a dead worker or silently extend permission to discard the worker's final writes.
-  reason ??= checkWaitingCopy(waiting).kept?.text ?? null;
+  // contents. Known changes postpone return with the original baseline. An uninspectable
+  // copy needs explicit discard-unseen authority; never infer that authority for a retry.
+  const comparison = reason ? null : checkWaitingCopy(waiting, left, { discardUnseen: force });
+  reason ??= comparison?.kept?.text ?? null;
   const back = reason ? null : returnCopy(task, project, { force });
   reason ??= back && !back.ok ? back.why : null;
   forget();
@@ -1628,7 +1630,7 @@ function cmdFinish(args) {
     console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}`);
   } else {
     saveTask(h, closed);
-    console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
+    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
   }
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
   if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
@@ -2020,7 +2022,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
       JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
   crew stop <id> [--force]                 ask the worker to leave
   crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
-      protective refusals precede stop; later uncertainty postpones return for the next start/finish; status alone returns nothing
+      protective refusals use the accepted baseline before stop; later uncertainty postpones return; status alone returns nothing
+      current --force can discard uninspectable contents unseen, but never override an unconfirmed stop/removal or another terminal
       sweeps follow successful handling only; forced finish of a closed task refuses held, silent or failed returns
       backlog: only reported scouts move here (not reviewers, except legacy treehouse); ships move at land
   crew done [<id>]                         (worker) my report is written

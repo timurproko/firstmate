@@ -300,6 +300,48 @@ gapTests['review-pending-status'] = () => {
   patch({ failRm: false }); assert.equal(f.call(['finish', t.id, '--force']).code, 0); assert.equal(f.call(['finish', removal.id]).code, 0);
 };
 
+gapTests['review2-baseline-race'] = () => {
+  const f = gapFixture('review2-baseline'), t = f.spawn('racing', ['--kind', 'ship']);
+  const late = path.join(t.worktree, 'late.txt'), preload = slash(path.join(f.dir, 'race.cjs'));
+  // Return a genuinely clean first status result, then let the worker write before the
+  // coordinator receives it. NODE_OPTIONS applies the hook only to this fake-Core command.
+  fs.writeFileSync(preload, `const cp = require('node:child_process'), fs = require('node:fs'), original = cp.spawnSync;
+let written = false;
+cp.spawnSync = function(command, args, options) {
+  const result = original(command, args, options);
+  if (!written && command === 'git' && args[1] === ${JSON.stringify(t.worktree)} && args.includes('status') && args.includes('--porcelain') && result.status === 0) {
+    written = true; fs.writeFileSync(${JSON.stringify(late)}, 'written after the clean result');
+  }
+  return result;
+};
+require('node:module').syncBuiltinESMExports();`);
+  const r = f.call(['finish', t.id], { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${JSON.stringify(preload)}` });
+  assert.ok([0, 6].includes(r.code), r.out);
+  assert.ok(fs.existsSync(late), 'Work between the clean result and baseline must not be silently accepted and deleted');
+  if (r.code === 6) assert.equal(readWorld().terminals[t.terminal].state, 'live', 'A refusal leaves the worker intact');
+  else assert.ok(f.task(t.id).copyToReturn, 'Work outside the accepted baseline postpones return');
+  assert.equal(f.call(['finish', t.id, '--force']).code, 0); assert.ok(!fs.existsSync(t.worktree));
+};
+
+gapTests['review2-unseen-force'] = () => {
+  const f = gapFixture('review2-unseen'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const corrupt = t => { const file = path.join(t.worktree, '.git'); fs.renameSync(file, `${file}-saved`); fs.writeFileSync(file, 'gitdir: missing\n'); };
+  const t = f.spawn('unseen', ['--kind', 'ship']); fs.writeFileSync(path.join(t.worktree, 'unsaved.txt'), 'discard only by explicit request'); corrupt(t);
+  let r = f.call(['finish', t.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, /Pass --force to discard it unseen/); assert.equal(readWorld().terminals[t.terminal].state, 'live');
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.ok(!fs.existsSync(t.worktree), 'Explicit force must discard an uninspectable copy on the first attempt');
+  assert.match(r.out, /discarded unseen/); assert.ok(!f.task(t.id).copyToReturn);
+
+  const closed = f.spawn('closed', ['--kind', 'ship']);
+  f.save({ ...closed, state: 'closed', closed: new Date().toISOString(), copyToReturn: { since: new Date().toISOString(), left: snapshotCopy(closed.worktree), cleanupTerminal: true } });
+  corrupt(closed);
+  r = f.call(['finish', closed.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(closed.worktree)); assert.match(r.out, /--force.*discards/);
+  f.guest(closed);
+  r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 6, r.out); assert.ok(fs.existsSync(closed.worktree), 'Unseen discard still cannot override another terminal');
+  f.leave(); patch({ silentLs: true }); r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 4, r.out); assert.ok(fs.existsSync(closed.worktree));
+  patch({ silentLs: false }); r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(closed.worktree), r.out); assert.match(r.out, /discarded unseen/);
+};
+
 gapTests.status = () => {
   const f = gapFixture('delivery'), ship = f.spawn('ship', ['--kind', 'ship']), scout = f.spawn('scout');
   for (const [fields, expected] of [[{}, 'plain'], [{ workflow: 'delivery' }, 'workflow'], [{ gate: 'no-mistakes', workflow: 'delivery' }, 'gate']]) {
