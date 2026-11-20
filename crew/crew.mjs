@@ -1122,8 +1122,10 @@ function recoveryTimings() {
 function recoverWorker(h, task, state, observed, timing) {
   let current = loadTask(h, task.id);
   if (current.state !== 'working' || current.terminal !== task.terminal) return {};
+  const error = state === 'error', idle = state === 'idle';
+  if (idle && fs.existsSync(current.report)) return {};
   const previous = current.recovery?.terminal === task.terminal ? current.recovery : null;
-  if (!previous && state !== 'error') return {};
+  if (!previous && !error && !idle) return {};
   let recovery = previous ? { ...previous } : { terminal: task.terminal, errors: 0 };
   if (recovery.state !== state) { recovery.state = state; recovery.since = now(); }
   const persist = () => {
@@ -1133,27 +1135,32 @@ function recoverWorker(h, task, state, observed, timing) {
   if (state === 'working' && Date.now() - observed.since >= timing.working) {
     recovery = { terminal: task.terminal, errors: 0, state, since: recovery.since };
   }
-  if (state !== 'error') { persist(); return {}; }
-  const since = recovery.lastErrorNudge ?? recovery.since;
-  const delay = timing.error[recovery.errors] ?? timing.check;
-  if (observed.checks < 2 || Date.now() - Date.parse(since) < delay) { persist(); return {}; }
+  if (!error && !idle) { persist(); return {}; }
+  const since = idle ? Math.max(Date.parse(recovery.since), Date.parse(recovery.idleNudged ?? recovery.since))
+    : Date.parse(recovery.lastErrorNudge ?? recovery.since);
+  const delay = error ? timing.error[recovery.errors] ?? timing.check : timing.idle;
+  if ((error && observed.checks < 2) || Date.now() - since < delay) { persist(); return {}; }
   const from = pickLabel(task.launch ?? { harness: task.agent });
-  const line = lastWords(task.terminal) || 'Core reports an error';
+  const line = error ? lastWords(task.terminal) || 'Core reports an error' : null;
   // Reading the screen can take time; a report accepted meanwhile is never reopened.
   current = loadTask(h, task.id);
-  if (current.state !== 'working' || current.terminal !== task.terminal) return {};
-  if (recovery.errors >= 3) { persist(); return { handover: line, tried: `${from} stopped on an error (${line}); told to continue 3 times without recovery` }; }
-  const message = 'Continue from where you stopped; the provider or network error may have passed.';
+  if (current.state !== 'working' || current.terminal !== task.terminal || (idle && fs.existsSync(current.report))) return {};
+  if (error && recovery.errors >= 3) { persist(); return { handover: line, tried: `${from} stopped on an error (${line}); told to continue 3 times without recovery` }; }
+  if (idle && recovery.idleNudged) { persist(); return { blocked: `${from} is idle without a report after its reminder to continue or report and run crew done` }; }
+  const message = error ? 'Continue from where you stopped; the provider or network error may have passed.'
+    : `Continue your task. If you are finished, write your complete result to ${task.report}, run \`crew done ${task.id}\`, and stop.`;
   const sent = hc(['send', task.terminal, message]);
   if (sent.code !== 0) { persist(); return { blocked: `Core did not deliver the recovery message to ${from}: ${lastLine(sent.stderr || sent.stdout)}` }; }
-  const at = now(), attempt = recovery.errors + 1;
-  recovery.errors = attempt; recovery.lastErrorNudge = at;
+  const at = now(), attempt = error ? recovery.errors + 1 : 1;
+  if (error) { recovery.errors = attempt; recovery.lastErrorNudge = at; }
+  else recovery.idleNudged = at;
   const latest = loadTask(h, task.id);
   // A fast worker may have reported during send: append history to its newest record.
   saveTask(h, { ...latest, ...(latest.terminal === task.terminal ? { recovery } : {}),
-    nudges: [...(latest.nudges ?? []), { at, kind: 'error', why: line, terminal: task.terminal, attempt }] });
+    nudges: [...(latest.nudges ?? []), { at, kind: error ? 'error' : 'idle', why: line ?? 'idle without a report', terminal: task.terminal, attempt }] });
   observed.checks = 0; // observe the effect before another message or hand-over
-  console.log(`== ${task.id}: ${from} stopped on an error (${line}); told to continue (${attempt} of 3)`);
+  console.log(error ? `== ${task.id}: ${from} stopped on an error (${line}); told to continue (${attempt} of 3)`
+    : `== ${task.id}: ${from} is idle without a report; told to continue or report and run crew done (1 of 1)`);
   return {};
 }
 
@@ -1219,7 +1226,7 @@ function cmdWait(args) {
       // without a report has failed, whatever the reason.
       if (!check || !task.terminal) continue;
       const { state: seen, t } = probe(task.terminal);
-      const state = seen === 'live' ? t.status?.state : seen;
+      const state = seen === 'live' ? (t.status?.state === 'done' ? 'idle' : t.status?.state) : seen;
       const previous = observations.get(id);
       const observed = previous?.terminal === task.terminal && previous.state === state
         ? { ...previous, checks: previous.checks + 1 } : { terminal: task.terminal, state, since: Date.now(), checks: 1 };

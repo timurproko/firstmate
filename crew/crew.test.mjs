@@ -1315,7 +1315,8 @@ if (a[0] === '--version') process.exit(0);`);
       const dir = path.join(home2, 'tasks', id), address = `recover-${id}`;
       fs.mkdirSync(dir);
       const task = { ...task2('plain'), id, terminal: address, state: 'working', tells: 2, chain: [],
-        brief: path.join(dir, 'brief.md'), report: path.join(dir, 'report.md'), ...taskPatch };
+        worktree: path.join(dir, 'copy'), brief: path.join(dir, 'brief.md'), report: path.join(dir, 'report.md'), ...taskPatch };
+      fs.mkdirSync(task.worktree);
       fs.writeFileSync(path.join(dir, 'task.json'), JSON.stringify(task));
       const w = readWorld();
       w.terminals[address] = { address, state: 'live', labels: {}, status: { state: 'error', app: 'a1' },
@@ -1400,6 +1401,46 @@ if (a[0] === '--version') process.exit(0);`);
       assert.equal(task2(task.id).tells, 9, 'Newest task fields survive send');
       assert.equal(task2(task.id).nudges.length, 1);
       q = quickWait(task.id); assert.equal(q.code, 0); assert.equal(sendsTo(task.terminal).length, 1);
+    }
+
+    // Idle/done workers get one delayed reminder, never a substitute answer to a question.
+    for (const state of ['idle', 'done']) {
+      const task = recovering(`idle-${state}`, { status: { state, app: 'a1' } });
+      q = quickWait(task.id, { CREW_RECOVERY_SECONDS: '0.2' }, [], 'k1', '0.5'); assert.equal(q.code, 124, q.out);
+      assert.equal(sendsTo(task.terminal).length, 0, 'The idle delay has not elapsed');
+      const since = task2(task.id).recovery.since;
+      q = quickWait(task.id, { CREW_RECOVERY_SECONDS: '0.2' }); assert.equal(q.code, 7, q.out);
+      assert.equal(sendsTo(task.terminal).length, 1);
+      assert.ok(Date.parse(task2(task.id).nudges[0].at) - Date.parse(since) >= 800);
+      assert.equal(task2(task.id).nudges[0].kind, 'idle'); assert.equal(task2(task.id).tells, 2);
+      assert.match(sendsTo(task.terminal)[0][2], new RegExp(`crew done ${task.id}`));
+      assert.match(q.out, /needs a person.*idle without a report after its reminder/);
+      q = quickWait(task.id); assert.equal(q.code, 7, q.out);
+      assert.equal(sendsTo(task.terminal).length, 1, 'The reminder is not repeated in another wait');
+    }
+    {
+      const task = recovering('idle-resumes', { status: { state: 'idle', app: 'a1' }, onSends: [workingState] });
+      q = quickWait(task.id, {}, [], 'k1', '0.5'); assert.equal(q.code, 124, q.out);
+      assert.equal(sendsTo(task.terminal).length, 1); assert.equal(task2(task.id).state, 'working');
+    }
+    {
+      const task = recovering('idle-blocked', { status: { state: 'blocked', msg: 'Allow this command?' } });
+      q = quickWait(task.id); assert.equal(q.code, 7, q.out);
+      assert.match(q.out, /needs a person - Allow this command\?/);
+      assert.equal(sendsTo(task.terminal).length, 0);
+    }
+    for (const [id, state] of [['idle-reported', 'reported'], ['idle-report-file', 'working']]) {
+      const task = recovering(id, { status: { state: 'idle', app: 'a1' } }, { state });
+      fs.writeFileSync(task.report, 'Already finished.');
+      const before = task2(id);
+      q = quickWait(id, {}, [], 'k1', '0.4'); assert.equal(q.code, state === 'reported' ? 0 : 124, q.out);
+      assert.equal(sendsTo(task.terminal).length, 0); assert.deepEqual(task2(id), before);
+    }
+    {
+      const task = recovering('idle-fast-report', { status: { state: 'idle', app: 'a1' } });
+      setTerminal(task.terminal, { reportOnSend: path.join(home2, 'tasks', task.id, 'task.json') });
+      q = quickWait(task.id); assert.equal(q.code, 0, q.out);
+      assert.equal(task2(task.id).state, 'reported'); assert.equal(task2(task.id).nudges.length, 1);
     }
 
     // finish never takes somebody else's terminal down with the working copy: returning a pool slot
