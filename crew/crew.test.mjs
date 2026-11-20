@@ -540,7 +540,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   fs.rmSync(ghMerged);
 
   // --- the tools Firstmate works with ----------------------------------------------------
-  assert.deepEqual(TOOLS.map(t => t.id), ['gh', 'gh-axi', 'chrome-devtools-axi', 'lavish-axi', 'tasks-axi', 'quota-axi', 'treehouse', 'no-mistakes', 'jq']);
+  assert.deepEqual(TOOLS.map(t => t.id), ['gh', 'gh-axi', 'chrome-devtools-axi', 'lavish-axi', 'tasks-axi', 'quota-axi', 'delivery', 'treehouse', 'no-mistakes', 'jq']);
   const fakeTasks = path.join(root, 'fake-tasks-axi.mjs'), fakeTree = path.join(root, 'fake-treehouse.mjs'), fakeVersion = path.join(root, 'fake-version.mjs');
   const treeLog = path.join(root, 'treehouse-log.json'), poolDir = path.join(root, 'pool');
   fs.writeFileSync(fakeVersion, "console.log('tool version v1.106.1');\n");
@@ -576,7 +576,7 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a.at(-1), 'checkout', '-q', 
   const tl = (args, terminal = 'c2', env = T) => crew(args, { terminal, env });
   // tools: what is here and what crew does with it; nothing is required.
   r = crew(['tools'], { terminal: 'c2' }); assert.equal(r.code, 0);
-  assert.equal(r.out.split('\n').filter(l => l.includes('not installed')).length, 9, r.out); assert.match(r.out, /Missing tools are optional/);
+  assert.equal(r.out.split('\n').filter(l => l.includes('not installed')).length, TOOLS.length, r.out); assert.match(r.out, /Missing tools are optional/);
   const seen = JSON.parse(tl(['tools', '--json']).out).tools;
   assert.deepEqual(seen.filter(t => t.installed).map(t => [t.id, t.version]), [['tasks-axi', '0.2.6'], ['treehouse', '3.1.8'], ['no-mistakes', '1.106.1']]);
 
@@ -602,32 +602,69 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a.at(-1), 'checkout', '-q', 
   assert.match(fs.readFileSync(path.join(homeDir, 'backlog.md'), 'utf8'), /- \[x\] b1 - Count the lines \(done\)/);
   assert.equal(tl(['finish', 'b2', '--force']).code, 0);
 
-  // treehouse: a project can take its working copies from the pool, and gives them back.
-  r = crew(['project', 'add', 'pooled', project, '--treehouse'], { terminal: 'c2' }); assert.equal(r.code, 4); assert.match(r.out, /treehouse is not installed/);
-  r = tl(['project', 'add', 'pooled', project, '--treehouse']); assert.equal(r.code, 0, r.out);
-  assert.match(tl(['project', 'list']).out, /^pooled\t.*\ttreehouse$/m);
-  r = crew(['spawn', 'p0', '--project', 'pooled', '--agent', 'pi', 'x'], { terminal: 'c2' }); assert.equal(r.code, 5); assert.match(r.out, /treehouse, which is not installed/);
-  r = tl(['spawn', 'p1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Change it.']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(treehouse\)/);
+  // delivery: where the shared delivery workflow is installed it makes and takes back the copies,
+  // and crew does not know whether one is a pool slot or a new folder.
+  const fakeDelivery = path.join(root, 'fake-delivery.mjs'), deliveryLog = path.join(root, 'delivery-log.json'), stuck = path.join(root, 'pool-stuck');
+  fs.writeFileSync(deliveryLog, '[]');
+  fs.writeFileSync(fakeDelivery, `import fs from 'node:fs'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
+const a = process.argv.slice(2), file = ${JSON.stringify(deliveryLog)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
+log.push({ a, cwd: process.cwd() }); fs.writeFileSync(file, JSON.stringify(log));
+const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
+if (a[0] === 'start') {
+  const detach = a.indexOf('--detach'), branch = detach < 0 ? a[1] : null;
+  const listed = git('worktree', 'list', '--porcelain').stdout.split(/\\r?\\n\\r?\\n/).map(b => ({ path: /^worktree (.*)$/m.exec(b)?.[1], branch: /^branch refs\\/heads\\/(.*)$/m.exec(b)?.[1] }));
+  const existing = branch ? listed.find(w => w.branch === branch) : null;
+  if (existing) { console.log(JSON.stringify({ path: existing.path, branch, created: false, pooled: true })); process.exit(0); }
+  const slot = path.join(${JSON.stringify(poolDir)}, String(log.length), 'demo');
+  const r = git('worktree', 'add', ...(branch ? ['-b', branch] : ['--detach']), slot, 'HEAD');
+  if (r.status !== 0) { console.error(r.stderr); process.exit(2); }
+  console.error('started in a pool slot'); console.log(JSON.stringify({ path: slot, branch, created: true, pooled: true }));
+} else if (a[0] === 'finish') {
+  if (fs.existsSync(${JSON.stringify(stuck)})) { console.log('kept ' + a[1] + ': the worktree is locked. Nothing was removed.'); process.exit(1); }
+  git('-C', a[1], 'reset', '-q', '--hard'); git('-C', a[1], 'clean', '-qfd'); git('-C', a[1], 'checkout', '-q', '--detach');
+  console.log('finished ' + a[1] + ': slot returned to the pool');
+}
+`);
+  const D = { ...T, CREW_TOOL_DELIVERY: fakeDelivery }, dl = args => tl(args, 'c2', D);
+  const calls = () => JSON.parse(fs.readFileSync(deliveryLog, 'utf8'));
+  // Pooled copies are no longer a choice per project: the old flag is accepted and ignored.
+  r = tl(['project', 'add', 'pooled', project, '--treehouse']); assert.equal(r.code, 0, r.out); assert.match(r.out, /--treehouse is no longer a project choice/);
+  assert.match(tl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\r?$/m);
+  r = dl(['spawn', 'p1', '--project', 'pooled', '--kind', 'ship', '--type', 'fix', '--agent', 'pi', 'Change it.']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(pool slot\)/);
   const p1 = taskOf('p1');
-  assert.equal(p1.pool, 'treehouse'); assert.ok(p1.worktree.startsWith(slash(poolDir)) && p1.worktree.endsWith('/demo'), p1.worktree);
-  assert.equal(git('-C', p1.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'feature/p1');
+  assert.deepEqual([p1.via, p1.pooled, p1.branch], ['delivery', true, 'fix/p1']); assert.ok(p1.worktree.startsWith(slash(poolDir)) && p1.worktree.endsWith('/demo'), p1.worktree);
+  assert.equal(git('-C', p1.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'fix/p1');
   assert.equal(readWorld().log.filter(a => a[0] === 'run').at(-1)[readWorld().log.filter(a => a[0] === 'run').at(-1).indexOf('--cwd') + 1], p1.worktree);
-  const lease = JSON.parse(fs.readFileSync(treeLog, 'utf8')).find(e => e.a[0] === 'get');
-  assert.deepEqual(lease.a, ['get', '--lease', '--json', '-b', 'feature/p1']); assert.equal(slash(lease.cwd).toLowerCase(), slash(fs.realpathSync(project)).toLowerCase());
-  fs.writeFileSync(path.join(root, 'pool-stuck'), '');
-  r = tl(['finish', 'p1']); assert.equal(r.code, 6); assert.match(r.out, /treehouse did not take the working copy back \(foreign process remains\)/);
-  assert.equal(taskOf('p1').state, 'working', 'A copy that was not returned keeps its task open');
-  fs.rmSync(path.join(root, 'pool-stuck'));
-  r = tl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to treehouse/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', p1.worktree]);
+  const asked = calls().find(e => e.a[0] === 'start');
+  assert.deepEqual(asked.a, ['start', 'fix/p1', '--json']); assert.equal(slash(asked.cwd).toLowerCase(), slash(fs.realpathSync(project)).toLowerCase());
+  // A copy that was already there belongs to other work: the task fails and the copy is left alone.
+  git('-C', project, 'worktree', 'add', '-q', '-b', 'feature/taken', path.join(root, 'taken'), 'HEAD');
+  r = dl(['spawn', 'taken', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']); assert.equal(r.code, 5); assert.match(r.out, /feature\/taken already has a working copy at .*; it was left alone/);
+  assert.equal(taskOf('taken').state, 'failed'); assert.ok(fs.existsSync(path.join(root, 'taken')) && !calls().some(e => e.a[0] === 'finish'));
+  // Finish hands the copy back; a refusal keeps the task open and says why.
+  fs.writeFileSync(stuck, '');
+  r = dl(['finish', 'p1']); assert.equal(r.code, 6); assert.match(r.out, /delivery did not take the working copy back \(kept .*the worktree is locked/);
+  assert.equal(taskOf('p1').state, 'working', 'A copy that was not taken back keeps its task open');
+  fs.rmSync(stuck);
+  r = dl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to the pool/);
+  assert.deepEqual(calls().at(-1).a, ['finish', p1.worktree, '--force']);
   assert.equal(taskOf('p1').state, 'closed');
-  // treehouse takes back a slot with loose files only when told to clean it: a scout's leftovers
-  // are scratch, and --force is the person's word.
-  assert.equal(tl(['spawn', 'p2', '--project', 'pooled', '--agent', 'pi', 'Look.']).code, 0);
-  assert.equal(tl(['finish', 'p2', '--force']).code, 0); assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', '--force', taskOf('p2').worktree]);
-  assert.equal(tl(['spawn', 'p3', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
-  assert.equal(tl(['finish', 'p3', '--force']).code, 0); assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', '--force', taskOf('p3').worktree]);
-  assert.match(r.out, /; merged branch feature\/p1 deleted/); assert.equal(git('-C', project, 'branch', '--list', 'feature/p1').trim(), '', 'A returned slot leaves no merged branch behind');
+  assert.match(r.out, /; merged branch fix\/p1 deleted/); assert.equal(git('-C', project, 'branch', '--list', 'fix/p1').trim(), '', 'A returned slot leaves no merged branch behind');
+  // A scout gets a copy without a branch, and its leftovers go with it.
+  assert.equal(dl(['spawn', 'p2', '--project', 'pooled', '--agent', 'pi', 'Look.']).code, 0);
+  assert.deepEqual(calls().filter(e => e.a[0] === 'start').at(-1).a, ['start', '--detach', 'p2', '--json']);
+  fs.writeFileSync(path.join(taskOf('p2').worktree, 'notes.tmp'), 'x');
+  assert.equal(dl(['finish', 'p2']).code, 0); assert.ok(!fs.existsSync(path.join(taskOf('p2').worktree, 'notes.tmp')));
+  // A ship task's unsaved work is still crew's own refusal, before delivery is asked.
+  assert.equal(dl(['spawn', 'p3', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  fs.writeFileSync(path.join(taskOf('p3').worktree, 'half.txt'), 'x'); const askedSoFar = calls().length;
+  r = dl(['finish', 'p3']); assert.equal(r.code, 6); assert.match(r.out, /has uncommitted work .*half\.txt/); assert.equal(calls().length, askedSoFar);
+  assert.equal(dl(['finish', 'p3', '--force']).code, 0);
+  // A task from before 0.8 whose project took its copies from treehouse is still given back to it.
+  assert.equal(tl(['spawn', 'p4', '--project', 'pooled', '--agent', 'pi', 'Look.']).code, 0);
+  { const file = path.join(homeDir, 'tasks', 'p4', 'task.json'); fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), pool: 'treehouse' })); }
+  r = tl(['finish', 'p4']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to treehouse/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', '--force', taskOf('p4').worktree]);
 
   // no-mistakes: a project with the gate is delivered by it; crew only records the result.
   git('-C', project, 'remote', 'add', 'no-mistakes', projectOrigin);
@@ -694,7 +731,7 @@ else console.log('session: opened\\nurl: "http://127.0.0.1:4387/session/d849b898
   fs.writeFileSync(path.join(root, 'broken.html'), 'x');
   r = crew(['show', path.join(root, 'broken.html')], { terminal: 'c2', env: L }); assert.equal(r.code, 4); assert.match(r.out, /did not open the page: error: the user ended this session/);
 
-  console.log('PASS: Firstmate\'s tools (list, backlog, treehouse copies, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  console.log('PASS: Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
