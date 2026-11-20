@@ -164,8 +164,9 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
   `Implementation: <link>`, and `crew done` records that stage and link. The coordinator approves
   the plan itself (`crew tell <id> "approved, implement"`) and asks the person only about a
   decision that is theirs. `crew status` shows `plan awaiting approval`, `plan` or
-  `implementation` without asking GitHub. `crew land` refuses a plan. For an implementation it
-  pushes nothing and opens nothing: it records the pull request (from the report, else
+  `implementation` without asking GitHub. `crew land` refuses a plan, and refuses while the copy
+  has commits its pushed branch lacks (the worker pushes them). For an implementation it pushes
+  nothing and opens nothing: it records the pull request (from the report's first line, else
   `gh pr view <branch>`), moves the backlog item, and prints whether the pull request is a draft
   and how many outcomes are ticked. The repository's bot marks it ready; the person merges.
 - **no-mistakes gate.** A project with the gate's remote (see below) is delivered by the gate;

@@ -196,6 +196,12 @@ try {
   fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
   assert.equal(crew(['init', homeDir]).code, 0);
   assert.ok(fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8').includes('crew spawn'));
+  {
+    // A workflow task's draft pull request is open from its plan on: the rules finish a task
+    // only after land recorded it, never merely because a pull request is open.
+    const rules = fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8');
+    assert.ok(rules.includes('task only once `crew land` has recorded the pull request') && !rules.includes('once the pull request is open'), rules);
+  }
   assert.equal(fs.readFileSync(path.join(homeDir, 'coordinator', 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
   assert.equal(crew(['init', homeDir]).code, 2, 'A home is never re-initialised');
   assert.equal(crew(['project', 'add', 'demo', project]).code, 0);
@@ -724,22 +730,33 @@ if (a[0] === 'start') {
   fs.writeFileSync(w1.report, 'Implementation: https://github.com/acme/demo/pull/11\n\nDone.\n');
   assert.equal(crew(['done', 'w1'], { terminal: w1.terminal }).code, 0);
   assert.match(dl(['status']).out, /^w1\treported \(implementation\)\t/m);
+  // Delivered means pushed: a branch the worker never pushed, or a commit it did not push, is refused.
+  const workerPush = (copy, branch) => git('-C', copy, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`);
+  r = dl(['land', 'w1']); assert.equal(r.code, 6); assert.match(r.out, /branch feature\/w1 is not pushed\. Tell the worker: crew tell w1 "push your branch/);
+  workerPush(w1.worktree, 'feature/w1'); const pushedW1 = head(w1.worktree);
+  commit(w1.worktree, { 'late.txt': 'x\n' }, 'fix: a late fix');
+  r = dl(['land', 'w1']); assert.equal(r.code, 6); assert.match(r.out, /its copy has 1 commit that the pushed branch feature\/w1 lacks\. Tell the worker: crew tell w1 "push your last commits/);
+  assert.equal(taskOf('w1').landed, undefined);
+  assert.equal(git('-C', projectOrigin, 'rev-parse', 'feature/w1').trim(), pushedW1, 'crew pushed nothing itself');
+  workerPush(w1.worktree, 'feature/w1');
   const ghBefore = ghCalls().length;
   r = dl(['land', 'w1']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /delivered w1: https:\/\/github\.com\/acme\/demo\/pull\/11 \(draft, 1 of 2 outcomes ticked\)\. It follows the repository's delivery workflow/);
   assert.deepEqual(ghCalls().slice(ghBefore), [['pr', 'view', 'https://github.com/acme/demo/pull/11', '--json', 'isDraft,body']], 'Only read, never opened');
-  assert.notEqual(spawnSync('git', ['-C', projectOrigin, 'rev-parse', '--verify', '-q', 'feature/w1']).status, 0, 'crew pushed nothing itself');
   assert.ok(taskOf('w1').landed);
   assert.match(dl(['land', 'w1']).out, /already has a pull request: https:\/\/github\.com\/acme\/demo\/pull\/11/);
-  // A report without the link: the pull request GitHub has for the branch.
+  // No link on the first line: the pull request GitHub has for the branch, never another one
+  // the report mentions further down.
   assert.equal(dl(['spawn', 'w2', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
-  fs.writeFileSync(taskOf('w2').report, 'Implemented it.\n'); assert.equal(crew(['done', 'w2'], { terminal: taskOf('w2').terminal }).code, 0);
+  workerPush(taskOf('w2').worktree, 'feature/w2');
+  fs.writeFileSync(taskOf('w2').report, 'Implemented it.\n\nConflicts with https://github.com/acme/demo/pull/5\n'); assert.equal(crew(['done', 'w2'], { terminal: taskOf('w2').terminal }).code, 0);
   r = dl(['land', 'w2']); assert.equal(r.code, 0, r.out); assert.match(r.out, /delivered w2: https:\/\/example\.invalid\/acme\/demo\/pull\/7/);
   assert.ok(ghCalls().some(a => a.join(' ') === 'pr view feature/w2 --json url --jq .url'));
   assert.ok(!ghCalls().some(a => a[1] === 'create' && a.includes('feature/w2')));
   assert.equal(taskOf('w2').pr, 'https://example.invalid/acme/demo/pull/7');
   // No pull request anywhere: land says what to tell the worker and records nothing.
   assert.equal(dl(['spawn', 'w3', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  workerPush(taskOf('w3').worktree, 'feature/w3');
   fs.writeFileSync(taskOf('w3').report, 'Implementation: not opened yet\n'); assert.equal(crew(['done', 'w3'], { terminal: taskOf('w3').terminal }).code, 0);
   fs.writeFileSync(ghDown, '');
   r = dl(['land', 'w3']); assert.equal(r.code, 6); assert.match(r.out, /has not opened its pull request yet\. Tell it: crew tell w3 "open the draft pull request/);

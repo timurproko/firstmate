@@ -275,7 +275,8 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
      \`crew wait <id>\` and review again. After two rounds that still fail, tell the person.
   3. \`crew land <id>\` pushes the branch and opens a pull request. Give the person the link.
 - Merging is the person's: never merge a project's pull request unless they told you to.
-  Finish the reviewer and the task once the pull request is open.
+  Finish the reviewer and the task only once \`crew land\` has recorded the pull request (a
+  workflow task's draft is open from its plan on; finishing it then loses the worker).
 - \`crew tell <id> "<message>"\` is also how you answer a worker's question or correct its
   course; the worker reports again when it has dealt with it.
 - A repository that delivers by pull request but is not recognised (or the other way round):
@@ -1603,13 +1604,23 @@ function cmdReview(args) {
 export const githubOwner = url => /github\.com[:/]+([^/]+)\/[^/]+?(?:\.git)?\/?$/.exec(String(url).trim())?.[1] ?? null;
 const GH = process.env.CREW_GH || 'gh';
 const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, ...args], options) : run(GH, args, options));
-// The pull request a worker (or its gate) opened: the first link in its report, else what
-// GitHub has for its branch.
-function pullRequestOf(task, branch) {
-  const reported = fs.existsSync(task.report) ? PR_LINK.exec(fs.readFileSync(task.report, 'utf8'))?.[0] : null;
+// The pull request a worker (or its gate) opened: a link in its report, else what GitHub has
+// for its branch. A workflow worker puts its own link on the first line, and a link further
+// down may be another pull request it mentions, so for it only the first line is read.
+function pullRequestOf(task, branch, { firstLine = false } = {}) {
+  const text = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8') : '';
+  const reported = PR_LINK.exec(firstLine ? text.trim().split(/\r?\n/)[0] ?? '' : text)?.[0];
   if (reported) return reported;
   const asked = gh(['pr', 'view', branch, '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 60000 });
   return /https?:\/\/\S+/.exec(asked?.stdout ?? '')?.[0] ?? null;
+}
+// Commits of the copy that its pushed branch lacks: 0 when all is pushed, null when the branch
+// is not on origin at all, undefined when origin could not be asked.
+function unpushedCommits(git, branch) {
+  const listed = git('ls-remote', '--exit-code', '--heads', 'origin', branch);
+  if (listed.code === 2) return null;
+  if (listed.code !== 0 || git('fetch', '--quiet', 'origin', branch).code !== 0) return undefined;
+  return Number(git('rev-list', '--count', 'FETCH_HEAD..HEAD').stdout.trim()) || 0;
 }
 // "draft, 2 of 3 outcomes ticked" from one read of the pull request; null when GitHub does not answer.
 function pullRequestState(url) {
@@ -1655,7 +1666,13 @@ function cmdLand(args) {
     // The repository's own workflow: the worker opened the draft pull request and ticks it,
     // the repository's bot marks it ready. Crew only records it; it never pushes or opens one.
     if (task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
-    const found = task.pr ?? pullRequestOf(task, branchOf(task));
+    // Delivered means the pull request holds every commit of the copy; the worker pushes them.
+    if (remote.code !== 0) no('the project has no `origin`, so it has no pull request to record.');
+    const behind = unpushedCommits(git, branchOf(task));
+    if (behind === undefined) no('the project\'s origin could not be reached. Try again.', 4);
+    if (behind === null) no(`its branch ${branchOf(task)} is not pushed. Tell the worker: crew tell ${id} "push your branch and open the draft pull request as the change-delivery skill says"`);
+    if (behind) no(`its copy has ${behind} commit${behind === 1 ? '' : 's'} that the pushed branch ${branchOf(task)} lacks. Tell the worker: crew tell ${id} "push your last commits to the pull request"`);
+    const found = pullRequestOf(task, branchOf(task), { firstLine: true });
     if (!found) no(`the worker has not opened its pull request yet. Tell it: crew tell ${id} "open the draft pull request as the change-delivery skill says and put Implementation: <its link> in the first line of your report"`);
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
     const shown = pullRequestState(found);
