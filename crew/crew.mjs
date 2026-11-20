@@ -1108,6 +1108,55 @@ function lastWords(address) {
   return (lines.reverse().find(l => /error|stopp|crash|fatal|exception|unexpected|denied|not found/i.test(l)) ?? '').replace(/\s+/g, ' ').slice(0, 160);
 }
 
+// One unit controls recovery delays: 30s, 2m, 5m for error retries, 2m for idle,
+// and 30s of observed work to end a stop. Shorter checks make the same path testable.
+function recoveryTimings() {
+  const seconds = process.env.CREW_RECOVERY_SECONDS === undefined ? 30 : Number(process.env.CREW_RECOVERY_SECONDS);
+  if (!Number.isFinite(seconds) || seconds < 0) refuse('CREW_RECOVERY_SECONDS must be a non-negative number of seconds.');
+  const unit = seconds * 1000;
+  return { error: [unit, 4 * unit, 10 * unit], idle: 4 * unit, working: unit, check: Math.max(10, Math.min(5000, unit)) };
+}
+
+// Recovery is separate from a coordinator follow-up: no task state, report stage or tells
+// counter is changed. Attempts survive a new wait; observations must be consecutive here.
+function recoverWorker(h, task, state, observed, timing) {
+  let current = loadTask(h, task.id);
+  if (current.state !== 'working' || current.terminal !== task.terminal) return {};
+  const previous = current.recovery?.terminal === task.terminal ? current.recovery : null;
+  if (!previous && state !== 'error') return {};
+  let recovery = previous ? { ...previous } : { terminal: task.terminal, errors: 0 };
+  if (recovery.state !== state) { recovery.state = state; recovery.since = now(); }
+  const persist = () => {
+    const latest = loadTask(h, task.id);
+    if (latest.state === 'working' && latest.terminal === task.terminal && JSON.stringify(latest.recovery) !== JSON.stringify(recovery)) saveTask(h, { ...latest, recovery });
+  };
+  if (state === 'working' && Date.now() - observed.since >= timing.working) {
+    recovery = { terminal: task.terminal, errors: 0, state, since: recovery.since };
+  }
+  if (state !== 'error') { persist(); return {}; }
+  const since = recovery.lastErrorNudge ?? recovery.since;
+  const delay = timing.error[recovery.errors] ?? timing.check;
+  if (observed.checks < 2 || Date.now() - Date.parse(since) < delay) { persist(); return {}; }
+  const from = pickLabel(task.launch ?? { harness: task.agent });
+  const line = lastWords(task.terminal) || 'Core reports an error';
+  // Reading the screen can take time; a report accepted meanwhile is never reopened.
+  current = loadTask(h, task.id);
+  if (current.state !== 'working' || current.terminal !== task.terminal) return {};
+  if (recovery.errors >= 3) { persist(); return { handover: line, tried: `${from} stopped on an error (${line}); told to continue 3 times without recovery` }; }
+  const message = 'Continue from where you stopped; the provider or network error may have passed.';
+  const sent = hc(['send', task.terminal, message]);
+  if (sent.code !== 0) { persist(); return { blocked: `Core did not deliver the recovery message to ${from}: ${lastLine(sent.stderr || sent.stdout)}` }; }
+  const at = now(), attempt = recovery.errors + 1;
+  recovery.errors = attempt; recovery.lastErrorNudge = at;
+  const latest = loadTask(h, task.id);
+  // A fast worker may have reported during send: append history to its newest record.
+  saveTask(h, { ...latest, ...(latest.terminal === task.terminal ? { recovery } : {}),
+    nudges: [...(latest.nudges ?? []), { at, kind: 'error', why: line, terminal: task.terminal, attempt }] });
+  observed.checks = 0; // observe the effect before another message or hand-over
+  console.log(`== ${task.id}: ${from} stopped on an error (${line}); told to continue (${attempt} of 3)`);
+  return {};
+}
+
 function cmdRelaunch(args) {
   const h = home();
   requireOwner(h);
@@ -1155,18 +1204,31 @@ function cmdWait(args) {
   // Handing a stopped worker's task to the next candidate changes the home, so only its owner does it.
   const handover = !flags['no-fallback'] && process.env.CREW_NO_FALLBACK !== '1' && ownerState(h).mine;
   const quiet = new Map(); // how many checks in a row found no agent in a worker's terminal
+  const observations = new Map(), timing = recoveryTimings();
+  let nextCheck = Date.now() + Math.min(4000, timing.check);
   ids.forEach(id => loadTask(h, id));
   const deadline = Date.now() + timeout * 1000, settled = new Map(), blocked = new Map();
-  for (let tick = 0; settled.size < ids.length && Date.now() < deadline; tick++) {
+  while (settled.size < ids.length && Date.now() < deadline) {
+    const check = Date.now() >= nextCheck;
+    if (check) nextCheck = Date.now() + timing.check;
     for (const id of ids) {
       if (settled.has(id)) continue;
       const task = loadTask(h, id);
       if (['reported', 'stopped', 'closed', 'failed'].includes(task.state)) { settled.set(id, task.state); continue; }
       // Every few seconds ask Core whether the terminal still exists; a worker that is gone
       // without a report has failed, whatever the reason.
-      if (tick % 5 !== 4 || !task.terminal) continue;
+      if (!check || !task.terminal) continue;
       const { state: seen, t } = probe(task.terminal);
-      if (seen === 'unknown') continue; // Core did not answer: that says nothing about the worker
+      const state = seen === 'live' ? t.status?.state : seen;
+      const previous = observations.get(id);
+      const observed = previous?.terminal === task.terminal && previous.state === state
+        ? { ...previous, checks: previous.checks + 1 } : { terminal: task.terminal, state, since: Date.now(), checks: 1 };
+      observations.set(id, observed);
+      if (seen === 'unknown') {
+        quiet.delete(id);
+        if (handover) recoverWorker(h, task, 'unknown', observed, timing);
+        continue; // Core did not answer: that says nothing about the worker
+      }
       if (t?.status?.state) quiet.delete(id);
       if (seen !== 'live') {
         saveTask(h, { ...task, state: 'failed', error: 'The worker terminal ended without a report.' });
@@ -1190,9 +1252,19 @@ function cmdWait(args) {
         // Waiting longer cannot help; hand that back so somebody looks at the terminal.
         blocked.set(id, String(t.status.msg ?? t.status.kind ?? 'it is waiting for an answer').slice(0, 120));
         settled.set(id, 'needs a person');
+        if (handover) recoverWorker(h, task, 'blocked', observed, timing);
+      } else if (handover) {
+        const recovery = recoverWorker(h, task, state, observed, timing);
+        if (recovery.handover) {
+          const latest = loadTask(h, id);
+          if (latest.state !== 'working' || latest.terminal !== task.terminal) continue;
+          const moved = relaunch(h, latest, recovery.handover);
+          if (moved.pick) console.log(`== ${id}: ${recovery.tried}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
+          else { blocked.set(id, `${recovery.tried}, and ${moved.why}`); settled.set(id, 'needs a person'); }
+        } else if (recovery.blocked) { blocked.set(id, recovery.blocked); settled.set(id, 'needs a person'); }
       }
     }
-    if (settled.size < ids.length) sleep(1000);
+    if (settled.size < ids.length) sleep(Math.min(1000, timing.check));
   }
   let pending = 0, stuck = 0;
   for (const id of ids) {

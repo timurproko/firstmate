@@ -59,12 +59,23 @@ if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forE
   w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
-else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
+else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; if (t?.steps?.length) Object.assign(t, t.steps.shift()); save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
 else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); if (w.silentAfterKill) w.silent = true; save(); }
 else if (a[0] === 'rm') { if (!w.failRm) delete w.terminals[a.at(-1)]; if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
+else if (a[0] === 'send') {
+  const t = w.terminals[a[1]];
+  if (t?.sendError) { save(); console.error('send transport unavailable'); process.exit(1); }
+  if (t?.onSends?.length) Object.assign(t, t.onSends.shift());
+  if (t?.reportOnSend) {
+    const task = JSON.parse(fs.readFileSync(t.reportOnSend, 'utf8'));
+    fs.writeFileSync(task.report, 'Complete');
+    fs.writeFileSync(t.reportOnSend, JSON.stringify({ ...task, state: 'reported', reported: new Date().toISOString(), tells: 9 }));
+  }
+  save();
+}
 else save();
 `);
 const readWorld = () => JSON.parse(fs.readFileSync(world, 'utf8'));
@@ -1298,6 +1309,98 @@ if (a[0] === '--version') process.exit(0);`);
     setQuota({ codex: 30, copilot: null, 'one@example.com': 70, 'two@example.com': 55 });
     q = crew2(['relaunch', 'cfg', '--agent', 'a1', '--model', 'openai-codex/gpt-x', 'quota is back']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /relaunched cfg: a1 openai-codex\/gpt-x in terminal/); assert.equal(task2('cfg').agent, 'a1'); assert.ok(lastRun().includes('had to stop: quota is back'), lastRun());
+
+    // Recovery uses Core send, not tell: its limits and history survive another wait.
+    const recovering = (id, terminalPatch = {}, taskPatch = {}) => {
+      const dir = path.join(home2, 'tasks', id), address = `recover-${id}`;
+      fs.mkdirSync(dir);
+      const task = { ...task2('plain'), id, terminal: address, state: 'working', tells: 2, chain: [],
+        brief: path.join(dir, 'brief.md'), report: path.join(dir, 'report.md'), ...taskPatch };
+      fs.writeFileSync(path.join(dir, 'task.json'), JSON.stringify(task));
+      const w = readWorld();
+      w.terminals[address] = { address, state: 'live', labels: {}, status: { state: 'error', app: 'a1' },
+        screen: 'Error: no healthy upstream\n', ...terminalPatch };
+      fs.writeFileSync(world, JSON.stringify(w));
+      return task;
+    };
+    const sendsTo = address => readWorld().log.filter(a => a[0] === 'send' && a[1] === address);
+    const quickWait = (id, more = {}, args = [], terminal = 'k1', timeout = '4') => crew2(['wait', id, '--timeout', timeout, ...args], terminal, { CREW_RECOVERY_SECONDS: '0', ...more });
+    const errorState = { status: { state: 'error', app: 'a1' } }, workingState = { status: { state: 'working', app: 'a1' } };
+    {
+      const task = recovering('error-once', { steps: [errorState, workingState] });
+      q = quickWait(task.id, {}, [], 'k1', '0.6'); assert.equal(q.code, 124, q.out);
+      assert.equal(sendsTo(task.terminal).length, 0, 'One error observation is not a stop');
+      const observed = readWorld().log.filter(a => a[0] === 'get' && a.at(-1) === task.terminal);
+      assert.ok(observed.length >= 2, 'Both the error and working state were observed');
+    }
+    {
+      const task = recovering('error-cap');
+      q = quickWait(task.id, { CREW_RECOVERY_SECONDS: '0.06' }); assert.equal(q.code, 7, q.out);
+      const nudges = task2(task.id).nudges;
+      assert.deepEqual(nudges.map(n => [n.kind, n.attempt]), [['error', 1], ['error', 2], ['error', 3]]);
+      assert.ok(Date.parse(nudges[1].at) - Date.parse(nudges[0].at) >= 240, 'Second message waits four units');
+      assert.ok(Date.parse(nudges[2].at) - Date.parse(nudges[1].at) >= 600, 'Third message waits ten units');
+      assert.equal(task2(task.id).tells, 2); assert.equal(task2(task.id).state, 'working');
+      assert.match(q.out, /stopped on an error \(Error: no healthy upstream\); told to continue \(1 of 3\)/);
+      assert.match(q.out, /needs a person.*told to continue 3 times without recovery.*no other candidate/);
+      const log = readWorld().log, sent = log.findIndex(a => a[0] === 'send' && a[1] === task.terminal);
+      assert.ok(log.slice(0, sent).filter(a => a[0] === 'get' && a.at(-1) === task.terminal).length >= 2);
+      q = quickWait(task.id); assert.equal(q.code, 7, q.out);
+      assert.equal(sendsTo(task.terminal).length, 3, 'Another wait cannot bypass the cap');
+    }
+    {
+      const task = recovering('error-handover', {}, { chain: [{ harness: 'a1', model: 'openai-codex/gpt-x' }] });
+      q = quickWait(task.id, {}, [], 'k1', '2'); assert.equal(q.code, 124, q.out);
+      const moved = task2(task.id);
+      assert.notEqual(moved.terminal, task.terminal, q.out); assert.equal(sendsTo(task.terminal).length, 3);
+      assert.equal(moved.fallbacks.at(-1).why, 'Error: no healthy upstream');
+      assert.equal(readWorld().terminals[moved.terminal].cwd, task.worktree);
+      assert.ok(lastRun().includes('Error: no healthy upstream'), lastRun());
+    }
+    {
+      const task = recovering('error-reset', { onSends: [
+        { steps: [workingState, workingState, workingState, workingState, errorState, errorState] },
+        { status: { state: 'blocked', msg: 'permission needed' } },
+      ] });
+      q = quickWait(task.id, { CREW_RECOVERY_SECONDS: '0.05' }); assert.equal(q.code, 7, q.out);
+      assert.deepEqual(task2(task.id).nudges.map(n => n.attempt), [1, 1], 'Sustained work starts a fresh stop');
+    }
+    {
+      const task = recovering('error-flicker', { onSends: [{ steps: [workingState, errorState, errorState] }] });
+      q = quickWait(task.id, { CREW_RECOVERY_SECONDS: '0.1' }); assert.equal(q.code, 7, q.out);
+      assert.deepEqual(task2(task.id).nudges.map(n => n.attempt), [1, 2, 3], 'A working flicker does not reset retries');
+    }
+    {
+      const task = recovering('error-quota', { screen: 'Error: usage limit reached\n' });
+      q = quickWait(task.id); assert.equal(q.code, 7, q.out);
+      assert.equal(sendsTo(task.terminal).length, 0, 'Quota is handled before transient errors');
+      assert.match(q.out, /stopped \(Error: usage limit reached\)/);
+    }
+    for (const [id, env, args, owner] of [
+      ['error-no-flag', {}, ['--no-fallback'], 'k1'],
+      ['error-no-env', { CREW_NO_FALLBACK: '1' }, [], 'k1'],
+      ['error-not-owner', {}, [], 'k9'],
+    ]) {
+      const task = recovering(id), before = task2(id);
+      q = quickWait(id, env, args, owner, '0.4'); assert.equal(q.code, 124, q.out);
+      assert.deepEqual(task2(id), before, 'Disabled recovery does not change the task');
+      assert.equal(sendsTo(task.terminal).length, 0);
+    }
+    {
+      const task = recovering('error-send-fails', { sendError: true });
+      q = quickWait(task.id); assert.equal(q.code, 7, q.out);
+      assert.match(q.out, /needs a person.*did not deliver.*send transport unavailable/);
+      assert.equal(task2(task.id).nudges, undefined); assert.equal(task2(task.id).recovery.errors, 0);
+    }
+    {
+      const task = recovering('error-fast-report');
+      setTerminal(task.terminal, { reportOnSend: path.join(home2, 'tasks', task.id, 'task.json') });
+      q = quickWait(task.id); assert.equal(q.code, 0, q.out);
+      assert.equal(task2(task.id).state, 'reported', 'A report during send is not overwritten');
+      assert.equal(task2(task.id).tells, 9, 'Newest task fields survive send');
+      assert.equal(task2(task.id).nudges.length, 1);
+      q = quickWait(task.id); assert.equal(q.code, 0); assert.equal(sendsTo(task.terminal).length, 1);
+    }
 
     // finish never takes somebody else's terminal down with the working copy: returning a pool slot
     // ends every process that sits in it, and a person's own session may have been opened there.
