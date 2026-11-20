@@ -131,34 +131,51 @@ try {
   // A home, with coordinator rules any agent reads, and a registered project.
   assert.match(crew(['status'], { cwd: root }).out, /No crew home yet/);
   // With no folder, the home is the per-user one, and crew then works from anywhere.
-  assert.ok(crew(['init'], { cwd: root }).out.includes('/user/.crew/crew'), 'The default home is under the user folder, in a folder named crew');
-  assert.ok(crew(['status'], { cwd: root }).out.includes('.crew/crew - no owner'), 'crew finds the default home from any folder');
-  // A home from before 0.6 (~/.crew/home) keeps working and is moved once, when nobody uses it.
+  assert.match(crew(['init'], { cwd: root }).out, /crew home created: \S*\/user\/\.crew\r?\n/, 'The default home is ~/.crew itself');
+  assert.ok(crew(['status'], { cwd: root }).out.includes('/user/.crew - no owner'), 'crew finds the default home from any folder');
   {
-    const now = path.join(fakeUser, '.crew', 'crew'), old = path.join(fakeUser, '.crew', 'home');
-    assert.equal(slash(crew(['home'], { cwd: root }).out.trim()), slash(now));
-    fs.renameSync(now, old);
-    fs.mkdirSync(path.join(old, 'tasks', 'k1'), { recursive: true });
-    fs.writeFileSync(path.join(old, 'tasks', 'k1', 'task.json'), JSON.stringify({ id: 'k1', state: 'closed', report: `${slash(old)}/tasks/k1/report.md`, brief: `${slash(old)}/tasks/k1/brief.md`, worktree: 'C:/elsewhere/k1' }));
-    assert.ok(crew(['status'], { cwd: root }).out.includes('.crew/home - no owner'), 'The old place still works');
-    assert.equal(crew(['init'], { cwd: root }).code, 2, 'No second default home beside the old one');
-    let w0 = readWorld(); w0.terminals.old1 = { address: 'old1', state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w0));
-    fs.writeFileSync(path.join(old, 'owner.json'), JSON.stringify({ terminal: 'old1' }));
+    const now = path.join(fakeUser, '.crew'), rules = path.join(now, 'coordinator');
+    assert.equal(slash(crew(['home'], { cwd: root }).out.trim()), slash(rules), 'crew home prints the folder the coordinator starts in');
+    assert.ok(fs.readFileSync(path.join(rules, 'AGENTS.md'), 'utf8').includes('crew spawn') && !fs.existsSync(path.join(now, 'AGENTS.md')), 'The rules are in their own folder, not above the workers');
+    // A home from before 0.7 (~/.crew/crew, earlier ~/.crew/home) keeps working and is unpacked
+    // into ~/.crew once, when nobody uses it.
+    for (const name of ['crew', 'home']) {
+      const old = path.join(now, name);
+      fs.rmSync(now, { recursive: true, force: true }); fs.mkdirSync(path.join(old, 'tasks', 'k1'), { recursive: true });
+      fs.writeFileSync(path.join(old, 'crew.json'), JSON.stringify({ version: 1, tag: 'old', projects: {} }));
+      fs.writeFileSync(path.join(old, 'AGENTS.md'), 'old rules'); fs.writeFileSync(path.join(old, 'CLAUDE.md'), '@AGENTS.md\n'); fs.writeFileSync(path.join(old, 'backlog.md'), 'b\n');
+      fs.writeFileSync(path.join(old, 'tasks', 'k1', 'task.json'), JSON.stringify({ id: 'k1', state: 'closed', report: `${slash(old)}/tasks/k1/report.md`, brief: `${slash(old)}/tasks/k1/brief.md`, worktree: 'C:/elsewhere/k1' }));
+      assert.ok(crew(['status'], { cwd: root }).out.includes(`.crew/${name} - no owner`), 'The old place still works');
+      assert.equal(slash(crew(['home'], { cwd: root }).out.trim()), slash(old), 'An old home is where its coordinator starts');
+      assert.equal(crew(['init'], { cwd: root }).code, 2, 'No second default home beside the old one');
+      let w0 = readWorld(); w0.terminals.old1 = { address: 'old1', state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w0));
+      fs.writeFileSync(path.join(old, 'owner.json'), JSON.stringify({ terminal: 'old1' }));
+      let m = crew(['home', '--ensure'], { cwd: root });
+      assert.ok(m.out.includes('for now: a session still holds it') && fs.existsSync(path.join(old, 'crew.json')) && !fs.existsSync(path.join(now, 'crew.json')), m.out);
+      w0 = readWorld(); delete w0.terminals.old1; fs.writeFileSync(world, JSON.stringify(w0));
+      m = crew(['home', '--ensure'], { cwd: root });
+      assert.ok(m.out.includes('the home moved from') && !fs.existsSync(old) && fs.existsSync(path.join(now, 'crew.json')), m.out);
+      assert.ok(m.out.split(/\r?\n/).map(slash).includes(slash(rules)), m.out);
+      assert.deepEqual([fs.readFileSync(path.join(rules, 'AGENTS.md'), 'utf8'), fs.readFileSync(path.join(now, 'backlog.md'), 'utf8')], ['old rules', 'b\n'], 'Rules go to coordinator/, the rest to ~/.crew');
+      const k1 = JSON.parse(fs.readFileSync(path.join(now, 'tasks', 'k1', 'task.json'), 'utf8'));
+      assert.deepEqual([k1.report, k1.brief, k1.worktree], [`${slash(now)}/tasks/k1/report.md`, `${slash(now)}/tasks/k1/brief.md`, 'C:/elsewhere/k1'], 'Task records follow the home');
+    }
+    // Something already in the way: nothing is moved, and the old home stays whole.
+    fs.rmSync(now, { recursive: true, force: true }); fs.mkdirSync(path.join(now, 'crew'), { recursive: true }); fs.mkdirSync(path.join(now, 'tasks'));
+    fs.writeFileSync(path.join(now, 'crew', 'crew.json'), JSON.stringify({ version: 1, tag: 'old', projects: {} })); fs.mkdirSync(path.join(now, 'crew', 'tasks'));
     let m = crew(['home', '--ensure'], { cwd: root });
-    assert.ok(m.out.includes('for now: a session still holds it') && fs.existsSync(old) && !fs.existsSync(now), m.out);
-    w0 = readWorld(); delete w0.terminals.old1; fs.writeFileSync(world, JSON.stringify(w0));
-    m = crew(['home', '--ensure'], { cwd: root });
-    assert.ok(m.out.includes('the home moved to') && !fs.existsSync(old) && fs.existsSync(path.join(now, 'crew.json')), m.out);
-    const k1 = JSON.parse(fs.readFileSync(path.join(now, 'tasks', 'k1', 'task.json'), 'utf8'));
-    assert.deepEqual([k1.report, k1.brief, k1.worktree], [`${slash(now)}/tasks/k1/report.md`, `${slash(now)}/tasks/k1/brief.md`, 'C:/elsewhere/k1'], 'Task records follow the home');
-    fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
+    assert.ok(/for now: \S*\/\.crew\/tasks already exists/.test(m.out) && fs.existsSync(path.join(now, 'crew', 'crew.json')) && !fs.existsSync(path.join(now, 'coordinator')), m.out);
+    fs.rmSync(now, { recursive: true, force: true });
     m = crew(['home', '--ensure'], { cwd: root });
     assert.ok(m.code === 0 && fs.existsSync(path.join(now, 'crew.json')), 'With no home at all, --ensure creates the default one');
+    // Update and crash records from before 0.7 move into state/ on first use.
+    fs.writeFileSync(path.join(now, 'tool-previous'), 'abc\n'); crew(['home'], { cwd: root });
+    assert.ok(!fs.existsSync(path.join(now, 'tool-previous')) && fs.readFileSync(path.join(now, 'state', 'previous'), 'utf8') === 'abc\n');
   }
   fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
   assert.equal(crew(['init', homeDir]).code, 0);
-  assert.ok(fs.readFileSync(path.join(homeDir, 'AGENTS.md'), 'utf8').includes('crew spawn'));
-  assert.equal(fs.readFileSync(path.join(homeDir, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
+  assert.ok(fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8').includes('crew spawn'));
+  assert.equal(fs.readFileSync(path.join(homeDir, 'coordinator', 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
   assert.equal(crew(['init', homeDir]).code, 2, 'A home is never re-initialised');
   assert.equal(crew(['project', 'add', 'demo', project]).code, 0);
   assert.equal(crew(['project', 'add', 'bad', root]).code, 2, 'Only git repositories are projects');
@@ -316,12 +333,23 @@ try {
   assert.equal(fs.readFileSync(path.join(f1copy, 'half-done.txt'), 'utf8'), 'unsaved');
   assert.equal(crew(['finish', 'f1', '--force'], { terminal: 'c2' }).code, 0);
   assert.ok(!fs.existsSync(f1copy), 'Discarding was asked for');
-  assert.ok(git('-C', project, 'branch', '--list', 'crew/f1').includes('crew/f1'), 'The branch stays');
+  assert.ok(git('-C', project, 'branch', '--list', 'feature/f1').includes('feature/f1'), 'The branch stays');
   // A branch whose commits are merged holds nothing more and goes with the working copy.
   assert.equal(crew(['spawn', 'f4', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
-  commit(path.join(copies, 'f4'), { 'merged.txt': 'in\n' }, 'Merged work'); git('-C', project, 'merge', '-q', '--ff-only', 'crew/f4');
-  r = crew(['finish', 'f4', '--force'], { terminal: 'c2' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch crew\/f4 deleted/);
-  assert.equal(git('-C', project, 'branch', '--list', 'crew/f4').trim(), '', 'A merged branch is deleted');
+  commit(path.join(copies, 'f4'), { 'merged.txt': 'in\n' }, 'Merged work'); git('-C', project, 'merge', '-q', '--ff-only', 'feature/f4');
+  r = crew(['finish', 'f4', '--force'], { terminal: 'c2' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch feature\/f4 deleted/);
+  assert.equal(git('-C', project, 'branch', '--list', 'feature/f4').trim(), '', 'A merged branch is deleted');
+  // --type names the branch the way the shared delivery workflow does; only a ship task has one.
+  r = crew(['spawn', 'f5', '--project', 'demo', '--kind', 'ship', '--type', 'bugfix', '--agent', 'pi', 'x'], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /Unknown type: bugfix/);
+  r = crew(['spawn', 'f5', '--project', 'demo', '--type', 'fix', '--agent', 'pi', 'x'], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /Only a ship task has a branch/);
+  assert.equal(crew(['spawn', 'f5', '--project', 'demo', '--kind', 'ship', '--type', 'fix', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
+  const f5copy = path.join(copies, 'f5');
+  assert.equal(git('-C', f5copy, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'fix/f5');
+  // A copy marked to keep is not removed unasked. The marker's folder is ignored, as in a delivery repository.
+  fs.mkdirSync(path.join(f5copy, '.artifacts')); fs.writeFileSync(path.join(f5copy, '.artifacts', '.gitignore'), '*\n'); fs.writeFileSync(path.join(f5copy, '.artifacts', 'KEEP'), '');
+  r = crew(['finish', 'f5'], { terminal: 'c2' }); assert.equal(r.code, 6); assert.match(r.out, /marked to keep by \.artifacts\/KEEP/);
+  assert.ok(fs.existsSync(f5copy), 'A kept copy stays');
+  r = crew(['finish', 'f5', '--force'], { terminal: 'c2' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch fix\/f5 deleted/);
   // A scout's leftovers are scratch.
   assert.equal(crew(['spawn', 'f2', '--project', 'demo', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
   fs.writeFileSync(path.join(copies, 'f2', 'notes.tmp'), 'x');
@@ -360,9 +388,9 @@ if (a[0] === 'run') {`));
   fs.writeFileSync(path.join(crashHome, 'crew.json'), JSON.stringify({ version: 1, tag: 'crash' }));
   r = crew(['project', 'list'], { cwd: crashHome }); assert.equal(r.code, 70, r.out);
   assert.match(r.out, /internal error[\s\S]*defect in crew itself[\s\S]*crew fix "/);
-  const crashFiles = fs.readdirSync(path.join(fakeUser, '.crew', 'crashes'));
+  const crashFiles = fs.readdirSync(path.join(fakeUser, '.crew', 'state', 'crashes'));
   assert.equal(crashFiles.length, 1);
-  assert.match(fs.readFileSync(path.join(fakeUser, '.crew', 'crashes', crashFiles[0]), 'utf8'), /command: crew project list[\s\S]*TypeError/);
+  assert.match(fs.readFileSync(path.join(fakeUser, '.crew', 'state', 'crashes', crashFiles[0]), 'utf8'), /command: crew project list[\s\S]*TypeError/);
 
   // fix: only the owner, one at a time, a ship task on crew's own source with the crash attached.
   assert.equal(sm(['fix', 'x'], 'c1').code, 3);
@@ -374,7 +402,7 @@ if (a[0] === 'run') {`));
   assert.deepEqual([fix1.selfFix, fix1.project, fix1.projectPath, fix1.base], [true, 'crew:self', slash(tool), first]);
   const fixBrief = fs.readFileSync(fix1.brief, 'utf8');
   assert.ok(fixBrief.includes('crew project list crashed instead of printing nothing') && fixBrief.includes(crashFiles[0]) && fixBrief.includes('under `crew/` only'), fixBrief);
-  assert.equal(git('-C', fixCopy, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'crew/fix-1');
+  assert.equal(git('-C', fixCopy, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'fix/fix-1');
   r = sm(['fix', 'another']); assert.equal(r.code, 2); assert.match(r.out, /already open: fix-1/);
 
   // selfmerge: every gate refuses and publishes nothing.
@@ -404,7 +432,7 @@ if (a[0] === 'run') {`));
   assert.equal(taskOf('fix-1').merged, second);
   assert.match(sm(['selfmerge', 'fix-1']).out, /already published/);
   assert.equal(sm(['finish', 'fix-1']).code, 0);
-  assert.equal(git('-C', tool, 'branch', '--list', 'crew/fix-1').trim(), '', 'A published repair leaves no branch behind');
+  assert.equal(git('-C', tool, 'branch', '--list', 'fix/fix-1').trim(), '', 'A published repair leaves no branch behind');
   assert.equal(crew(['spawn', 'no', '--project', 'crew:self', 'x'], { terminal: 'c2' }).code, 2, "crew's own source is not a project for ordinary tasks");
 
   // rollback: this machine goes back one step and stays there while that revision is the latest.
@@ -424,9 +452,9 @@ if (a[0] === 'run') {`));
   r = sm(['start'], 'c2', { CREW_AUTO_UPDATE: '1' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /did not check for updates[\s\S]*you hold /);
   assert.equal(sm(['update']).code, 4);
   // A newer crew brings its coordinator rules into an existing home.
-  fs.writeFileSync(path.join(homeDir, 'AGENTS.md'), 'old rules');
+  fs.writeFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'old rules');
   assert.match(crew(['start'], { terminal: 'c2' }).out, /coordinator rules changed/);
-  assert.ok(fs.readFileSync(path.join(homeDir, 'AGENTS.md'), 'utf8').includes('crew selfmerge'));
+  assert.ok(fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8').includes('crew selfmerge'));
 
   // --- follow-ups, review and delivery ---------------------------------------------------
   assert.deepEqual(['https://github.com/acme/tool.git', 'git@github.com:acme/tool', 'https://github.com/acme/tool/', path.join(root, 'x.git')].map(githubOwner), ['acme', 'acme', 'acme', null]);
@@ -468,7 +496,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   const review = taskOf('s1-review');
   assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).includes('crew.kind=review'), 'A reviewer is labelled as one');
   assert.deepEqual([review.kind, review.reviews, review.project], ['scout', 's1', 'demo']);
-  assert.ok(fs.readFileSync(review.brief, 'utf8').includes('git diff HEAD...crew/s1') && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
+  assert.ok(fs.readFileSync(review.brief, 'utf8').includes('git diff HEAD...feature/s1') && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
   assert.match(own(['review', 's1', '--agent', 'claude']).out, /spawned s1-review-2: claude scout/);
   // land: refused with unsaved work, without a place to push to, and honest when GitHub says no.
   fs.writeFileSync(path.join(s1copy, 'loose.txt'), 'x');
@@ -478,14 +506,14 @@ console.log('https://example.invalid/acme/demo/pull/7');
   const projectOrigin = path.join(root, 'project-origin.git'); git('clone', '-q', '--bare', project, projectOrigin); git('-C', project, 'remote', 'add', 'origin', projectOrigin);
   const baseBranch = git('-C', project, 'rev-parse', '--abbrev-ref', 'HEAD').trim();
   fs.writeFileSync(ghDown, '');
-  r = own(['land', 's1']); assert.equal(r.code, 4); assert.match(r.out, /branch crew\/s1 is pushed, but the pull request was not opened \(gh: not signed in\)/);
-  assert.equal(git('-C', projectOrigin, 'rev-parse', 'crew/s1').trim(), head(s1copy), 'The branch is published');
+  r = own(['land', 's1']); assert.equal(r.code, 4); assert.match(r.out, /branch feature\/s1 is pushed, but the pull request was not opened \(gh: not signed in\)/);
+  assert.equal(git('-C', projectOrigin, 'rev-parse', 'feature/s1').trim(), head(s1copy), 'The branch is published');
   assert.equal(taskOf('s1').pr, undefined);
   fs.rmSync(ghDown);
   r = own(['land', 's1']); assert.equal(r.code, 0, r.out);
   assert.ok(r.out.includes(`delivered s1: https://example.invalid/acme/demo/pull/7 (against ${baseBranch}, 1 commit)`), r.out);
   const made = JSON.parse(fs.readFileSync(ghLog, 'utf8')).at(-1);
-  assert.deepEqual(made.a.slice(0, 8), ['pr', 'create', '--base', baseBranch, '--head', 'crew/s1', '--title', 'Add a third line']);
+  assert.deepEqual(made.a.slice(0, 8), ['pr', 'create', '--base', baseBranch, '--head', 'feature/s1', '--title', 'Add a third line']);
   assert.match(made.body, /# Done\nAdded a line\.[\s\S]*crew task `s1` \(pi\), 1 commit/);
   assert.equal(taskOf('s1').pr, 'https://example.invalid/acme/demo/pull/7');
   r = own(['status', '--json']); assert.equal(r.code, 0, r.out);
@@ -494,7 +522,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.match(r.out, /^s1\t[^\r\n]*\thttps:\/\/example\.invalid\/acme\/demo\/pull\/7\r?$/m);
   assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
   for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
-  assert.ok(git('-C', project, 'branch', '--list', 'crew/s1').includes('crew/s1'), 'A branch whose pull request is not merged stays');
+  assert.ok(git('-C', project, 'branch', '--list', 'feature/s1').includes('feature/s1'), 'A branch whose pull request is not merged stays');
   // A squash merge leaves no ancestry: GitHub's merged pull request with this exact head counts.
   assert.equal(own(['spawn', 'm1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   const m1head = commit(path.join(copies, 'm1'), { 'squashed.txt': 'x\n' }, 'Squashed work');
@@ -502,10 +530,10 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.equal(own(['spawn', 'm2', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   commit(path.join(copies, 'm2'), { 'later.txt': 'x\n' }, 'Work after the merged head');
   r = own(['finish', 'm2', '--force']); assert.equal(r.code, 0, r.out); assert.ok(!r.out.includes('deleted'), r.out);
-  assert.ok(git('-C', project, 'branch', '--list', 'crew/m2').includes('crew/m2'), 'Commits the merged pull request did not have keep the branch');
+  assert.ok(git('-C', project, 'branch', '--list', 'feature/m2').includes('feature/m2'), 'Commits the merged pull request did not have keep the branch');
   fs.writeFileSync(ghMerged, m1head + '\n');
-  r = own(['finish', 'm1', '--force']); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch crew\/m1 deleted/);
-  assert.equal(git('-C', project, 'branch', '--list', 'crew/m1').trim(), '');
+  r = own(['finish', 'm1', '--force']); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch feature\/m1 deleted/);
+  assert.equal(git('-C', project, 'branch', '--list', 'feature/m1').trim(), '');
   fs.rmSync(ghMerged);
 
   // --- the tools Firstmate works with ----------------------------------------------------
@@ -539,7 +567,7 @@ else if (a[0] === 'get') {
   if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
   console.error('Leased worktree'); console.log(JSON.stringify({ path: slot, lease_id: 'x' }));
 } else if (a[0] === 'return' && fs.existsSync(${JSON.stringify(path.join(root, 'pool-stuck'))})) { console.error('foreign process remains'); process.exit(1); }
-else if (a[0] === 'return') spawnSync('git', ['-C', a[1], 'checkout', '-q', '--detach']);
+else if (a[0] === 'return') spawnSync('git', ['-C', a.at(-1), 'checkout', '-q', '--detach']);
 `);
   const T = { CREW_GH: fakeGh, CREW_TOOL_TASKS_AXI: fakeTasks, CREW_TOOL_TREEHOUSE: fakeTree, CREW_TOOL_NO_MISTAKES: fakeVersion };
   const tl = (args, terminal = 'c2', env = T) => crew(args, { terminal, env });
@@ -579,10 +607,10 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a[1], 'checkout', '-q', '--d
   r = tl(['spawn', 'p1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Change it.']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(treehouse\)/);
   const p1 = taskOf('p1');
   assert.equal(p1.pool, 'treehouse'); assert.ok(p1.worktree.startsWith(slash(poolDir)) && p1.worktree.endsWith('/demo'), p1.worktree);
-  assert.equal(git('-C', p1.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'crew/p1');
+  assert.equal(git('-C', p1.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'feature/p1');
   assert.equal(readWorld().log.filter(a => a[0] === 'run').at(-1)[readWorld().log.filter(a => a[0] === 'run').at(-1).indexOf('--cwd') + 1], p1.worktree);
   const lease = JSON.parse(fs.readFileSync(treeLog, 'utf8')).find(e => e.a[0] === 'get');
-  assert.deepEqual(lease.a, ['get', '--lease', '--json', '-b', 'crew/p1']); assert.equal(slash(lease.cwd).toLowerCase(), slash(fs.realpathSync(project)).toLowerCase());
+  assert.deepEqual(lease.a, ['get', '--lease', '--json', '-b', 'feature/p1']); assert.equal(slash(lease.cwd).toLowerCase(), slash(fs.realpathSync(project)).toLowerCase());
   fs.writeFileSync(path.join(root, 'pool-stuck'), '');
   r = tl(['finish', 'p1']); assert.equal(r.code, 6); assert.match(r.out, /treehouse did not take the working copy back \(foreign process remains\)/);
   assert.equal(taskOf('p1').state, 'working', 'A copy that was not returned keeps its task open');
@@ -590,7 +618,13 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a[1], 'checkout', '-q', '--d
   r = tl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to treehouse/);
   assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', p1.worktree]);
   assert.equal(taskOf('p1').state, 'closed');
-  assert.match(r.out, /; merged branch crew\/p1 deleted/); assert.equal(git('-C', project, 'branch', '--list', 'crew/p1').trim(), '', 'A returned slot leaves no merged branch behind');
+  // treehouse takes back a slot with loose files only when told to clean it: a scout's leftovers
+  // are scratch, and --force is the person's word.
+  assert.equal(tl(['spawn', 'p2', '--project', 'pooled', '--agent', 'pi', 'Look.']).code, 0);
+  assert.equal(tl(['finish', 'p2', '--force']).code, 0); assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', '--force', taskOf('p2').worktree]);
+  assert.equal(tl(['spawn', 'p3', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.equal(tl(['finish', 'p3', '--force']).code, 0); assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', '--force', taskOf('p3').worktree]);
+  assert.match(r.out, /; merged branch feature\/p1 deleted/); assert.equal(git('-C', project, 'branch', '--list', 'feature/p1').trim(), '', 'A returned slot leaves no merged branch behind');
 
   // no-mistakes: a project with the gate is delivered by it; crew only records the result.
   git('-C', project, 'remote', 'add', 'no-mistakes', projectOrigin);
@@ -610,7 +644,7 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a[1], 'checkout', '-q', '--d
   fs.writeFileSync(g1.report, 'Done: https://github.com/acme/demo/pull/9 is open.');
   r = tl(['land', 'g1']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /delivered g1 through no-mistakes: https:\/\/github\.com\/acme\/demo\/pull\/9\.[\s\S]*backlog: done g1 -> Done/);
-  assert.notEqual(spawnSync('git', ['-C', projectOrigin, 'rev-parse', '--verify', '-q', 'crew/g1']).status, 0, 'crew pushed nothing itself');
+  assert.notEqual(spawnSync('git', ['-C', projectOrigin, 'rev-parse', '--verify', '-q', 'feature/g1']).status, 0, 'crew pushed nothing itself');
   assert.match(fs.readFileSync(path.join(homeDir, 'backlog.md'), 'utf8'), /- \[x\] g1 .*\(done https:\/\/github\.com\/acme\/demo\/pull\/9\)/);
   fs.rmSync(ghDown);
   assert.ok(g1brief.includes(intentFile + ' --skip ci`') && g1brief.includes('The gate ends when the pull request is open'), 'By default the gate stops at the open pull request');
