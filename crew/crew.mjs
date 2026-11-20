@@ -15,7 +15,7 @@ export const VERSION = '0.6.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
-// Herdr), crew/ (the default crew home) and worktrees/ (workers' copies).
+// Herdr), crew/ (the default crew home) and .worktrees/ (workers' copies).
 export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'crew');
 
 // --- agents ------------------------------------------------------------------
@@ -133,7 +133,7 @@ function home() {
   if (!config || config.version !== 1) refuse(`${path.join(dir, 'crew.json')} is not a version 1 crew home.`);
   // Working copies live OUTSIDE the home. Agents read instruction files from their folder
   // upwards, so a worker inside the home would load the coordinator's rules and act as one.
-  const worktrees = path.join(process.env.CREW_WORKTREES || path.join(os.homedir(), '.crew', 'worktrees'), String(config.tag));
+  const worktrees = path.join(process.env.CREW_WORKTREES || path.join(os.homedir(), '.crew', '.worktrees'), String(config.tag));
   return { dir, config, tasks: path.join(dir, 'tasks'), worktrees, owner: path.join(dir, 'owner.json') };
 }
 const taskDir = (h, id) => path.join(h.tasks, id);

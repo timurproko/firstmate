@@ -17,7 +17,7 @@ Where the work stands, why it went this way and what is left: [`docs/plan.md`](d
 ```
 ~/.crew/tool/        this repository, when installed from the Herdr plugin
 ~/.crew/crew/        the default crew home: crew.json, AGENTS.md, CLAUDE.md, owner.json, tasks/<id>/
-~/.crew/worktrees/   workers' copies: <home tag>/<task id>
+~/.crew/.worktrees/  workers' copies: <home tag>/<task id>
 ```
 
 A worker's copy is never inside the home: agents read instruction files from their folder

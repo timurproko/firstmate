@@ -49,7 +49,7 @@ dependency-free Node file in the same fork, with Firstmate's code close by as re
 |---|---|
 | `~/.crew/tool` | the installed copy of this fork on each machine; updates itself at `crew start` |
 | `~/.crew/crew` | the coordinator's home: projects, tasks, backlog, pages. Herdr names the space after the folder, hence "crew" |
-| `~/.crew/worktrees` | workers' working copies (outside the home, so a worker never loads the coordinator's rules) |
+| `~/.crew/.worktrees` | workers' working copies (outside the home, so a worker never loads the coordinator's rules) |
 | `~/.crew/crashes` | crash records |
 | `D:\Git\crew` | development clone of this fork on both machines. On pc2 it is also the Firstmate install and holds Firstmate's untracked `config/`, `data/`, `projects/`, `state/` |
 
