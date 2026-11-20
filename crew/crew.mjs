@@ -6,6 +6,7 @@
 // short process talking to Core through `hc`; there is no watcher, no hook and no
 // background service. See crew/README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1379,20 +1380,49 @@ function gitStatus(folder, ...more) {
   return entries;
 }
 const listFiles = files => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ', …' : ''}`;
-// What a postponed copy held when finish accepted to discard it: every changed or untracked
-// file (any kind of task) with its modification time, and the keep marker's. Finish only
-// accepted what was there then (a scout's scratch, or what --force covered); null when git
-// could not tell.
-function snapshotCopy(folder) {
-  const stamp = p => { try { return fs.statSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
+// Metadata only: one fingerprint per ignored root, even for a large dependency tree. The
+// digest includes names and individual metadata: count/max/size alone can hide a rename,
+// a same-size edit below the newest timestamp, or two changes whose sizes cancel out.
+// Never follow symlinks or read contents. A slow/unreadable walk is uncertainty, not clean.
+export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
+  const deadline = performance.now() + budgetMs;
+  const stamp = p => { try { return fs.lstatSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
   const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : []);
-  // Ignored files go with the copy too (a forced removal takes everything), so they count;
-  // they are listed by folder, whose time changes when something is written into it.
-  const changed = git('--untracked-files=all'), ignored = git('--ignored');
-  if (!changed || !ignored) return null;
-  const files = {};
-  for (const { file } of [...changed, ...ignored.filter(e => e.code === '!!')]) files[file] = stamp(file);
-  return { files, keep: stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
+  const changed = git('--untracked-files=all'), roots = git('--ignored');
+  if (!changed || !roots) return null;
+  const files = {}, ignored = {};
+  let incomplete = null;
+  const checkTime = () => { if (performance.now() >= deadline) throw new Error('ignored walk exceeded its time budget'); };
+  try {
+    for (const { file } of changed) {
+      files[file] = stamp(file);
+      if (files[file] === null) throw new Error(`could not read ${file}`);
+    }
+    for (const { file } of roots.filter(e => e.code === '!!')) {
+      const hash = createHash('sha256'), summary = { files: 0, newestMtimeMs: 0, totalSize: 0 };
+      const walk = name => {
+        checkTime();
+        let stat;
+        try { stat = fs.lstatSync(path.join(folder, name)); } catch { throw new Error(`could not read ${name}`); }
+        hash.update(JSON.stringify([name, stat.mode, stat.size, stat.mtimeMs, stat.ctimeMs]));
+        if (stat.isDirectory() && !stat.isSymbolicLink()) {
+          let names;
+          try { names = fs.readdirSync(path.join(folder, name)).sort(); } catch { throw new Error(`could not read ${name}`); }
+          for (const child of names) walk(`${name.replace(/\/$/, '')}/${child}`);
+        } else {
+          summary.files++;
+          summary.newestMtimeMs = Math.max(summary.newestMtimeMs, stat.mtimeMs);
+          summary.totalSize += stat.size;
+        }
+        checkTime();
+      };
+      // Strip git's trailing slash before lstat: otherwise a directory symlink can be followed.
+      walk(file.replace(/\/$/, ''));
+      ignored[file] = { ...summary, metadata: hash.digest('hex') };
+    }
+    checkTime();
+  } catch (error) { incomplete = error.message; }
+  return { files, ignoredVersion: 1, ignored, incomplete, keep: stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
 }
 // Where the copy's history stood: its HEAD and branch, how many entries its own HEAD reflog
 // has (a linked copy's reflog is its own and goes with it), and which git operations are
@@ -1426,14 +1456,18 @@ function commitsOnlyInCopy(folder, before) {
 function checkWaitingCopy(task) {
   const seen = snapshotCopy(task.worktree), before = task.copyToReturn.left ?? { files: {}, keep: null };
   if (!seen) return { kept: { why: 'uncommitted work', text: 'it could not be checked for work written since finish' }, leftovers: false };
+  const uncertain = !task.copyToReturn.left ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
+  if (uncertain) return { kept: { why: 'uncommitted work', text: `changes cannot be determined: ${uncertain}` }, leftovers: true };
   if (seen.keep !== null && seen.keep !== before.keep) return { kept: { why: 'marked to keep', text: 'it was marked to keep by .artifacts/KEEP since finish' }, leftovers: true };
-  const added = Object.keys(seen.files).filter(file => !(file in before.files) || before.files[file] !== seen.files[file]);
+  const ignored = new Set([...Object.keys(before.ignored ?? {}), ...Object.keys(seen.ignored)]);
+  const added = [...Object.keys(seen.files).filter(file => !(file in before.files) || before.files[file] !== seen.files[file]),
+    ...[...ignored].filter(file => JSON.stringify(before.ignored?.[file]) !== JSON.stringify(seen.ignored[file]))];
   if (added.length) return { kept: { why: 'uncommitted work', text: `it has work written since finish (${listFiles(added)})` }, leftovers: true };
   const started = seen.operations.filter(name => !(before.operations ?? []).includes(name));
   if (started.length) return { kept: { why: 'operation in progress', text: `it has ${started.map(name => OPERATIONS[name]).join(' and ')} since finish` }, leftovers: true };
   const commits = commitsOnlyInCopy(task.worktree, before);
   if (commits.length) return { kept: { why: 'commits', text: `it has commits made since finish that no branch holds (${listFiles(commits.map(sha => sha.slice(0, 8)))})` }, leftovers: true };
-  return { kept: null, leftovers: Object.keys(seen.files).length > 0 || seen.keep !== null };
+  return { kept: null, leftovers: Object.keys(seen.files).length > 0 || Object.keys(seen.ignored).length > 0 || seen.keep !== null };
 }
 
 // Copies whose return finish postponed because another terminal held them. They go back

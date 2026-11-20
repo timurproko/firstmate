@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -90,7 +90,66 @@ const commit = (folder, files, message) => {
   return git('-C', folder, 'rev-parse', 'HEAD').trim();
 };
 
+// Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
+const gapTests = {};
+function gapFixture(name, extra = {}) {
+  const dir = path.join(root, `gap-${name}`), home = path.join(dir, 'home'), repo = path.join(dir, 'repo');
+  fs.mkdirSync(repo, { recursive: true }); git('-C', repo, 'init', '-q');
+  commit(repo, { 'README.md': 'baseline\n', '.gitignore': 'scratch/\nloose.log\n' }, 'baseline');
+  const owner = `owner-${name}`, w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const call = (args, env = {}) => crew(args, { cwd: home, terminal: owner, env: { CREW_CLAUDE_ACCOUNTS: '', ...extra, ...env } });
+  assert.equal(call(['init', home]).code, 0);
+  assert.equal(call(['project', 'add', 'demo', repo]).code, 0);
+  assert.equal(call(['start']).code, 0);
+  const taskFile = id => path.join(home, 'tasks', id, 'task.json');
+  const task = id => JSON.parse(fs.readFileSync(taskFile(id), 'utf8'));
+  const save = t => fs.writeFileSync(taskFile(t.id), JSON.stringify(t));
+  const spawn = (id, flags = []) => { const r = call(['spawn', id, '--project', 'demo', ...flags, 'Count lines.']); assert.equal(r.code, 0, r.out); return task(id); };
+  const guest = t => { const w = readWorld(); w.terminals[`guest-${name}`] = { address: `guest-${name}`, state: 'live', labels: {}, cwd: t.worktree }; fs.writeFileSync(world, JSON.stringify(w)); };
+  const leave = () => { const w = readWorld(); delete w.terminals[`guest-${name}`]; fs.writeFileSync(world, JSON.stringify(w)); };
+  return { dir, home, repo, call, task, save, spawn, guest, leave };
+}
+gapTests.ignored = () => {
+  const f = gapFixture('ignored'), count = Math.max(12001, Number(process.env.CREW_TEST_IGNORED_FILES) || 12001);
+  const fill = t => { fs.mkdirSync(path.join(t.worktree, 'scratch')); for (let i = 0; i < count; i++) fs.writeFileSync(path.join(t.worktree, 'scratch', `${i}.txt`), 'old'); fs.utimesSync(path.join(t.worktree, 'scratch'), 1700000000, 1700000000); };
+  const changed = f.spawn('changed'); fill(changed); f.guest(changed);
+  let r = f.call(['finish', changed.id]); assert.equal(r.code, 0, r.out);
+  const before = fs.statSync(path.join(changed.worktree, 'scratch'));
+  fs.writeFileSync(path.join(changed.worktree, 'scratch', '0.txt'), 'new');
+  fs.utimesSync(path.join(changed.worktree, 'scratch'), before.atime, before.mtime);
+  f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out);
+  assert.ok(fs.existsSync(changed.worktree), 'An existing ignored file changed after finish must keep the copy');
+  assert.match(r.out, /work written since finish.*scratch/);
+  r = f.call(['finish', changed.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(changed.worktree));
+  r = f.call(['finish', changed.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(changed.worktree));
+
+  const untouched = f.spawn('untouched'); fill(untouched); f.guest(untouched);
+  const start = performance.now(), snapshot = snapshotCopy(untouched.worktree), elapsed = performance.now() - start;
+  console.log(`ignored walk: ${count} files, ${elapsed.toFixed(1)} ms, ${JSON.stringify(snapshot).length} stored bytes`);
+  assert.equal(snapshot.ignored['scratch/'].files, count); assert.equal(snapshot.incomplete, null);
+  assert.ok(JSON.stringify(snapshot).length < 2000, 'The stored fingerprint is bounded independently of file count');
+  r = f.call(['finish', untouched.id]); assert.equal(r.code, 0, r.out);
+  f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(untouched.worktree), r.out);
+
+  const uncertain = f.spawn('uncertain'); fill(uncertain); f.guest(uncertain);
+  assert.match(snapshotCopy(uncertain.worktree, { budgetMs: 0 }).incomplete, /time budget/);
+  const lstat = fs.lstatSync;
+  try {
+    fs.lstatSync = (file, ...args) => { if (String(file).endsWith(`${path.sep}0.txt`)) throw Object.assign(new Error('denied'), { code: 'EACCES' }); return lstat(file, ...args); };
+    assert.match(snapshotCopy(uncertain.worktree).incomplete, /could not read.*0\.txt/);
+  } finally { fs.lstatSync = lstat; }
+  r = f.call(['finish', uncertain.id]); assert.equal(r.code, 0, r.out); f.leave();
+  const saved = f.task(uncertain.id); saved.copyToReturn.left.incomplete = 'ignored walk exceeded its time budget'; f.save(saved);
+  r = f.call(['start']); assert.ok(fs.existsSync(uncertain.worktree)); assert.match(r.out, /time budget/);
+  delete saved.copyToReturn.left.ignoredVersion; delete saved.copyToReturn.left.incomplete; f.save(saved);
+  r = f.call(['start']); assert.ok(fs.existsSync(uncertain.worktree)); assert.match(r.out, /older snapshot/);
+  assert.equal(f.call(['finish', uncertain.id, '--force']).code, 0);
+};
+
 try {
+  const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
+  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
+  if (!onlyGaps) {
   // Status uses spawn time (creation while preparing), freezes settled tasks, and formats
   // elapsed time without contacting Core or depending on the wall clock.
   {
@@ -1189,6 +1248,7 @@ if (a[0] === '--version') process.exit(0);`);
   }
 
   console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery, a repository\'s own delivery workflow), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
