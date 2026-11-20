@@ -244,10 +244,13 @@ Crew has no background process, so the postponed copies are returned at the next
 it (delivery, the legacy treehouse path, or `git worktree remove`), its merged branch is dropped, and one line
 says so. A copy deleted by hand meanwhile is pruned from git and its merged branch dropped. Copies still held
 wait for next time with one summary line; a failed return is reported in one line and never fails the command.
-Since somebody worked in the copy meanwhile, the return checks it again as finish would: uncommitted ship work or
-a `.artifacts/KEEP` marker keeps it waiting with a line that says why (unless finish was forced).
-`crew finish <id> --force` on such a closed task discards that and returns the copy, never while a terminal
-holds it. `crew status --all` lists such a task with who holds its copy; plain `crew status`
+Since somebody worked in the copy meanwhile, finish records what the copy held when it was postponed (changed,
+untracked and ignored files with their times, and the keep marker). The later return keeps the copy waiting,
+with a line that says why, when a file is new or changed since then or a `.artifacts/KEEP` marker appeared, for
+any kind of task. A `--force` given at finish covers only what was there then. `crew finish <id>` on such a
+closed task tries its copy again and says how it stands; `crew finish <id> --force` discards what was found and
+returns the copy, never while a terminal holds it. A Core that does not answer keeps every waiting copy and
+says which. A project keeps its registration while one of its finished tasks still waits for its copy. `crew status --all` lists such a task with who holds its copy; plain `crew status`
 ends with a line counting them.
 
 The refusals that protect work come first and are unchanged: uncommitted ship work, the `.artifacts/KEEP`

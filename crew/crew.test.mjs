@@ -912,7 +912,7 @@ if (a[0] === '--version') process.exit(0);`);
       fs.mkdirSync(path.join(plain.worktree, '.artifacts')); fs.writeFileSync(path.join(plain.worktree, '.artifacts', 'KEEP'), '');
       q = crew2(['spawn', 'other', '--project', 'demo', 'x']); assert.equal(q.code, 0, q.out);
       q = crew2(['finish', 'other']); assert.equal(q.code, 0, q.out);
-      assert.match(q.out, /the working copy of finished task plain waits: it is marked to keep by \.artifacts\/KEEP\. `crew finish plain --force` discards it/);
+      assert.match(q.out, /the working copy of finished task plain waits: it was marked to keep by \.artifacts\/KEEP since finish\. `crew finish plain --force` discards it/);
       assert.ok(fs.existsSync(path.join(plain.worktree, '.artifacts', 'KEEP')) && task2('plain').copyToReturn);
       assert.equal(JSON.parse(crew2(['status', '--all', '--json']).out).tasks.find(t => t.id === 'plain').copyToReturn.why, 'marked to keep');
       // Once the marker is gone the next finish of another task returns plain's copy.
@@ -925,9 +925,9 @@ if (a[0] === '--version') process.exit(0);`);
       // The guest of dirty closes after writing into the copy: start keeps the copy and its work.
       setWorld(v => { delete v.terminals.guest2; });
       fs.writeFileSync(path.join(dirty.worktree, 'later.txt'), 'new work');
-      q = crew2(['start']); assert.equal(q.code, 0, q.out); assert.match(q.out, /the working copy of finished task dirty waits: it has uncommitted work \(later\.txt\)/);
+      q = crew2(['start']); assert.equal(q.code, 0, q.out); assert.match(q.out, /the working copy of finished task dirty waits: it has work written since finish \(later\.txt\)/);
       assert.ok(fs.existsSync(path.join(dirty.worktree, 'later.txt')) && task2('dirty').copyToReturn, 'Work written after finish is never discarded unasked');
-      assert.match(crew2(['status', '--all']).out, /dirty\tclosed\t.*waits: it has uncommitted work \(later\.txt\) \(crew finish dirty --force discards it\)/);
+      assert.match(crew2(['status', '--all']).out, /dirty\tclosed\t.*waits: it has work written since finish \(later\.txt\) \(crew finish dirty --force discards it\)/);
       assert.equal(JSON.parse(crew2(['status', '--all', '--json']).out).tasks.find(t => t.id === 'dirty').copyToReturn.why, 'uncommitted work');
       // `finish --force` on the closed task is the person's word to discard it, but never while a terminal holds it.
       setWorld(v => { v.terminals.guest3 = { address: 'guest3', state: 'live', labels: {}, status: null, cwd: dirty.worktree }; });
@@ -948,6 +948,45 @@ if (a[0] === '--version') process.exit(0);`);
       q = crew2(['start']); assert.equal(q.code, 0, q.out); assert.match(q.out, /the working copy of finished task byhand was already gone; merged branch feature\/byhand deleted/);
       assert.ok(!git('-C', project, 'worktree', 'list').includes(slash(byhand.worktree)) && !task2('byhand').copyToReturn, 'Its stale entry is pruned');
       assert.equal(git('-C', project, 'branch', '--list', 'feature/byhand').trim(), '');
+      // A --force given at finish covers only what was in the copy then: work written later
+      // stays, and the files it did cover go with the copy once that is free.
+      q = crew2(['spawn', 'forced', '--project', 'demo', '--kind', 'ship', 'x']); assert.equal(q.code, 0, q.out);
+      const forced = task2('forced');
+      setTerminal(forced.terminal, { status: { state: 'working', app: 'a1' } });
+      setWorld(v => { v.terminals.guest6 = { address: 'guest6', state: 'live', labels: {}, status: null, cwd: forced.worktree }; });
+      fs.writeFileSync(path.join(forced.worktree, 'half.txt'), 'covered by --force');
+      q = crew2(['finish', 'forced', '--force']); assert.equal(q.code, 0, q.out); assert.match(q.out, /finished forced \(cancelled; terminal ended\); its working copy is kept for now/);
+      fs.writeFileSync(path.join(forced.worktree, 'later.txt'), 'written after finish');
+      setWorld(v => { delete v.terminals.guest6; });
+      q = crew2(['start']); assert.equal(q.code, 0, q.out); assert.match(q.out, /the working copy of finished task forced waits: it has work written since finish \(later\.txt\)/);
+      assert.ok(fs.existsSync(path.join(forced.worktree, 'later.txt')), 'A --force given at finish never discards later work');
+      fs.writeFileSync(path.join(forced.worktree, 'half.txt'), 'changed after finish');
+      q = crew2(['start']); assert.match(q.out, /forced waits: it has work written since finish \(half\.txt, later\.txt\)/, 'A covered file changed later counts as new work');
+      fs.rmSync(path.join(forced.worktree, 'later.txt')); fs.rmSync(path.join(forced.worktree, 'half.txt'));
+      // An ignored file goes with the copy too, so one written since finish keeps it as well.
+      const exclude = path.join(project, '.git', 'info', 'exclude'); fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, '\nscratch/\n');
+      fs.mkdirSync(path.join(forced.worktree, 'scratch')); fs.writeFileSync(path.join(forced.worktree, 'scratch', 'notes.md'), 'mine');
+      q = crew2(['start']); assert.match(q.out, /forced waits: it has work written since finish \(scratch\/\)/); assert.ok(fs.existsSync(path.join(forced.worktree, 'scratch', 'notes.md')));
+      fs.rmSync(path.join(forced.worktree, 'scratch'), { recursive: true });
+      q = crew2(['start']); assert.match(q.out, /returned the working copy of finished task forced/); assert.ok(!fs.existsSync(forced.worktree));
+      // A waiting copy keeps its project, which is needed to hand it back.
+      assert.equal(crew2(['project', 'add', 'side', project]).code, 0);
+      q = crew2(['spawn', 'retry', '--project', 'side', '--kind', 'ship', 'x']); assert.equal(q.code, 0, q.out);
+      const retry = task2('retry');
+      setWorld(v => { v.terminals.guest5 = { address: 'guest5', state: 'live', labels: {}, status: null, cwd: retry.worktree }; });
+      q = crew2(['finish', 'retry']); assert.equal(q.code, 0, q.out); assert.match(q.out, /kept for now/);
+      q = crew2(['project', 'remove', 'side']); assert.equal(q.code, 2, q.out); assert.match(q.out, /Project side still has working copies of finished tasks to return: retry/);
+      // A silent Core during the sweep keeps everything and still says which copies wait.
+      setWorld(v => { v.silentLs = true; });
+      q = crew2(['start']); assert.equal(q.code, 0, q.out); assert.match(q.out, /Core did not answer about the terminals in the working copies of finished tasks; 1 copy waits to be returned and was kept \(retry\)/);
+      setWorld(v => { delete v.silentLs; });
+      assert.ok(fs.existsSync(retry.worktree));
+      // Asking again for a closed task whose copy is now free returns it, without --force.
+      q = crew2(['finish', 'retry']); assert.equal(q.code, 0, q.out); assert.match(q.out, /retry is already closed; its working copy still waits to be returned: the working copy of retry is still held by guest5/);
+      setWorld(v => { delete v.terminals.guest5; });
+      q = crew2(['finish', 'retry']); assert.equal(q.code, 0, q.out); assert.match(q.out, /retry is already closed; returned the working copy of finished task retry/);
+      assert.ok(!fs.existsSync(retry.worktree) && !task2('retry').copyToReturn);
+      assert.equal(crew2(['project', 'remove', 'side']).code, 0);
     }
     // A rule, a role, and nobody left.
     q = crew2(['spawn', 'ruled', '--project', 'demo', '--rule', '1', 'Rename x.']); assert.equal(q.code, 0, q.out);
