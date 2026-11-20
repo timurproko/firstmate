@@ -1466,10 +1466,10 @@ function commitsOnlyInCopy(folder, before) {
 // is new or changed since finish's snapshot, or a keep marker that was not there then. Only
 // `crew finish <id> --force` on the closed task discards that. { kept, leftovers }: `kept`
 // says why it waits (or null), `leftovers` that finish's accepted files are still there.
-function checkWaitingCopy(task) {
-  const seen = snapshotCopy(task.worktree), before = task.copyToReturn.left ?? { files: {}, keep: null };
+function checkWaitingCopy(task, before = task.copyToReturn?.left) {
+  const seen = snapshotCopy(task.worktree);
   if (!seen) return { kept: { why: 'uncommitted work', text: 'it could not be checked for work written since finish' }, leftovers: false };
-  const uncertain = !task.copyToReturn.left ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
+  const uncertain = !before ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
   if (uncertain) return { kept: { why: 'uncommitted work', text: `changes cannot be determined: ${uncertain}` }, leftovers: true };
   if (seen.keep !== null && seen.keep !== before.keep) return { kept: { why: 'marked to keep', text: 'it was marked to keep by .artifacts/KEEP since finish' }, leftovers: true };
   const ignored = new Set([...Object.keys(before.ignored ?? {}), ...Object.keys(seen.ignored)]);
@@ -1525,11 +1525,14 @@ function removeStoppedTerminal(task) {
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
 function returnWaiting(h, task, { force = false } = {}) {
   const { copyToReturn, ...rest } = task, project = projectOf(h, task);
+  // A new explicit force accepts what is here now, not work written during the stop/removal
+  // it is about to retry. Keep the original durable baseline if more work appears meanwhile.
+  const accepted = force ? snapshotCopy(task.worktree) : copyToReturn.left;
   if (copyToReturn.stopPending) {
     // The stop was requested but not confirmed. Reapply idle/busy protection before any
     // further lifecycle action; uncertainty never grants permission to discard the copy.
     try {
-      const result = stopWorker(task);
+      const result = stopWorker(task, { force });
       if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
       copyToReturn.stopPending = false;
       saveTask(h, task);
@@ -1552,7 +1555,7 @@ function returnWaiting(h, task, { force = false } = {}) {
   const holders = otherTerminalsIn(task.worktree, task.terminal);
   if (holders === null) return { state: 'silent', line: `${CORE_SILENT} the terminals in ${task.worktree}; the working copy of ${task.id} was kept. Try again.` };
   if (holders.length) return { state: 'held', line: `the working copy of ${task.id} is still held by ${describeHolders(holders, task.worktree)}; nothing was removed.` };
-  const check = force ? { kept: null, leftovers: true } : checkWaitingCopy(task);
+  const check = checkWaitingCopy(task, accepted);
   if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. \`crew finish ${task.id} --force\` discards it and returns the copy.` };
   // What is left was accepted at finish (or now): discarding it is what was asked.
   const back = returnCopy(task, project, { force: check.leftovers });
@@ -1609,13 +1612,13 @@ function cmdFinish(args) {
   saveTask(h, waiting);
   const cleanup = result.stopped ? removeStoppedTerminal(task) : { text: `its worker stop is not confirmed (${result.how})` };
   waiting.copyToReturn.cleanupTerminal = Boolean(cleanup);
-  // Only after the stop can we know whether the worker wrote more while leaving. Never
-  // refuse here with a dead worker: postpone return and keep the pre-stop snapshot instead.
-  const after = force ? { dirty: [], keep: false } : workInCopy(task);
-  let reason = cleanup?.text ?? (after.dirty === null ? 'uncommitted work could not be checked after stopping' : after.dirty.length ? `uncommitted work written while stopping (${listFiles(after.dirty)})` : after.keep ? 'it was marked to keep while stopping' : null);
   const holders = cleanup ? null : fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
-  reason ??= holders === null ? 'Core did not say which terminals are in it' : holders.length ? `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it` : null;
-  reason ??= !left ? 'work written since finish could not be recorded' : left.incomplete;
+  let reason = cleanup?.text ?? (holders === null ? 'Core did not say which terminals are in it' : holders.length ? `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it` : null);
+  // Only after stopping and removing the terminal can we compare everything written while
+  // leaving, including ignored files and scout scratch. Even force accepted only the pre-stop
+  // contents. If anything changed, postpone return with the original baseline, never refuse
+  // with a dead worker or silently extend permission to discard the worker's final writes.
+  reason ??= checkWaitingCopy(waiting).kept?.text ?? null;
   const back = reason ? null : returnCopy(task, project, { force });
   reason ??= back && !back.ok ? back.why : null;
   forget();
@@ -1985,15 +1988,17 @@ function cmdStatus(args) {
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
   // A workflow task's stage is what its last report said it is; GitHub is not asked here.
   const stageOf = t => (!t.stage ? '' : t.stage === 'plan' && t.state === 'reported' ? ' (plan awaiting approval)' : ` (${t.stage})`);
-  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.pending ? `waits: ${t.copyToReturn.pending}${t.copyToReturn.heldBy ? `; held by ${t.copyToReturn.heldBy}` : ''}` : t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
   if (waiting) console.log(`${waiting} working ${waiting === 1 ? 'copy' : 'copies'} of finished tasks still to be returned (crew status --all)`);
 }
 // Where a postponed copy stands now, asked of Core: { worktree, since, heldBy, free }.
 function copyWaiting(task) {
   const holders = fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
-  const free = Array.isArray(holders) && !holders.length, kept = free && fs.existsSync(task.worktree) ? checkWaitingCopy(task).kept : null;
-  const why = holders === null ? 'unknown' : holders.length ? 'held' : kept ? kept.why : 'free';
-  return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, free: why === 'free' };
+  const { stopPending, cleanupTerminal } = task.copyToReturn;
+  const pending = stopPending ? 'its worker stop is not confirmed' : cleanupTerminal ? 'its worker terminal removal is not confirmed' : null;
+  const free = !pending && Array.isArray(holders) && !holders.length, kept = free && fs.existsSync(task.worktree) ? checkWaitingCopy(task).kept : null;
+  const why = stopPending ? 'stop pending' : cleanupTerminal ? 'terminal removal pending' : holders === null ? 'unknown' : holders.length ? 'held' : kept ? kept.why : 'free';
+  return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, pending, free: why === 'free' };
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,

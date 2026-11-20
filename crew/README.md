@@ -312,17 +312,21 @@ a `.artifacts/KEEP` marker appeared, a
 rebase, merge, cherry-pick, revert, bisect or `git worktree lock` began there, or the copy's HEAD reached a
 commit that no branch or tag holds (its own reflog is read, so moving back does not hide it), for any kind of
 task. Stashes and branches made in the copy live in the repository and outlive it. A `--force` given at finish covers only what was there then. `crew finish <id>` on such a
-closed task tries its copy again and says how it stands; `crew finish <id> --force` discards what was found and
-returns the copy, never while a terminal holds it. A Core that does not answer keeps every waiting copy and
+closed task tries its copy again and says how it stands. `crew finish <id> --force` accepts what
+is there now and can cancel a still-busy worker whose stop was pending, but never another
+terminal. It compares again after any retried stop/removal; newer writes keep waiting.
+Automatic retries never inherit an earlier `--force`. A Core that does not answer keeps every waiting copy and
 says which. A project keeps its registration while a finished task waits for its copy.
 `crew status --all` shows holders, new work, keep/history protections, a free copy, or an
-unanswered Core query; reading status never returns a copy. JSON's `copyToReturn` has `why`,
-`kept` and `free`. Plain status ends with a count of waiting copies.
+unanswered Core query. Unconfirmed worker stops and terminal removals are shown as pending,
+never free; reading status never returns a copy. JSON's `copyToReturn` has `why`, `kept`,
+`pending` and `free`. Plain status ends with a count of waiting copies.
 
 Protective refusals come before stopping: uncommitted ship work, a failed work inspection,
 `.artifacts/KEEP`, a busy worker without `--force`, or an unanswered initial Core query leave
-the worker and copy intact. Work and the keep marker are checked again after stopping; work
-written while leaving postpones return rather than refusing with the worker gone. A silent
+the worker and copy intact. Before immediate return, the whole snapshot is compared after
+stopping and terminal removal, including ignored files and scout scratch, even with `--force`.
+Work written while leaving postpones return rather than refusing with the worker gone. A silent
 second terminal listing, unconfirmed stop or terminal removal, or failed return also leaves a closed
 task with its copy waiting. The next finish or start retries safely, as the output says.
 

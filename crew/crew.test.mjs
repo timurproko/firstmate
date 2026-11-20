@@ -236,6 +236,70 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
 };
 
+gapTests['review-stop-race'] = () => {
+  const f = gapFixture('review-race'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const lost = [];
+  for (const [id, flags, file, closed] of [
+    ['ship-ignored', ['--kind', 'ship'], 'scratch/late.txt', false],
+    ['scout-scratch', [], 'late.txt', false],
+    ['forced-ship', ['--kind', 'ship', '--force'], 'late.txt', false],
+    ['forced-scout', ['--force'], 'scratch/late.txt', false],
+    ['closed-force', ['--force'], 'late.txt', true],
+    ['closed-normal', [], 'late.txt', true],
+  ]) {
+    const force = flags.includes('--force'), t = f.spawn(id, flags.filter(flag => flag !== '--force'));
+    if (file.startsWith('scratch/')) { fs.mkdirSync(path.join(t.worktree, 'scratch')); fs.writeFileSync(path.join(t.worktree, 'scratch', 'before.txt'), 'accepted'); }
+    if (force && !closed) setTerminal(t.terminal, { status: { state: 'working', app: t.agent } });
+    if (closed) f.save({ ...t, state: 'closed', closed: new Date().toISOString(), copyToReturn: { since: new Date().toISOString(), left: snapshotCopy(t.worktree), cleanupTerminal: true } });
+    const late = path.join(t.worktree, file); patch({ writeOnKill: late });
+    let r = f.call(['finish', id, ...(force ? ['--force'] : [])]); patch({ writeOnKill: null });
+    assert.equal(r.code, 0, r.out);
+    if (!fs.existsSync(late)) { lost.push(`${id}: work written while stopping was deleted`); continue; }
+    assert.equal(f.task(id).state, 'closed'); assert.ok(f.task(id).copyToReturn, r.out);
+    assert.match(r.out, /work written since finish/);
+    r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(late), 'Automatic sweeps do not inherit the original force');
+    r = f.call(['finish', id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(late), 'A normal retry still protects late work');
+    assert.equal(f.call(['finish', id, '--force']).code, 0); assert.ok(!fs.existsSync(t.worktree), 'Only a new explicit forced finish accepts the late work');
+  }
+  assert.deepEqual(lost, [], 'Every initial and resumed finish compares the post-stop copy, even with force');
+};
+
+gapTests['review-force-retry'] = () => {
+  const f = gapFixture('review-force'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const t = f.spawn('pending'); setTerminal(t.terminal, { status: { state: 'working', app: t.agent } }); patch({ unkillable: true });
+  let r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(f.task(t.id).copyToReturn.stopPending);
+  patch({ unkillable: false }); const before = readWorld().log.length;
+  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.equal(readWorld().terminals[t.terminal].state, 'live');
+  assert.ok(!readWorld().log.slice(before).some(a => a[0] === 'kill'), 'Automatic retries do not force a busy worker');
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.ok(!readWorld().terminals[t.terminal] && !fs.existsSync(t.worktree), 'An explicitly forced retry cancels and returns the pending copy');
+  const writing = f.spawn('pending-write'); setTerminal(writing.terminal, { status: { state: 'working', app: writing.agent } }); patch({ unkillable: true });
+  assert.equal(f.call(['finish', writing.id, '--force']).code, 0);
+  const late = path.join(writing.worktree, 'late.txt'); patch({ unkillable: false, writeOnKill: late });
+  r = f.call(['finish', writing.id, '--force']); patch({ writeOnKill: null }); assert.equal(r.code, 0, r.out);
+  assert.ok(fs.existsSync(late) && f.task(writing.id).copyToReturn, 'A forced stop retry also protects work written during its own cancellation');
+  assert.equal(f.call(['finish', writing.id, '--force']).code, 0); assert.ok(!fs.existsSync(writing.worktree));
+};
+
+gapTests['review-pending-status'] = () => {
+  const f = gapFixture('review-status'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const t = f.spawn('pending'); setTerminal(t.terminal, { status: { state: 'working', app: t.agent } }); patch({ unkillable: true });
+  let r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); patch({ unkillable: false });
+  const assertPending = (task, why, text) => {
+    const before = readWorld().log.length;
+    const shown = JSON.parse(f.call(['status', '--all', '--json']).out).tasks.find(s => s.id === task.id).copyToReturn;
+    assert.equal(shown.free, false, 'A pending lifecycle confirmation must not be presented as a free copy');
+    assert.equal(shown.why, why); assert.match(shown.pending, text);
+    const line = f.call(['status', '--all']).out.split(/\r?\n/).find(line => line.startsWith(`${task.id}\t`));
+    assert.match(line, text); assert.ok(!line.includes('free now') && !line.includes('--force discards it'), line);
+    assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])), 'Status is observational only');
+  };
+  assertPending(t, 'stop pending', /worker stop is not confirmed/);
+  const removal = f.spawn('removal'); patch({ failRm: true }); r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out);
+  assertPending(removal, 'terminal removal pending', /worker terminal removal is not confirmed/);
+  patch({ failRm: false }); assert.equal(f.call(['finish', t.id, '--force']).code, 0); assert.equal(f.call(['finish', removal.id]).code, 0);
+};
+
 gapTests.status = () => {
   const f = gapFixture('delivery'), ship = f.spawn('ship', ['--kind', 'ship']), scout = f.spawn('scout');
   for (const [fields, expected] of [[{}, 'plain'], [{ workflow: 'delivery' }, 'workflow'], [{ gate: 'no-mistakes', workflow: 'delivery' }, 'gate']]) {
