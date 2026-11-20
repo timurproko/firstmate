@@ -34,8 +34,11 @@ crew init [folder]                       create a crew home (default ~/.crew)
 crew project add <name> <git folder>     register a project   (crew project list)
 crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session
-crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [--agent a1|pi|claude] "<task>"
-crew wait <id>... [--timeout seconds]    block until each worker reports
+crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
+    who: [--agent a1|pi|claude] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]
+crew agents [--role scout|ship|review|fix] [who] [--json]   who would do the work now: profiles, quota, fallback order
+crew relaunch <id> [who] ["<why>"]       hand unfinished work to another agent in the same working copy
+crew wait <id>... [--timeout seconds] [--no-fallback]   block until each worker reports; one that ran out of quota is replaced
 crew status [--all] [--json]             tasks and their terminals
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
@@ -43,9 +46,9 @@ crew done [<id>]                         (worker) my report is written
 crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
-crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
+crew review <id> [who]                   start a reviewer on a ship task's branch
 crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
-crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
+crew fix [who] "<problem>"               start a worker that repairs crew itself
 crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
 crew update | crew rollback              bring this machine's crew up to date, or back one step
 ```
@@ -80,6 +83,59 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
 
 Adding one is a line in `AGENTS` in `crew.mjs`.
 
+## Who does the work
+
+Firstmate's model is kept, in its own file and format: `<home>/config/crew-dispatch.json`.
+A *profile* names the agent program and optionally its model and effort; `default` is an
+ordered list of them, `rules` pair a description of a kind of work with the profiles to use
+for it, `shared_quota: true` turns quota reading off. Crew adds two things for a machine with
+several logins: `roles` (a list per `scout`, `ship`, `review`, `fix`), and `account` on a
+Claude profile.
+
+```json
+{
+  "default": [
+    { "harness": "a1", "model": "openai-codex/gpt-x", "effort": "high" },
+    { "harness": "a1", "model": "github-copilot/gpt-x" },
+    { "harness": "claude", "model": "opus" }
+  ],
+  "roles": { "review": [{ "harness": "claude", "model": "sonnet", "account": "me@example.com" }] },
+  "rules": [{ "when": "A small mechanical edit", "use": { "harness": "claude", "model": "haiku", "effort": "low" } }]
+}
+```
+
+- **A1 and Pi** choose their login with the model: `<provider>/<id>` is started as
+  `--provider <provider> --model <id>`, so Codex and Copilot are two profiles of the same agent.
+- **Claude accounts** are the logins saved by the account-switcher plugin (asked from its
+  `session-dir.js list`; `CREW_CLAUDE_ACCOUNTS` names them on a machine without it). A profile
+  with `account` is started through the plugin's launcher as that account. A Claude profile
+  without one stands for every saved account, each a candidate of its own, with
+  `CREW_CLAUDE_ACCOUNT` (what Herdr's account choice sets) first.
+- **The list is a fallback chain, in the person's order.** The order is never rearranged; a
+  candidate is only passed over for a known reason: its quota is used up, its login is no
+  longer accepted, or its program is not installed. A quota that could not be read is
+  uncertainty, not an empty account, and the candidate stays. What the command line names
+  (`--agent`, `--model`, `--effort`, `--account`, or `--rule <n>`) goes first and the
+  configured list stands behind it; `--no-fallback` keeps only that. Without the file, crew
+  starts `a1` as it always did.
+- **Quota** comes from quota-axi as it is. One ordinary reading covers the candidates that
+  spend from the machine's own logins (A1's are found through `PI_CODING_AGENT_DIR`). For each
+  saved Claude account the plugin's helper writes that account's current login into an empty
+  temporary folder (`session-dir.js refresh <account> --into <folder>`, which also rotates
+  tokens that are about to expire, under the plugin's lock), quota-axi reads exactly that
+  folder (`CLAUDE_CONFIG_DIR=<folder> quota-axi --provider claude --profile-only --json`), and
+  the folder is removed. With a single candidate nothing is read.
+- **While work is under way.** `crew wait` looks at a worker that is no longer working: when
+  the last lines of its screen say it stopped on a limit or a lost login, the next candidate
+  of the task's chain is started in the same working copy and told to go on from what is
+  there (`git status`, `git log`, the report). The task keeps its id; its record holds
+  `launch` (who works now), `chain` (who is left) and `fallbacks` (who stopped, and why).
+  `crew relaunch <id>` does the same by hand. Only when nobody is left does the wait end with
+  "needs a person", and a spawn with "Nobody can take this work now", each with the reason
+  per candidate.
+- `crew agents` shows the list as it stands, with every candidate's quota; `crew status`
+  shows who works on each task.
+
 ## Delivering a code change
 
 A ship task ends with commits on branch `<type>/<id>`. From there:
@@ -104,7 +160,8 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 | --- | --- |
 | `gh` | `crew land` opens the pull request with it. |
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
-| `lavish-axi`, `quota-axi` | The coordinator's rules say when to use them: showing a decision or long report as a page; checking which agent has room before a batch. |
+| `lavish-axi` | The coordinator's rules say when to use it: showing a decision or long report as a page. |
+| `quota-axi` | Crew reads it, unchanged, when it chooses who works (see "Who does the work"): one ordinary reading for the machine's own logins, and one `--profile-only` reading per saved Claude account. |
 | `tasks-axi` | `crew backlog <tasks-axi command…>` keeps the durable list of work in `<home>/backlog.md`. A task with the same id as a backlog item moves it: In flight at spawn, Done at `land` (ship, with the pull request) or `finish` (scout). Reading is open to any session; changes are the owner's. |
 | `delivery` | The shared delivery workflow's command. `crew spawn` asks it for the task's copy (`delivery start <type>/<id> --json`, or `--detach <id>` for a scout) and `crew finish` hands the copy back (`delivery finish <copy> --force`, after crew's own refusal of unsaved ship work and of a keep marker). The copy is cut from the project's published default branch. Whether copies are pooled is one setting of the machine, `delivery pool`. |
 | `treehouse` | The pool `delivery` takes reused copies from. Crew does not call it for new tasks; the `--treehouse` option of `crew project add` is accepted and ignored. |

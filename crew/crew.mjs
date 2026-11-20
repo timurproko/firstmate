@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.8.0';
+export const VERSION = '0.9.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -241,11 +241,12 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 2. Run \`crew status\` to see work left by an earlier session and finish it by the book.
 
 ## One task
-1. \`crew spawn <id> --project <name> --kind scout|ship --agent a1 "<task for the worker>"\`
+1. \`crew spawn <id> --project <name> --kind scout|ship "<task for the worker>"\`
    - \`scout\`: read-only investigation, ends with a written report.
    - \`ship\`: changes code on a branch of its own, \`<type>/<id>\`. Say what the work is with
      \`--type feature|fix|refactor|docs|test|chore|style\` (default \`feature\`).
    - Independent tasks may be spawned one after another without waiting; they run together.
+   - Who does it is crew's choice unless the person said otherwise: see "Who does the work".
 2. \`crew wait <id> [<id>...]\` blocks until each worker reports (or fails). It prints the reports.
 3. Tell the person the result in your own words. Do not paste the whole report unless asked.
 4. \`crew finish <id>\` stops the worker and removes its terminal and working copy.
@@ -254,7 +255,7 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 
 ## Code changes (ship tasks)
 1. After the worker reported, have the change checked unless it is trivial:
-   \`crew review <id>\` starts a reviewer (\`--agent\` picks another agent for a second opinion);
+   \`crew review <id>\` starts a reviewer (\`--agent\`, \`--model\` or \`--account\` picks another one for a second opinion);
    \`crew wait <id>-review\`. Its report starts with \`APPROVE\` or \`CHANGES NEEDED\`.
 2. On \`CHANGES NEEDED\`: \`crew tell <id> "<the defects, as the reviewer wrote them>"\`, then
    \`crew wait <id>\` and review again. After two rounds that still fail, tell the person.
@@ -264,8 +265,27 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 - \`crew tell <id> "<message>"\` is also how you answer a worker's question or correct its
   course; the worker reports again when it has dealt with it.
 
+## Who does the work
+The person's agents, models and accounts are in \`config/crew-dispatch.json\` of this home, as an
+ordered list: the first that has quota and a working login takes the task, the others stand
+behind it. Crew reads the quota itself (quota-axi, each saved Claude account separately).
+- \`crew agents\` shows the list as it stands now, with quota, and its numbered rules.
+  \`crew agents --role ship|review|fix\` shows it for that kind of work.
+- Say nothing and crew chooses. When a rule's \`when\` describes the task, add \`--rule <n>\`.
+- When the person names an agent, model or account, pass it: \`--agent a1|pi|claude\`,
+  \`--model <id>\` (for a1 and pi \`<provider>/<id>\`, e.g. \`github-copilot/...\`, which chooses the
+  login), \`--effort <level>\`, \`--account <claude account>\`. The list still stands behind that
+  choice; \`--no-fallback\` only when the person wants that one and nothing else.
+- A worker that runs out of quota or loses its login is not a failure: \`crew wait\` hands its
+  task to the next in the list, in the same working copy, and keeps waiting. It says so in a
+  line; pass that on to the person. \`crew relaunch <id> [--agent ...]\` does the same by hand.
+- "Nobody can take this work now" lists why for each candidate. Tell the person exactly that;
+  do not retry in a loop.
+
 ## Rules
 - Never work in a worker's copy yourself and never edit a project directly.
+- When the person has you do a piece of work yourself, follow the shared delivery workflow
+  (the \`change-delivery\` skill) for your working copy, as workers do.
 - \`crew wait\` saying a worker needs a person: tell the person which terminal is waiting and
   why; do not finish it. Wait again once they have answered.
 - A worker that failed or went quiet: read \`crew status\`, look at its terminal with
@@ -281,8 +301,8 @@ is required. For any of them, read its \`--help\` before the first use instead o
   \`crew backlog ready\` shows what can be started. Give a task the same id as its backlog
   item and crew moves the item itself: In flight at spawn, Done at land (ship) or finish
   (scout). A decision that waits for the person: \`crew backlog hold <id> --reason "<why>"\`.
-- **Quota** (\`quota-axi\`): before starting several workers at once, run \`quota-axi\` and give
-  the work to an agent whose account has room (\`--agent\`). Skip it for a single small task.
+- **Quota** (\`quota-axi\`): crew reads it when it chooses who works; \`crew agents\` shows the result.
+  You do not need to run it yourself.
 - **GitHub** (\`gh-axi\`): read issues, pull requests and checks with it. \`crew land\` opens
   pull requests itself.
 - **Browser** (\`chrome-devtools-axi\`): for looking at a web page. Workers are told about it.
@@ -437,22 +457,267 @@ function bashProgram() {
   return candidates.find(p => fs.existsSync(p)) ?? refuse('Git Bash was not found; set CREW_BASH to bash.exe.', 4);
 }
 
-// The shell words that start an agent with one instruction. For Claude Code a saved account
-// can be chosen with CREW_CLAUDE_ACCOUNT (set by the Herdr plugin, or by hand): the worker is
-// then started through the account-switcher launcher as that account, exactly as the
-// person's own `claude` wrapper does plus `--as`. Without the variable, or without that
-// launcher on the machine, plain `claude` runs (the wrapper's default account).
-export function agentCommand(name, agent, instruction, env = process.env) {
-  const plain = [agent.command, instruction, ...(agent.args ?? [])].map(shq).join(' ');
-  const account = name === 'claude' ? String(env.CREW_CLAUDE_ACCOUNT ?? '').trim() : '';
+// The shell words that start an agent with one instruction. `pick` is what was chosen for this
+// worker (see "who does the work" below): a model, an effort, and for Claude Code a saved
+// account. A1 and Pi take a model as provider/id, which is how one of their logins is chosen
+// (openai-codex/..., github-copilot/...). A Claude account starts the worker through the
+// account-switcher launcher as that account, exactly as the person's own `claude` wrapper
+// does plus `--as`. CREW_CLAUDE_ACCOUNT (set by the Herdr plugin, or by hand) is the account
+// when none was chosen; only for that unchosen default does a machine without the launcher
+// fall back to plain `claude`. A chosen account that cannot be used is refused instead.
+const EFFORT_FLAG = { claude: '--effort', a1: '--thinking', pi: '--thinking' };
+const ACCOUNT = /^[A-Za-z0-9._@+-]{1,100}$/;
+const claudeLauncher = env => env.CREW_CLAUDE_LAUNCHER || path.join(os.homedir(), '.claude', 'plugins-local', 'account-switcher', 'bin', 'claude-as.sh');
+export function agentCommand(name, agent, instruction, env = process.env, pick = {}) {
+  const tune = [];
+  if (pick.model) {
+    const cut = name === 'claude' ? -1 : pick.model.indexOf('/');
+    tune.push(...(cut > 0 ? ['--provider', pick.model.slice(0, cut), '--model', pick.model.slice(cut + 1)] : ['--model', pick.model]));
+  }
+  if (pick.effort) tune.push(EFFORT_FLAG[name], pick.effort);
+  // Claude Code reads a prompt placed after --allowedTools as one more tool name, so its
+  // options follow the instruction; A1 and Pi take theirs before it.
+  const words = name === 'claude' ? [instruction, ...tune, ...(agent.args ?? [])] : [...tune, instruction, ...(agent.args ?? [])];
+  const plain = [agent.command, ...words].map(shq).join(' ');
+  const account = name === 'claude' ? String(pick.account ?? env.CREW_CLAUDE_ACCOUNT ?? '').trim() : '';
   if (!account) return plain;
-  if (!/^[A-Za-z0-9._@+-]{1,100}$/.test(account)) refuse(`Not an account name: ${account}`);
-  const launcher = env.CREW_CLAUDE_LAUNCHER || path.join(os.homedir(), '.claude', 'plugins-local', 'account-switcher', 'bin', 'claude-as.sh');
+  if (!ACCOUNT.test(account)) refuse(`Not an account name: ${account}`);
+  const launcher = claudeLauncher(env);
   if (!fs.existsSync(launcher)) {
+    if (pick.account) refuse(`Claude Code cannot be started as ${account}: the account launcher is not on this machine (${slash(launcher)}).`, 4);
     console.error(`crew: CREW_CLAUDE_ACCOUNT is set, but the account launcher is not on this machine (${slash(launcher)}); starting Claude Code on its default account.`);
     return plain;
   }
-  return `bash --noprofile --norc ${shq(bashPath(launcher))} --as ${shq(account)} --command "$(type -P claude || type -P claude.exe)" -- ${[instruction, ...(agent.args ?? [])].map(shq).join(' ')}`;
+  return `bash --noprofile --norc ${shq(bashPath(launcher))} --as ${shq(account)} --command "$(type -P claude || type -P claude.exe)" -- ${words.map(shq).join(' ')}`;
+}
+
+// --- who does the work ----------------------------------------------------------------
+// Firstmate's model, kept: a *profile* names the agent program, and optionally its model and
+// effort ({ "harness": "a1", "model": "openai-codex/gpt-x", "effort": "high" }), and
+// <home>/config/crew-dispatch.json lists them: `default` is an ordered array, `rules` pair a
+// description of a kind of work (`when`) with the profiles to `use` for it, `shared_quota`
+// turns quota reading off. Added for crew: `roles` (an array per scout, ship, review, fix),
+// and `account` on a Claude profile, a login saved by the account-switcher plugin. A Claude
+// profile without one stands for every saved account, each a candidate of its own.
+// The resulting ordered list is a fallback chain. Before a worker starts, candidates whose
+// quota is used up or whose login is gone are passed over; when a running worker stops on a
+// limit or a lost login, `crew wait` hands its task to the next one (see relaunch). Work
+// stops only when nobody in the chain can take it, and then crew says why for each.
+const WORD = /^[A-Za-z0-9][A-Za-z0-9._@+:/-]{0,119}$/;
+const QUOTA_FAMILY = { 'openai-codex': 'codex', openai: 'codex', 'github-copilot': 'copilot', anthropic: 'claude', xai: 'grok', zai: 'zai' };
+const ROLES = ['scout', 'ship', 'review', 'fix'];
+const PICK_FLAGS = ['agent', 'model', 'effort', 'account', 'rule'];
+export const pickLabel = c => [c.harness, c.model, c.effort && `(${c.effort})`, c.account && `as ${c.account}`].filter(Boolean).join(' ');
+const pickKey = c => [c.harness, c.model ?? '', c.account ?? ''].join('|');
+
+// Arguments of a command: `--name value` for the names in `valued`, bare `--name` for those in
+// `bools`. Any other lone --word is refused instead of quietly becoming part of a task text.
+function takeFlags(args, valued, bools = []) {
+  const flags = {}, rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const m = /^--([a-z][a-z0-9-]*)$/.exec(args[i]);
+    if (!m) rest.push(args[i]);
+    else if (bools.includes(m[1])) flags[m[1]] = true;
+    else if (!valued.includes(m[1])) refuse(`Unknown option: ${args[i]}`);
+    else if (args[i + 1] === undefined || /^--[a-z]/.test(args[i + 1])) refuse(`${args[i]} needs a value.`);
+    else flags[m[1]] = args[++i];
+  }
+  return { flags, rest };
+}
+
+export function cleanProfile(raw, where = '') {
+  const at = where ? `${where}: ` : '', p = typeof raw === 'string' ? { harness: raw } : raw;
+  if (!p || typeof p !== 'object' || Array.isArray(p)) refuse(`${at}not a profile ({ "harness": "a1", "model": ..., "effort": ..., "account": ... }).`);
+  const harness = p.harness ?? p.agent;
+  if (!AGENTS[harness]) refuse(`${at}Unknown agent: ${harness}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  const out = { harness };
+  for (const key of ['model', 'effort', 'account']) {
+    if (p[key] === undefined || p[key] === null || p[key] === '') continue;
+    if (!(key === 'account' ? ACCOUNT : WORD).test(String(p[key]))) refuse(`${at}Not a usable ${key}: ${p[key]}`);
+    out[key] = String(p[key]);
+  }
+  if (out.account && harness !== 'claude') refuse(`${at}Only Claude Code has saved accounts. ${harness} chooses its login with the model, as in "github-copilot/<id>".`);
+  // Firstmate's optional `provider` is the quota-axi family the profile spends from.
+  if (typeof p.provider === 'string' && WORD.test(p.provider)) out.family = p.provider;
+  return out;
+}
+
+const dispatchFile = h => path.join(h.dir, 'config', 'crew-dispatch.json');
+function dispatchConfig(h) {
+  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [] };
+  if (!fs.existsSync(file)) return none;
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { refuse(`${slash(file)} is not valid JSON (${error.message}). Correct it, or remove it to use the built-in default.`); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) refuse(`${slash(file)} must hold one object.`);
+  const list = (value, where) => (value === undefined || value === null ? [] : Array.isArray(value) ? value : [value]).map((p, i) => cleanProfile(p, `${where}[${i}] in ${slash(file)}`));
+  const unknownRole = Object.keys(raw.roles ?? {}).find(r => !ROLES.includes(r));
+  if (unknownRole) refuse(`${slash(file)}: roles.${unknownRole} is not a role. Roles: ${ROLES.join(', ')}`);
+  return { file, present: true, shared: raw.shared_quota === true, default: list(raw.default, 'default'),
+    roles: Object.fromEntries(Object.entries(raw.roles ?? {}).map(([role, value]) => [role, list(value, `roles.${role}`)])),
+    rules: (Array.isArray(raw.rules) ? raw.rules : []).map((r, i) => ({ when: String(r?.when ?? ''), why: String(r?.why ?? ''), use: list(r?.use, `rules[${i}].use`) })) };
+}
+
+// The Claude logins the account-switcher plugin has saved, asked from its own helper.
+// CREW_CLAUDE_ACCOUNTS (comma-separated) names them instead, for a machine without it.
+function claudeAccounts(env = process.env) {
+  if (env.CREW_CLAUDE_ACCOUNTS !== undefined) return String(env.CREW_CLAUDE_ACCOUNTS).split(',').map(a => a.trim()).filter(a => ACCOUNT.test(a));
+  const launcher = claudeLauncher(env), helper = path.join(path.dirname(launcher), 'session-dir.js');
+  if (!fs.existsSync(launcher) || !fs.existsSync(helper)) return [];
+  const listed = run(process.execPath, [helper, 'list'], { timeout: 20000 });
+  if (listed.code !== 0) return [];
+  return listed.stdout.split(/\r?\n/).map(l => /^\d+\.\s+(\S+)(.*)$/.exec(l.trim())).filter(m => m && !/no saved login/.test(m[2]) && ACCOUNT.test(m[1])).map(m => m[1]);
+}
+
+// The ordered candidates for one piece of work. What the command line names comes first and
+// the configured chain follows it as its fallback; `--no-fallback` keeps only the first.
+// `legacy` is the agent crew used before there was any configuration.
+function workChain(h, role, flags, legacy, env = process.env) {
+  const config = dispatchConfig(h);
+  let base;
+  if (flags.rule !== undefined) {
+    const rule = config.rules[Number(flags.rule) - 1];
+    if (!rule) refuse(`No rule ${flags.rule} in ${slash(config.file)}${config.rules.length ? ` (it has ${config.rules.length}; see \`crew agents\`)` : ' (it has none)'}.`);
+    base = rule.use;
+  } else base = config.roles[role]?.length ? config.roles[role] : config.default;
+  const named = ['agent', 'model', 'effort', 'account'].some(key => flags[key] !== undefined);
+  // --agent starts a clean choice, so an account or model of another agent is never carried
+  // over; --model, --effort or --account alone adjust the first configured profile.
+  const start = flags.agent !== undefined ? {} : base[0] ?? { harness: legacy };
+  const first = named ? cleanProfile({ ...start, ...Object.fromEntries(['model', 'effort', 'account'].filter(k => flags[k] !== undefined).map(k => [k, flags[k]])), ...(flags.agent !== undefined ? { harness: flags.agent } : {}) }) : null;
+  let chain = first ? [first, ...base] : base.length ? base : [cleanProfile({ harness: legacy })];
+  if (flags['no-fallback']) chain = chain.slice(0, 1);
+  const saved = claudeAccounts(env), preferred = String(env.CREW_CLAUDE_ACCOUNT ?? '').trim();
+  const accounts = saved.includes(preferred) ? [preferred, ...saved.filter(a => a !== preferred)] : saved;
+  const candidates = [], seen = new Set();
+  for (const profile of chain) {
+    const each = profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
+    for (const c of each) { if (!seen.has(pickKey(c))) { seen.add(pickKey(c)); candidates.push(c); } }
+  }
+  return { candidates, config, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : config.roles[role]?.length ? `roles.${role}` : config.default.length ? 'default' : 'built-in' };
+}
+
+// The provider an A1 or Pi profile without a model spends from: the agent's own saved default.
+function nativeProvider(harness) {
+  const settings = readJson(path.join(os.homedir(), harness === 'a1' ? '.a1' : '.pi', 'agent', 'settings.json'));
+  return typeof settings?.defaultProvider === 'string' ? settings.defaultProvider : null;
+}
+const familyOf = c => c.family ?? (c.harness === 'claude' ? 'claude' : QUOTA_FAMILY[c.model?.includes('/') ? c.model.split('/')[0] : nativeProvider(c.harness)] ?? null);
+
+// One provider row of a quota-axi --json reading, as it bears on a model. Firstmate's rule:
+// a candidate is out only when a scope that bounds it is exhausted now or has nothing left;
+// a reading that could not be taken is uncertainty, never proof of an empty account.
+export function quotaVerdict(row, model) {
+  if (!row || row.notSetUp) return { status: 'unknown', note: 'quota-axi has no reading for it' };
+  const why = [row.state?.error, row.state?.reason].filter(Boolean).join(', ');
+  if (row.quotaSemantics?.status !== 'known') {
+    return /unauthori[sz]ed|logged.?out|not.?logged|sign(ed)?.?(in|out)|invalid.?(token|credential|grant)|credential.?(missing|expired)|no.?credential/i.test(why)
+      ? { status: 'signed-out', note: `not signed in (${why})` } : { status: 'unknown', note: `quota could not be read${why ? ` (${why})` : ''}` };
+  }
+  const bare = String(model ?? '').split('/').pop();
+  const scopes = (row.quotaSemantics.effectiveAvailability ?? []).filter(s => ['all_models', 'all_products', `model:${bare}`, `product:${bare}`].includes(s.scope));
+  const left = scopes.map(s => s.effectivePercentRemaining).filter(Number.isFinite);
+  const empty = scopes.find(s => s.runway?.status === 'exhausted_now' || (Number.isFinite(s.effectivePercentRemaining) && s.effectivePercentRemaining <= 0));
+  if (empty) {
+    const window = (row.windows ?? []).find(w => (empty.limitingWindowIds ?? []).includes(w.id) || w.kind === empty.boundedBy?.[0]);
+    return { status: 'exhausted', remaining: 0, note: `quota used up${window?.resetsAt ? `, back ${window.resetsAt}` : ''}` };
+  }
+  return left.length ? { status: 'ok', remaining: Math.min(...left), note: `${Math.round(Math.min(...left))}% left` } : { status: 'unknown', note: 'no quota figure for it' };
+}
+
+// What quota-axi knows about each candidate, keyed like pickKey. quota-axi is used as it is:
+// one ordinary reading covers every candidate that spends from the machine's own logins, and
+// each saved Claude account gets a reading of its own. For that, the account-switcher's
+// helper writes the account's current login into an empty folder (rotating the tokens first
+// when they are about to expire, under the plugin's own lock), quota-axi reads exactly that
+// folder with --profile-only, and the folder is removed again.
+function quotaFacts(candidates, { shared = false, env = process.env } = {}) {
+  const facts = new Map(), all = fact => { for (const c of candidates) facts.set(pickKey(c), fact); return facts; };
+  if (shared) return all({ status: 'unknown', note: 'shared_quota: quota is not read' });
+  if (env.CREW_NO_QUOTA === '1' || !toolPath('quota-axi')) return all({ status: 'unknown', note: 'quota-axi is not installed here' });
+  const reading = (args, extra = {}) => {
+    const r = runTool('quota-axi', [...args, '--json'], { timeout: 90000, env: { ...env, ...extra } });
+    // quota-axi exits nonzero when a provider could not be measured and still prints its snapshot.
+    try { return JSON.parse(r.stdout).providers ?? []; } catch { return null; }
+  };
+  const plain = candidates.filter(c => !c.account), families = [...new Set(plain.map(familyOf).filter(Boolean))];
+  let rows = null;
+  if (families.length) {
+    // A1 keeps its logins in its own folder; quota-axi reads a Pi-style login from the folder
+    // PI_CODING_AGENT_DIR names, so that is pointed at A1's when A1 is among the candidates.
+    const a1Root = path.join(os.homedir(), '.a1', 'agent');
+    rows = reading(['--provider', families.join(','), '--max-age', '2m'], plain.some(c => c.harness === 'a1') && !env.PI_CODING_AGENT_DIR && fs.existsSync(a1Root) ? { PI_CODING_AGENT_DIR: a1Root } : {});
+  }
+  const helper = path.join(path.dirname(claudeLauncher(env)), 'session-dir.js'), byAccount = new Map();
+  for (const c of candidates) {
+    if (!c.account) {
+      const family = familyOf(c);
+      facts.set(pickKey(c), !family ? { status: 'unknown', note: 'crew does not know which quota it spends' } : !rows ? { status: 'unknown', note: 'quota-axi gave no reading' } : quotaVerdict(rows.find(r => r.provider === family), c.model));
+      continue;
+    }
+    if (!byAccount.has(c.account)) byAccount.set(c.account, (() => {
+      if (!fs.existsSync(helper)) return { note: 'the account-switcher helper is not on this machine' };
+      const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-quota-'));
+      try {
+        const seeded = run(process.execPath, [helper, 'refresh', c.account, '--into', folder], { timeout: 60000 });
+        let said = null; try { said = JSON.parse(lastLine(seeded.stdout)); } catch { /* judged by the exit code */ }
+        // The helper exits 2 when the saved login is no longer accepted, 3 when it could not ask.
+        if (seeded.code === 2) return { out: `its saved login is no longer accepted${said?.error ? ` (${String(said.error).slice(0, 80)})` : ''}; log in as it once` };
+        if (!fs.existsSync(path.join(folder, '.credentials.json'))) return { note: `its login could not be prepared (${lastLine(seeded.stderr || seeded.stdout).slice(0, 80)})` };
+        const read = reading(['--provider', 'claude', '--profile-only'], { CLAUDE_CONFIG_DIR: folder });
+        return read ? { row: read.find(r => r.provider === 'claude') } : { note: 'quota-axi gave no reading' };
+      } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+    })());
+    const got = byAccount.get(c.account);
+    facts.set(pickKey(c), got.out ? { status: 'signed-out', note: got.out } : got.note ? { status: 'unknown', note: got.note } : quotaVerdict(got.row, c.model));
+  }
+  return facts;
+}
+
+// An agent whose program is not on this machine cannot take work. Looked up on the real PATH
+// (CREW_AGENT_PATH replaces it in the tests); `true` when that cannot be told.
+function agentInstalled(harness, env = process.env) {
+  const command = AGENTS[harness].command, names = WINDOWS ? [command, `${command}.exe`, `${command}.cmd`, `${command}.bat`] : [command];
+  const dirs = String(env.CREW_AGENT_PATH ?? env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  return !dirs.length || dirs.some(dir => names.some(name => fs.existsSync(path.join(dir, name))));
+}
+
+// Reads the candidates' quota and keeps, in their own order, those that can take work now.
+// The order is the person's preference and is not rearranged; a candidate is only dropped
+// for a known reason. With a single candidate there is nothing to choose and nothing is read.
+function usableCandidates(candidates, { shared = false, always = false, env = process.env } = {}) {
+  const check = candidates.length > 1 || always, facts = check ? quotaFacts(candidates, { shared, env }) : new Map();
+  if (check) for (const c of candidates) if (!agentInstalled(c.harness, env)) facts.set(pickKey(c), { status: 'missing', note: `${AGENTS[c.harness].command} is not installed on this machine` });
+  const rows = candidates.map(c => ({ ...c, fact: facts.get(pickKey(c)) ?? { status: 'unknown', note: 'not checked: the only candidate' } }));
+  return { rows, usable: rows.filter(r => ['ok', 'unknown'].includes(r.fact.status)).map(({ fact, family, ...c }) => c) };
+}
+const candidateLines = rows => rows.map(r => `  ${pickLabel(r)} - ${r.fact.note}`).join('\n');
+
+// Who takes a new piece of work, and who stands behind them.
+function chooseWorker(h, role, flags, legacy) {
+  const { candidates, config, source } = workChain(h, role, flags, legacy);
+  const { rows, usable } = usableCandidates(candidates, { shared: config.shared });
+  if (!usable.length) refuse(`Nobody can take this work now:\n${candidateLines(rows)}\nAdd another profile to ${slash(config.file)}, or name one: --agent <agent> [--model <id>] [--account <account>].`, 8);
+  for (const r of rows.slice(0, rows.findIndex(r => pickKey(r) === pickKey(usable[0])))) console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`);
+  return { pick: usable[0], rest: usable.slice(1), source };
+}
+
+function cmdAgents(args) {
+  const h = home();
+  const { flags } = takeFlags(args, ['role', ...PICK_FLAGS], ['json', 'no-fallback']);
+  if (flags.role !== undefined && !ROLES.includes(flags.role)) refuse(`Unknown role: ${flags.role}. Roles: ${ROLES.join(', ')}`);
+  const role = flags.role ?? 'scout', { candidates, config, source } = workChain(h, role, flags, 'a1');
+  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
+  const first = usable[0] ? pickKey(usable[0]) : null;
+  if (flags.json) {
+    console.log(JSON.stringify({ config: config.present ? slash(config.file) : null, role, source, sharedQuota: config.shared,
+      candidates: rows.map(({ fact, family, ...c }) => ({ ...c, label: pickLabel(c), status: fact.status, remaining: fact.remaining ?? null, note: fact.note, next: pickKey(c) === first })),
+      rules: config.rules.map((r, i) => ({ rule: i + 1, when: r.when, why: r.why, use: r.use.map(pickLabel) })) }));
+    return;
+  }
+  console.log(config.present ? `profiles from ${slash(config.file)} (${source}), for ${role} work:` : `no ${slash(config.file)}: the built-in default, for ${role} work:`);
+  for (const r of rows) console.log(`${pickKey(r) === first ? '->' : '  '} ${pickLabel(r).padEnd(52)} ${r.fact.status.padEnd(11)}${r.fact.note}`);
+  if (!first) console.log('Nobody can take work now.');
+  config.rules.forEach((r, i) => console.log(`rule ${i + 1}: ${r.when}\n        use ${r.use.map(pickLabel).join(', then ')}  (--rule ${i + 1})`));
 }
 
 // --- the tools Firstmate works with -----------------------------------------------
@@ -465,7 +730,7 @@ export const TOOLS = [
   { id: 'chrome-devtools-axi', crew: 'agents look at web pages with it', brief: 'To look at a web page or check something in a browser use `chrome-devtools-axi`; run `chrome-devtools-axi --help` first.' },
   { id: 'lavish-axi', crew: '`crew show` opens a decision or a long report as a page, with a link in the Herdr status bar' },
   { id: 'tasks-axi', crew: '`crew backlog` keeps the queue with it; spawn, land and finish move the item' },
-  { id: 'quota-axi', crew: 'the coordinator checks which agent has room before a batch' },
+  { id: 'quota-axi', crew: 'crew reads each candidate\'s quota with it (every saved Claude account separately) before a worker starts or takes over' },
   { id: 'delivery', crew: "makes and removes workers' copies (`delivery start`, `delivery finish`); it alone decides between a pool slot and a new folder" },
   { id: 'treehouse', crew: 'the pool the shared delivery workflow takes reused copies from; crew does not call it for new tasks' },
   { id: 'no-mistakes', crew: 'a project with its gate is delivered through it' },
@@ -594,24 +859,47 @@ const branchOf = task => task.branch ?? `crew/${task.id}`;
 function cmdSpawn(args) {
   const h = home();
   requireOwner(h);
-  const opts = { kind: 'scout', agent: 'a1' }, rest = [];
-  for (let i = 0; i < args.length; i++) {
-    const m = /^--(project|kind|agent|type)$/.exec(args[i]);
-    if (m) opts[m[1]] = args[++i]; else rest.push(args[i]);
-  }
+  const { flags, rest } = takeFlags(args, ['project', 'kind', 'type', ...PICK_FLAGS], ['no-fallback']);
+  const opts = { kind: flags.kind ?? 'scout', project: flags.project, ...(flags.type !== undefined ? { type: flags.type } : {}) };
   const [id, ...words] = rest;
   const task = words.join(' ').trim();
-  if (!validId(id) || !task) refuse('Usage: crew spawn <id> --project <name> [--kind scout|ship] [--type feature|fix|...] [--agent a1|pi|claude] "<task>"');
+  if (!validId(id) || !task) refuse(`Usage: crew spawn <id> --project <name> [--kind scout|ship] [--type feature|fix|...] ${PICK_USAGE} "<task>"`);
   if (!['scout', 'ship'].includes(opts.kind)) refuse(`Unknown kind: ${opts.kind}`);
   if (opts.type !== undefined && (opts.kind !== 'ship' || !BRANCH_TYPES.includes(opts.type))) refuse(opts.kind !== 'ship' ? 'Only a ship task has a branch, so only it takes --type.' : `Unknown type: ${opts.type}. Known: ${BRANCH_TYPES.join(', ')}`);
-  const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  // Checked before anything is created: an unknown agent or a bad profile makes no task.
+  if (flags.agent !== undefined && !AGENTS[flags.agent]) refuse(`Unknown agent: ${flags.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
   if (fs.existsSync(taskDir(h, id))) refuse(`Task ${id} already exists.`);
-  launchWorker(h, { id, opts, agent, project, task });
+  launchWorker(h, { id, opts, chosen: chooseWorker(h, opts.kind, flags, 'a1'), project, task });
 }
+const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]`;
+
+// Starts the terminal in which `pick` works on a task. The agent starts with one instruction
+// as its argument, so nothing is typed into it and there is no race with its startup. The
+// shell stays afterwards so the terminal survives the agent leaving; `crew finish` removes it.
+function startTerminal(h, { id, worktree, label, pick, instruction }) {
+  const agent = AGENTS[pick.harness];
+  if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
+  const line = [
+    `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
+    agentCommand(pick.harness, agent, instruction, process.env, pick),
+    'exec bash --login -i',
+  ].join('; ');
+  const tag = h.config.tag;
+  return hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
+    // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
+    '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${label}`,
+    '--label', `herdr.space=fm-crew-${tag}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
+    '--', bashProgram(), '--login', '-i', '-c', line]);
+}
+const kindLabel = task => (task.selfFix ? 'fix' : task.reviews ? 'review' : task.kind);
+const roleOf = kindLabel;
 
 // Creates the task, its working copy and its terminal. `extra` is kept on the task record.
-function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
+// `chosen` is who does it (`pick`), who stands behind them (`rest`) and where that came from.
+function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
+  const { pick } = chosen;
+  opts = { ...opts, agent: pick.harness };
   const dir = taskDir(h, id), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
   let worktree = slash(path.join(h.worktrees, id));
   const branch = opts.kind === 'ship' ? `${extra.selfFix ? 'fix' : opts.type ?? 'feature'}/${id}` : null;
@@ -625,6 +913,8 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
+    // What the worker was started with, and the candidates left to take over from it.
+    launch: { ...pick, source: chosen.source }, chain: chosen.rest,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
   saveTask(h, record);
 
@@ -648,22 +938,7 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   if (intent) fs.writeFileSync(intent, `${task.trim()}\n`);
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project) }));
 
-  if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
-  // The agent starts with one instruction as its argument, so nothing is typed into it and
-  // there is no race with its startup. The shell stays afterwards so the terminal survives
-  // the agent leaving; `crew finish` removes it.
-  const instruction = `Read the brief at ${brief} and carry it out exactly.`;
-  const line = [
-    `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
-    agentCommand(opts.agent, agent, instruction),
-    'exec bash --login -i',
-  ].join('; ');
-  const tag = h.config.tag;
-  const started = hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
-    // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
-    '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${extra.selfFix ? 'fix' : extra.reviews ? 'review' : opts.kind}`,
-    '--label', `herdr.space=fm-crew-${tag}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
-    '--', bashProgram(), '--login', '-i', '-c', line]);
+  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, instruction: `Read the brief at ${brief} and carry it out exactly.` });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
@@ -676,8 +951,67 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   // writing the record this command started with over an accepted report.
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
-  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}`);
+  const detail = pickLabel(pick) !== pick.harness || chosen.rest.length ? `; ${pickLabel(pick)}${chosen.rest.length ? `, ${chosen.rest.length} more can take over` : ''}` : '';
+  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${detail}`);
   backlogMove(h, id, 'start');
+}
+
+// relaunch: the same task, the same working copy, another agent. This is the fallback while
+// work is under way: a worker that stopped on a used-up quota or a lost login is replaced by
+// the next candidate of its chain, which is told to go on from what is already there.
+// Returns the new pick, or null with `why` when nobody else can take the task.
+function relaunch(h, task, reason, flags = null) {
+  const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
+  const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
+  const config = dispatchConfig(h);
+  // The task's own chain as it stood at launch; a task from before there were chains, or an
+  // explicit choice on the command line, takes the configured one as it stands now.
+  const candidates = (named || !task.chain ? workChain(h, role, flags ?? {}, task.agent).candidates : task.chain).filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
+  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
+  if (!usable.length) return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+  const [pick, ...rest] = usable;
+  if (task.terminal) {
+    let seen = probe(task.terminal).state;
+    if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; task ${task.id} was left as it is. Try again.`, 4);
+    if (seen !== 'absent') { hc(['kill', task.terminal]); hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
+    if (seen !== 'absent') refuse(`Core still has terminal ${task.terminal}; task ${task.id} was not handed over.`, 6);
+  }
+  const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
+  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction });
+  const address = started.value?.address;
+  if (started.code !== 0 || !address) {
+    saveTask(h, { ...task, state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
+    refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
+  }
+  const { error, ...kept } = task;
+  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, chain: rest, tried: [...tried], state: 'working', terminal: address,
+    fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
+  return { pick, rest, address };
+}
+
+// What on a stopped worker's screen says it cannot go on for want of quota or a login. Only
+// the last lines count, and only while the agent is not working: text the worker itself wrote
+// about limits earlier is not a stop.
+const STOPPED_ON = /usage limit|rate limit(?:ed)?\b.{0,40}(?:reached|exceeded|hit)|(?:quota|credits?|tokens?)\b.{0,30}(?:exceeded|exhausted|used up|ran out|run out)|out of (?:credits|quota|usage)|credit balance is too low|hit your\b.{0,20}limit|limit (?:has been )?reached|insufficient[_ ]quota|not logged in|please (?:run )?\/login|invalid (?:api key|x-api-key|authentication)|authentication[_ ](?:failed|error)|oauth token (?:has )?expired|401 unauthorized/i;
+function stoppedOn(address, lines) {
+  const read = hc(['read', address, '--lines', String(lines)]);
+  if (read.code !== 0) return null;
+  const hit = read.stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean).slice(-lines).reverse().find(l => STOPPED_ON.test(l));
+  return hit ? hit.replace(/\s+/g, ' ').slice(0, 140) : null;
+}
+
+function cmdRelaunch(args) {
+  const h = home();
+  requireOwner(h);
+  const { flags, rest } = takeFlags(args, PICK_FLAGS, ['no-fallback']);
+  const [id, ...words] = rest;
+  if (!id) refuse(`Usage: crew relaunch <id> ${PICK_USAGE} ["<why>"]`);
+  const task = loadTask(h, id);
+  if (!['working', 'stopped', 'failed'].includes(task.state)) refuse(`Task ${id} is ${task.state}; only unfinished work is handed to another agent.`);
+  if (!fs.existsSync(task.worktree)) refuse(`Task ${id} has no working copy any more (${task.worktree}); spawn a new task instead.`, 6);
+  const moved = relaunch(h, task, words.join(' ').trim() || 'the coordinator handed the task over', flags);
+  if (!moved.pick) refuse(`Task ${id} was not handed over: ${moved.why}`, 8);
+  console.log(`relaunched ${id}: ${pickLabel(moved.pick)} in terminal ${moved.address}${moved.rest.length ? `, ${moved.rest.length} more can take over` : ''}; next: crew wait ${id}`);
 }
 
 function cmdDone(args) {
@@ -697,10 +1031,11 @@ const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0,
 
 function cmdWait(args) {
   const h = home();
-  let timeout = 1800;
-  const ids = [];
-  for (let i = 0; i < args.length; i++) { if (args[i] === '--timeout') timeout = Number(args[++i]) || timeout; else ids.push(args[i]); }
-  if (!ids.length) refuse('Usage: crew wait <id> [<id>...] [--timeout seconds]');
+  const { flags, rest: ids } = takeFlags(args, ['timeout'], ['no-fallback']);
+  const timeout = Number(flags.timeout) || 1800;
+  if (!ids.length) refuse('Usage: crew wait <id> [<id>...] [--timeout seconds] [--no-fallback]');
+  // Handing a stopped worker's task to the next candidate changes the home, so only its owner does it.
+  const handover = !flags['no-fallback'] && process.env.CREW_NO_FALLBACK !== '1' && ownerState(h).mine;
   ids.forEach(id => loadTask(h, id));
   const deadline = Date.now() + timeout * 1000, settled = new Map(), blocked = new Map();
   for (let tick = 0; settled.size < ids.length && Date.now() < deadline; tick++) {
@@ -716,6 +1051,13 @@ function cmdWait(args) {
       if (seen !== 'live') {
         saveTask(h, { ...task, state: 'failed', error: 'The worker terminal ended without a report.' });
         settled.set(id, 'failed');
+      } else if (handover && t.status?.state && t.status.state !== 'working' && stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12)) {
+        // The worker cannot go on for want of quota or a login: the next candidate of its
+        // chain takes the task over in the same working copy, and the wait goes on.
+        const reason = stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12), from = pickLabel(task.launch ?? { harness: task.agent });
+        const moved = relaunch(h, loadTask(h, id), reason);
+        if (moved.pick) console.log(`== ${id}: ${from} stopped (${reason}); ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
+        else { blocked.set(id, `${from} stopped (${reason}) and ${moved.why}`); settled.set(id, 'needs a person'); }
       } else if (t.status?.state === 'blocked') {
         // The agent itself says it is waiting for a person (a permission or a question).
         // Waiting longer cannot help; hand that back so somebody looks at the terminal.
@@ -860,7 +1202,7 @@ function cmdFinish(args) {
       sleep(1000);
     }
     if (back.code !== 0) refuse(`delivery did not take the working copy back (${lastLine(back.stdout || back.stderr)}); it was kept: ${task.worktree}`, 6);
-    if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
+    if (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) forgetClaudeFolder(task.worktree);
     saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
     console.log(`finished ${id} (${result.how}); working copy ${task.pooled ? 'returned to the pool' : 'removed'}; report kept at ${task.report}${dropMergedBranch(project, task)}`);
     if (task.kind === 'scout' && task.state === 'reported' && !task.reviews) backlogMove(h, id, 'done');
@@ -875,7 +1217,7 @@ function cmdFinish(args) {
     const back = runTool('treehouse', ['return', ...(force || task.kind === 'scout' ? ['--force'] : []), task.worktree], { cwd: project?.path, timeout: 180000 });
     if (!back) refuse(`Task ${id} uses a treehouse working copy, and treehouse is not installed here; nothing was returned.`, 6);
     if (back.code !== 0 && fs.existsSync(task.worktree)) refuse(`treehouse did not take the working copy back (${lastLine(back.stderr || back.stdout)}); it was kept: ${task.worktree}`, 6);
-    if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
+    if (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) forgetClaudeFolder(task.worktree);
     saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
     console.log(`finished ${id} (${result.how}); working copy returned to treehouse; report kept at ${task.report}${dropMergedBranch(project, task)}`);
     if (task.kind === 'scout' && task.state === 'reported') backlogMove(h, id, 'done');
@@ -891,7 +1233,7 @@ function cmdFinish(args) {
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
   // A published self-fix is on main; its branch has nothing left to keep.
   if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', branchOf(task)]);
-  if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
+  if (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) forgetClaudeFolder(task.worktree);
   // An emptied folder that something still sits in (a helper process the agent left behind)
   // is not worth failing for: the work is gone from disk and from git; say so and move on.
   let leftover = '';
@@ -933,16 +1275,18 @@ function cmdTell(args) {
 function cmdReview(args) {
   const h = home();
   requireOwner(h);
-  let agentName = null; const rest = [];
-  for (let i = 0; i < args.length; i++) { if (args[i] === '--agent') agentName = args[++i]; else rest.push(args[i]); }
+  const { flags, rest } = takeFlags(args, PICK_FLAGS, ['no-fallback']);
   const id = rest[0];
-  if (!id) refuse(`Usage: crew review <id> [--agent ${Object.keys(AGENTS).join('|')}]`);
+  if (!id) refuse(`Usage: crew review <id> ${PICK_USAGE}`);
+  if (flags.agent !== undefined && !AGENTS[flags.agent]) refuse(`Unknown agent: ${flags.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const task = loadTask(h, id);
   if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
   const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
-  const opts = { kind: 'scout', agent: agentName ?? process.env.CREW_REVIEW_AGENT ?? task.agent, project: task.project };
-  const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  const opts = { kind: 'scout', project: task.project };
+  // Without a choice and without a review chain in the configuration: CREW_REVIEW_AGENT, else the author's agent.
+  const legacy = process.env.CREW_REVIEW_AGENT ?? task.agent;
+  if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
   const text = [
@@ -952,7 +1296,7 @@ function cmdReview(args) {
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, agent, project, task: text, extra: { reviews: id } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy), project, task: text, extra: { reviews: id } });
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
 
@@ -1103,11 +1447,11 @@ function recentCrashes() {
 function cmdFix(args) {
   const h = home();
   requireOwner(h);
-  const opts = { kind: 'ship', agent: process.env.CREW_FIX_AGENT || 'a1', project: SELF_PROJECT }, words = [];
-  for (let i = 0; i < args.length; i++) { if (args[i] === '--agent') opts.agent = args[++i]; else words.push(args[i]); }
+  const opts = { kind: 'ship', project: SELF_PROJECT }, { flags, rest: words } = takeFlags(args, PICK_FLAGS, ['no-fallback']);
   const problem = words.join(' ').trim();
-  if (!problem) refuse(`Usage: crew fix [--agent ${Object.keys(AGENTS).join('|')}] "<what you ran, what happened, what you expected>"`);
-  const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  if (!problem) refuse(`Usage: crew fix ${PICK_USAGE} "<what you ran, what happened, what you expected>"`);
+  const legacy = process.env.CREW_FIX_AGENT || 'a1';
+  for (const name of [flags.agent, legacy]) if (name !== undefined && !AGENTS[name]) refuse(`Unknown agent: ${name}. Known: ${Object.keys(AGENTS).join(', ')}`);
   if (!isClone()) refuse(`crew's own source (${TOOL_ROOT}) is not a git clone, so it cannot be repaired from here.`);
   // One repair at a time: two fixers on the same few files would only undo each other.
   const open = allTasks(h).filter(t => t.selfFix && t.state !== 'closed');
@@ -1127,7 +1471,7 @@ function cmdFix(args) {
     '5. Commit on this branch. Do not push: the coordinator publishes it with `crew selfmerge`.',
     '6. In the report give the cause, the change and the new check, each in a line or two.',
   ].join('\n');
-  launchWorker(h, { id, opts, agent, project: { path: TOOL_ROOT }, task, extra: { selfFix: true, projectPath: TOOL_ROOT, base: toolRevision() } });
+  launchWorker(h, { id, opts, chosen: chooseWorker(h, 'fix', flags, legacy), project: { path: TOOL_ROOT }, task, extra: { selfFix: true, projectPath: TOOL_ROOT, base: toolRevision() } });
   console.log(`next: crew wait ${id}, then crew selfmerge ${id}`);
 }
 
@@ -1194,36 +1538,39 @@ function cmdStatus(args) {
   const currentTime = Date.now();
   const tasks = allTasks(h).filter(t => all || t.state !== 'closed').map(t => {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
-    return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, project: t.project, terminal: t.terminal,
+    return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
       report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime) };
   });
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
-  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.agent}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}`);
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
-  home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
+  home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
   crew project add <name> <git folder> [--gate-skip <steps>|none]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
-  crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
-  crew wait <id>... [--timeout seconds]    block until each worker reports
+  crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
+      who: ${PICK_USAGE}
+  crew agents [--role scout|ship|review|fix] [who] [--json]   who would do the work now: profiles, quota, fallback order
+  crew relaunch <id> [who] ["<why>"]       hand unfinished work to another agent in the same working copy
+  crew wait <id>... [--timeout seconds] [--no-fallback]   block until each worker reports; one that ran out of quota is replaced
   crew status [--all] [--json]             tasks and their terminals
   crew stop <id> [--force]                 ask the worker to leave
   crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
-  crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
+  crew review <id> [who]                   start a reviewer on a ship task's branch
   crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
   crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
-  crew fix [--agent <agent>] "<problem>"   start a worker that repairs crew itself
+  crew fix [who] "<problem>"               start a worker that repairs crew itself
   crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
   crew update | crew rollback              bring this machine's crew up to date, or back one step`;
 
