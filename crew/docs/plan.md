@@ -47,13 +47,14 @@ dependency-free Node file in the same fork, with Firstmate's code close by as re
 
 | Folder | What it is |
 |---|---|
-| `~/.crew/tool` | the installed copy of this fork on each machine; updates itself at `crew start` |
-| `~/.crew/crew` | the coordinator's home: projects, tasks, backlog, pages. Herdr names the space after the folder, hence "crew" |
-| `~/.crew/worktrees` | workers' working copies (outside the home, so a worker never loads the coordinator's rules) |
-| `~/.crew/crashes` | crash records |
+| `~/.crew/core` | the installed copy of this fork on each machine (`~/.crew/tool` before 0.7); updates itself at `crew start` |
+| `~/.crew` | the home: projects (`crew.json`), `tasks/`, backlog, pages |
+| `~/.crew/coordinator` | the coordinator's rules and the folder it starts in. Herdr names the space after the folder, so the space is called "coordinator" |
+| `~/.crew/.worktrees` | workers' working copies (never under `coordinator/`, so a worker never loads the coordinator's rules) |
+| `~/.crew/state` | update and crash records |
 | `D:\Git\crew` | development clone of this fork on both machines. On pc2 it is also the Firstmate install and holds Firstmate's untracked `config/`, `data/`, `projects/`, `state/` |
 
-Do not edit `~/.crew/tool`; change crew in the development clone and merge to `main`.
+Do not edit `~/.crew/core`; change crew in the development clone and merge to `main`.
 
 ## 4. Crew: verified state
 
@@ -108,7 +109,7 @@ earlier line.
 Kept in the user's private Herdr customizations, not in this repository:
 
 - **Crew plugin**: requirements checklist per machine ("Install on" chooses whose list is
-  shown and installed to); installs this fork into `~/.crew/tool`; the tools from section 4
+  shown and installed to); installs this fork into `~/.crew/core`; the tools from section 4
   are optional rows.
 - **Profile checkbox** "Run as crew coordinator", offered for a profile on any machine;
   crew is checked on the profile's own machine at launch.
@@ -128,6 +129,12 @@ Crew, in order:
 4. Pi as coordinator on pc2.
 5. A self-repair that passes the suite but is wrong still reaches every machine;
    `rollback` is per machine.
+6. Postponed, to discuss: pooled working copies for the shared delivery workflow too. The
+   idea is that an agent uses treehouse instead of a plain `git worktree` whenever treehouse
+   is installed on the machine, so installing it is the opt-in and plain worktrees keep
+   working unchanged. Known from a trial: a returned slot keeps ignored files, so
+   `.artifacts/` of the previous task must be cleared; slots are numbered folders, not
+   named after the task.
 
 Environment:
 
@@ -165,3 +172,4 @@ Firstmate, only if it is taken further:
 | 2026-11-17 | Self-repair (#13, 0.2.0); delivery workflow (#14–#15, 0.3.0); Firstmate's tools (#16, 0.4.0) |
 | 2026-11-17 | Two end-to-end runs on pc2; `crew show`; gate options (#17–#24, 0.5.x) |
 | 2026-11-17 | Home renamed to `~/.crew/crew`; pages open on the person's PC (#25, 0.6.0) |
+| 2026-11-20 | `crew finish` deletes a merged branch (#27). Aligned with the shared delivery workflow (#28, 0.7.0): flat `~/.crew` layout with `coordinator/`, branches named `<type>/<id>`, `.artifacts/KEEP` honoured, pooled copies returned with `--force` when their files are scratch |

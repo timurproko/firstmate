@@ -15,9 +15,12 @@ Where the work stands, why it went this way and what is left: [`docs/plan.md`](d
 ## Layout on a machine
 
 ```
-~/.crew/tool/        this repository, when installed from the Herdr plugin
-~/.crew/crew/        the default crew home: crew.json, AGENTS.md, CLAUDE.md, owner.json, tasks/<id>/
-~/.crew/worktrees/   workers' copies: <home tag>/<task id>
+~/.crew/                the default crew home: crew.json, owner.json, backlog.md
+~/.crew/core/           this repository, when installed from the Herdr plugin
+~/.crew/coordinator/    the coordinator's rules (AGENTS.md, CLAUDE.md); the folder it starts in
+~/.crew/tasks/<id>/     task record, brief and report
+~/.crew/.worktrees/<id> workers' copies
+~/.crew/state/          update and crash records
 ```
 
 A worker's copy is never inside the home: agents read instruction files from their folder
@@ -27,11 +30,11 @@ coordinator.
 ## Commands
 
 ```
-crew init [folder]                       create a crew home (default ~/.crew/crew)
+crew init [folder]                       create a crew home (default ~/.crew)
 crew project add <name> <git folder>     register a project   (crew project list)
 crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session
-crew spawn <id> --project <name> [--kind scout|ship] [--agent a1|pi|claude] "<task>"
+crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [--agent a1|pi|claude] "<task>"
 crew wait <id>... [--timeout seconds]    block until each worker reports
 crew status [--all] [--json]             tasks and their terminals
 crew stop <id> [--force]                 ask the worker to leave
@@ -55,7 +58,7 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
 - **Owner.** `crew start` records the calling Core terminal as the home's owner. Another
   session is refused and may only read while Core says that terminal is live; when it is
   gone, the next `start` takes over and is told which tasks were left unfinished.
-- **Spawn.** `git worktree add` (detached for `scout`, a new branch `crew/<id>` for `ship`),
+- **Spawn.** `git worktree add` (detached for `scout`, a new branch `<type>/<id>` for `ship`, where `--type` is `feature` (default), `fix`, `refactor`, `docs`, `test`, `chore` or `style`, as the shared delivery workflow names branches),
   a brief file, then one `hc run` with labels `crew.task`, `crew.home` and the Herdr
   space/tab labels. The agent starts with one instruction as its command-line argument
   ("read the brief…"), so nothing is typed into it.
@@ -79,7 +82,7 @@ Adding one is a line in `AGENTS` in `crew.mjs`.
 
 ## Delivering a code change
 
-A ship task ends with commits on branch `crew/<id>`. From there:
+A ship task ends with commits on branch `<type>/<id>`. From there:
 
 - `crew review <id>` starts a read-only task `<id>-review` whose brief points at that branch.
   Its report starts with `APPROVE` or `CHANGES NEEDED`. `--agent` (or `CREW_REVIEW_AGENT`)
@@ -103,7 +106,7 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
 | `lavish-axi`, `quota-axi` | The coordinator's rules say when to use them: showing a decision or long report as a page; checking which agent has room before a batch. |
 | `tasks-axi` | `crew backlog <tasks-axi command…>` keeps the durable list of work in `<home>/backlog.md`. A task with the same id as a backlog item moves it: In flight at spawn, Done at `land` (ship, with the pull request) or `finish` (scout). Reading is open to any session; changes are the owner's. |
-| `treehouse` | `crew project add <name> <folder> --treehouse`: that project's workers get a leased copy from the treehouse pool (`treehouse get --lease`), and `crew finish` gives it back (`treehouse return`). The copy is cut from the branch treehouse infers, not from the folder's current commit. |
+| `treehouse` | `crew project add <name> <folder> --treehouse`: that project's workers get a leased copy from the treehouse pool (`treehouse get --lease`), and `crew finish` gives it back (`treehouse return`, with `--force` for a scout's leftovers or when `crew finish --force` was given). The copy is cut from the branch treehouse infers, not from the folder's current commit. |
 | `no-mistakes` | A project that has the gate (a `no-mistakes` remote) is delivered through it: the ship worker's brief tells it to run `no-mistakes axi run --yes --intent-file <task>` and follow it to a pull request. `crew land` then pushes nothing and only records that pull request (from the report, or from `gh pr view`). The gate's CI watch is left out by default (`--skip ci`): delivery ends at the open pull request. `crew project add <name> <folder> --gate-skip ci,lint` leaves out more steps (rebase, review, test, document, lint, ci) where they cannot run on the machine; `--gate-skip none` keeps the watch. |
 
 `CREW_TOOL_<NAME>` (for example `CREW_TOOL_TASKS_AXI`) names a tool's program explicitly;
@@ -129,14 +132,14 @@ reported; nothing is uncommitted; the branch rebases cleanly onto the published 
 changed file is under `crew/`; and `node crew/crew.test.mjs` exits 0 in the fixer's copy. The
 push is an ordinary one (never forced), with the machine's own git credentials.
 
-The copy Herdr installed (`~/.crew/tool`) fast-forwards itself at each `crew start`, so a
+The copy Herdr installed (`~/.crew/core`, or `~/.crew/tool` from before 0.7) fast-forwards itself at each `crew start`, so a
 repair published from one machine reaches the others at their next session. A developer's
 checkout never updates itself. After `crew rollback` the machine stays on the older revision
 until something newer than the one it left is published. `crew start` also rewrites the
 home's `AGENTS.md` when the rules of the running version differ, so do not keep notes there.
 
 A command that fails with an unexpected error exits 70 and writes a record to
-`~/.crew/crashes/`.
+`~/.crew/state/crashes/`.
 
 What this does not protect against: a repair that passes the suite and is still wrong. It
 reaches every machine at its next session; `crew rollback` is per machine.

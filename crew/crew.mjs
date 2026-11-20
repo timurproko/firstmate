@@ -11,12 +11,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.6.0';
+export const VERSION = '0.7.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
-// Everything of crew on a machine lives under ~/.crew: tool/ (this code, when installed from
-// Herdr), crew/ (the default crew home) and worktrees/ (workers' copies).
-export const DEFAULT_HOME = path.join(os.homedir(), '.crew', 'crew');
+// Everything of crew on a machine lives under ~/.crew, which is also the default home:
+// core/ (this code, when installed from Herdr), coordinator/ (the coordinator's rules and the
+// folder it starts in), tasks/, .worktrees/ (workers' copies), state/ (update and crash
+// records) and crew.json (the registered projects).
+const CREW_DIR = path.join(os.homedir(), '.crew');
+export const DEFAULT_HOME = CREW_DIR;
 
 // --- agents ------------------------------------------------------------------
 // The only per-agent knowledge: how to start it with one instruction, and how it can be
@@ -90,51 +93,70 @@ function findHome() {
     if (path.dirname(dir) === dir) break;
   }
   // Otherwise the per-user home, so `crew` works from any folder on the machine.
-  return [DEFAULT_HOME, LEGACY_HOME].find(dir => fs.existsSync(path.join(dir, 'crew.json'))) ?? null;
+  return [DEFAULT_HOME, ...LEGACY_HOMES].find(dir => fs.existsSync(path.join(dir, 'crew.json'))) ?? null;
 }
-// The default home was ~/.crew/home until 0.6. Herdr names a space after its folder, so the
-// coordinator's space was called "home"; in ~/.crew/crew it is called "crew". An existing
-// home is moved once, and only when nobody can be using it: no live owner, and the folder
-// itself free (a terminal still sitting in it keeps it where it is). Until then the old
+// The default home used to be one folder holding everything: ~/.crew/home until 0.6, then
+// ~/.crew/crew. Since 0.7 the home is ~/.crew itself and the coordinator's rules have their
+// own folder, so tasks and settings no longer sit under a second "crew". An existing home
+// is unpacked once, and only when nobody can be using it: no live owner. Until then the old
 // place keeps working. Task records hold paths into the home, so those are rewritten.
-const LEGACY_HOME = path.join(os.homedir(), '.crew', 'home');
+const LEGACY_HOMES = ['crew', 'home'].map(name => path.join(CREW_DIR, name));
+const RULE_FILES = ['AGENTS.md', 'CLAUDE.md'];
+const legacyHome = () => LEGACY_HOMES.find(dir => fs.existsSync(path.join(dir, 'crew.json'))) ?? null;
 function moveLegacyHome() {
-  if (!fs.existsSync(path.join(LEGACY_HOME, 'crew.json')) || fs.existsSync(DEFAULT_HOME)) return null;
+  const old = legacyHome();
+  if (!old || fs.existsSync(path.join(DEFAULT_HOME, 'crew.json'))) return null;
+  const target = name => (RULE_FILES.includes(name) ? path.join(DEFAULT_HOME, 'coordinator', name) : path.join(DEFAULT_HOME, name));
+  const done = [];
   try {
-    const owner = readJson(path.join(LEGACY_HOME, 'owner.json'));
-    if (owner?.terminal && probe(owner.terminal).state !== 'absent' && probe(owner.terminal).state !== 'finished') return 'a session still holds it';
-    fs.renameSync(LEGACY_HOME, DEFAULT_HOME);
-  } catch (error) { return `it is in use (${error.code ?? error.message})`; }
-  const from = slash(LEGACY_HOME), tasks = path.join(DEFAULT_HOME, 'tasks');
+    const owner = readJson(path.join(old, 'owner.json'));
+    if (owner?.terminal && probe(owner.terminal).state !== 'absent' && probe(owner.terminal).state !== 'finished') return { old, why: 'a session still holds it' };
+    const names = fs.readdirSync(old), taken = names.find(name => fs.existsSync(target(name)));
+    if (taken) return { old, why: `${slash(target(taken))} already exists` };
+    fs.mkdirSync(path.join(DEFAULT_HOME, 'coordinator'), { recursive: true });
+    // crew.json goes last: until it has moved, the old folder is still the home.
+    for (const name of [...names.filter(n => n !== 'crew.json'), 'crew.json']) { fs.renameSync(path.join(old, name), target(name)); done.push(name); }
+  } catch (error) {
+    // Something in it is held open: put back what already moved, so the old home stays whole.
+    for (const name of done.reverse()) { try { fs.renameSync(target(name), path.join(old, name)); } catch { /* reported below */ } }
+    return { old, why: `it is in use (${error.code ?? error.message})` };
+  }
+  try { fs.rmdirSync(old); } catch { /* a terminal still sits in the emptied folder */ }
+  const from = `${slash(old)}/`, to = `${slash(DEFAULT_HOME)}/`, tasks = path.join(DEFAULT_HOME, 'tasks');
   for (const id of fs.existsSync(tasks) ? fs.readdirSync(tasks) : []) {
     const file = path.join(tasks, id, 'task.json'), task = readJson(file);
     if (!task) continue;
-    for (const key of ['report', 'brief']) if (typeof task[key] === 'string' && task[key].startsWith(`${from}/`)) task[key] = slash(DEFAULT_HOME) + task[key].slice(from.length);
+    for (const key of ['report', 'brief']) if (typeof task[key] === 'string' && task[key].startsWith(from)) task[key] = to + task[key].slice(from.length);
     writeJson(file, task);
   }
-  return 'moved';
+  return { old, moved: true };
 }
-// `crew home` prints the home in use; `--ensure` first moves an old home to its new place when
-// that is safe and creates the default home when there is none. Herdr runs it before it
-// starts a coordinator, to know which folder to start it in.
+// `crew home` prints the folder the coordinator starts in; `--ensure` first unpacks an old
+// home when that is safe and creates the default home when there is none. Herdr runs it
+// before it starts a coordinator, to know which folder to start it in.
 function cmdHome(args) {
   if (args.includes('--ensure') && !process.env.CREW_HOME) {
     const moved = moveLegacyHome();
-    if (moved === 'moved') console.error(`crew: the home moved to ${slash(DEFAULT_HOME)}`);
-    else if (moved) console.error(`crew: the home stays at ${slash(LEGACY_HOME)} for now: ${moved}`);
-    if (!fs.existsSync(path.join(DEFAULT_HOME, 'crew.json')) && !fs.existsSync(path.join(LEGACY_HOME, 'crew.json'))) createHome(DEFAULT_HOME);
+    if (moved?.moved) console.error(`crew: the home moved from ${slash(moved.old)} to ${slash(DEFAULT_HOME)}`);
+    else if (moved) console.error(`crew: the home stays at ${slash(moved.old)} for now: ${moved.why}`);
+    if (!fs.existsSync(path.join(DEFAULT_HOME, 'crew.json')) && !legacyHome()) createHome(DEFAULT_HOME);
   }
-  console.log(slash(home().dir));
+  console.log(slash(home().coordinator));
 }
 function home() {
   const dir = findHome();
-  if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home yet. Run `crew init` once (it creates ~/.crew/crew), or `crew init <folder>` for a home elsewhere.');
+  if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home yet. Run `crew init` once (it creates ~/.crew), or `crew init <folder>` for a home elsewhere.');
   const config = readJson(path.join(dir, 'crew.json'));
   if (!config || config.version !== 1) refuse(`${path.join(dir, 'crew.json')} is not a version 1 crew home.`);
-  // Working copies live OUTSIDE the home. Agents read instruction files from their folder
-  // upwards, so a worker inside the home would load the coordinator's rules and act as one.
-  const worktrees = path.join(process.env.CREW_WORKTREES || path.join(os.homedir(), '.crew', 'worktrees'), String(config.tag));
-  return { dir, config, tasks: path.join(dir, 'tasks'), worktrees, owner: path.join(dir, 'owner.json') };
+  // A home from before 0.7 holds the coordinator's rules itself; a newer one keeps them in
+  // coordinator/. Working copies are never under the folder with those rules: agents read
+  // instruction files from their folder upwards, so a worker placed there would load the
+  // coordinator's rules and act as one.
+  const unpacked = fs.existsSync(path.join(dir, 'coordinator'));
+  const coordinator = unpacked ? path.join(dir, 'coordinator') : dir;
+  const worktrees = process.env.CREW_WORKTREES ? path.join(process.env.CREW_WORKTREES, String(config.tag))
+    : unpacked ? path.join(dir, '.worktrees') : path.join(CREW_DIR, '.worktrees', String(config.tag));
+  return { dir, config, coordinator, tasks: path.join(dir, 'tasks'), worktrees, owner: path.join(dir, 'owner.json') };
 }
 const taskDir = (h, id) => path.join(h.tasks, id);
 const taskFile = (h, id) => path.join(taskDir(h, id), 'task.json');
@@ -221,7 +243,8 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 ## One task
 1. \`crew spawn <id> --project <name> --kind scout|ship --agent a1 "<task for the worker>"\`
    - \`scout\`: read-only investigation, ends with a written report.
-   - \`ship\`: changes code on a branch of its own.
+   - \`ship\`: changes code on a branch of its own, \`<type>/<id>\`. Say what the work is with
+     \`--type feature|fix|refactor|docs|test|chore|style\` (default \`feature\`).
    - Independent tasks may be spawned one after another without waiting; they run together.
 2. \`crew wait <id> [<id>...]\` blocks until each worker reports (or fails). It prints the reports.
 3. Tell the person the result in your own words. Do not paste the whole report unless asked.
@@ -295,17 +318,18 @@ around it by hand and never edit crew's own files yourself.
 `;
 
 function cmdInit(args) {
-  if (!args[0] && fs.existsSync(path.join(LEGACY_HOME, 'crew.json'))) refuse(`There is already a crew home at ${slash(LEGACY_HOME)}. \`crew home --ensure\` moves it to ${slash(DEFAULT_HOME)}.`);
+  const old = legacyHome();
+  if (!args[0] && old) refuse(`There is already a crew home at ${slash(old)}. \`crew home --ensure\` moves it to ${slash(DEFAULT_HOME)}.`);
   createHome(args[0] ? path.resolve(args[0]) : DEFAULT_HOME);
 }
 function createHome(dir) {
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, 'crew.json');
+  const file = path.join(dir, 'crew.json'), rules = path.join(dir, 'coordinator');
   if (fs.existsSync(file)) refuse(`${dir} is already a crew home.`);
   fs.mkdirSync(path.join(dir, 'tasks'), { recursive: true });
+  fs.mkdirSync(rules, { recursive: true });
   writeJson(file, { version: 1, tag: Math.random().toString(16).slice(2, 10), projects: {} });
   for (const [name, text] of [['AGENTS.md', COORDINATOR_RULES], ['CLAUDE.md', '@AGENTS.md\n']]) {
-    if (!fs.existsSync(path.join(dir, name))) fs.writeFileSync(path.join(dir, name), text);
+    if (!fs.existsSync(path.join(rules, name))) fs.writeFileSync(path.join(rules, name), text);
   }
   console.log(`crew home created: ${slash(dir)}`);
 }
@@ -389,7 +413,7 @@ function cmdStart() {
   if (owner && live && owner.terminal !== mine) refuse(`Read-only: this home is owned by live terminal ${owner.terminal}.`, 3);
   writeJson(h.owner, { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined });
   // The rules file belongs to the tool: a newer crew may have changed what a coordinator does.
-  const rules = path.join(h.dir, 'AGENTS.md');
+  const rules = path.join(h.coordinator, 'AGENTS.md');
   if (fs.existsSync(rules) && fs.readFileSync(rules, 'utf8') !== COORDINATOR_RULES) {
     fs.writeFileSync(rules, COORDINATOR_RULES);
     console.log(`the coordinator rules changed with this crew version: read ${slash(rules)} again before going on`);
@@ -561,18 +585,24 @@ export function briefText({ id, kind, task, worktree, project, report, tools = [
   ].join('\n');
 }
 
+// A ship task works on a branch named the way the shared delivery workflow names them:
+// <type>/<task id>. Tasks from before 0.7 are on crew/<id>.
+const BRANCH_TYPES = ['feature', 'fix', 'refactor', 'docs', 'test', 'chore', 'style'];
+const branchOf = task => task.branch ?? `crew/${task.id}`;
+
 function cmdSpawn(args) {
   const h = home();
   requireOwner(h);
   const opts = { kind: 'scout', agent: 'a1' }, rest = [];
   for (let i = 0; i < args.length; i++) {
-    const m = /^--(project|kind|agent)$/.exec(args[i]);
+    const m = /^--(project|kind|agent|type)$/.exec(args[i]);
     if (m) opts[m[1]] = args[++i]; else rest.push(args[i]);
   }
   const [id, ...words] = rest;
   const task = words.join(' ').trim();
-  if (!validId(id) || !task) refuse('Usage: crew spawn <id> --project <name> [--kind scout|ship] [--agent a1|pi|claude] "<task>"');
+  if (!validId(id) || !task) refuse('Usage: crew spawn <id> --project <name> [--kind scout|ship] [--type feature|fix|...] [--agent a1|pi|claude] "<task>"');
   if (!['scout', 'ship'].includes(opts.kind)) refuse(`Unknown kind: ${opts.kind}`);
+  if (opts.type !== undefined && (opts.kind !== 'ship' || !BRANCH_TYPES.includes(opts.type))) refuse(opts.kind !== 'ship' ? 'Only a ship task has a branch, so only it takes --type.' : `Unknown type: ${opts.type}. Known: ${BRANCH_TYPES.join(', ')}`);
   const agent = AGENTS[opts.agent] ?? refuse(`Unknown agent: ${opts.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
   if (fs.existsSync(taskDir(h, id))) refuse(`Task ${id} already exists.`);
@@ -583,6 +613,7 @@ function cmdSpawn(args) {
 function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   const dir = taskDir(h, id), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
   let worktree = slash(path.join(h.worktrees, id));
+  const branch = opts.kind === 'ship' ? `${extra.selfFix ? 'fix' : opts.type ?? 'feature'}/${id}` : null;
   // A project added with --treehouse takes its copies from the treehouse pool (already set
   // up, dependencies and all) instead of a fresh git worktree.
   const pool = project.worktrees === 'treehouse' ? 'treehouse' : null;
@@ -593,12 +624,12 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
-    ...(pool ? { pool } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
+    ...(branch ? { branch } : {}), ...(pool ? { pool } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
   saveTask(h, record);
 
   const failed = why => { saveTask(h, { ...record, state: 'failed', error: why.slice(0, 400) }); refuse(`Could not create the working copy: ${why}`, 5); };
   if (pool) {
-    const got = runTool('treehouse', ['get', '--lease', '--json', ...(opts.kind === 'ship' ? ['-b', `crew/${id}`] : [])], { cwd: project.path, timeout: 600000 });
+    const got = runTool('treehouse', ['get', '--lease', '--json', ...(branch ? ['-b', branch] : [])], { cwd: project.path, timeout: 600000 });
     let leased = null;
     try { leased = JSON.parse(got.stdout).path; } catch { /* reported below */ }
     if (got.code !== 0 || !leased) failed(`treehouse gave no working copy (${lastLine(got.stderr || got.stdout)})`);
@@ -606,8 +637,8 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
     record = { ...record, worktree };
     saveTask(h, record);
   } else {
-    const wt = opts.kind === 'ship'
-      ? run('git', ['-C', project.path, 'worktree', 'add', '-b', `crew/${id}`, worktree, 'HEAD'])
+    const wt = branch
+      ? run('git', ['-C', project.path, 'worktree', 'add', '-b', branch, worktree, 'HEAD'])
       : run('git', ['-C', project.path, 'worktree', 'add', '--detach', worktree, 'HEAD']);
     if (wt.code !== 0) failed(wt.stderr.trim());
   }
@@ -763,13 +794,13 @@ function cmdStop(args) {
   if (!result.stopped) process.exitCode = 6;
 }
 
-// A ship task's branch crew/<id> outlives its working copy on purpose: it holds the commits.
+// A ship task's branch outlives its working copy on purpose: it holds the commits.
 // Once they are merged it holds nothing, so it goes with the copy. Merged means: reachable
 // from the project's current or default branch, or GitHub has a merged pull request whose
 // head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
 function dropMergedBranch(project, task) {
   if (task.kind !== 'ship' || task.selfFix || !project?.path) return '';
-  const branch = `crew/${task.id}`, git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
+  const branch = branchOf(task), git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
   let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
@@ -801,6 +832,8 @@ function cmdFinish(args) {
     const files = dirty.stdout.split(/\r?\n/).filter(Boolean);
     if (files.length) refuse(`Task ${id} has uncommitted work in ${task.worktree} (${files.slice(0, 5).map(l => l.slice(3)).join(', ')}${files.length > 5 ? ', …' : ''}). Nothing was removed. Commit it there, or pass --force to discard it.`, 6);
   }
+  // A copy marked to keep (the shared delivery workflow's marker) is not removed unasked.
+  if (!force && fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP'))) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
   if (task.terminal) {
     let seen = probe(task.terminal).state;
     if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; the working copy was kept. Try again.`, 4);
@@ -813,7 +846,10 @@ function cmdFinish(args) {
   let removal = { code: 0, stderr: '' };
   if (task.pool === 'treehouse') {
     // The copy is a pool slot: it goes back to treehouse, which cleans it and keeps it.
-    const back = runTool('treehouse', ['return', task.worktree], { cwd: project?.path, timeout: 180000 });
+    // treehouse refuses a slot with loose files unless told to clean it. A scout's leftovers
+    // are scratch, and --force is the person's word to discard; a ship task's unsaved work
+    // without --force was refused above.
+    const back = runTool('treehouse', ['return', ...(force || task.kind === 'scout' ? ['--force'] : []), task.worktree], { cwd: project?.path, timeout: 180000 });
     if (!back) refuse(`Task ${id} uses a treehouse working copy, and treehouse is not installed here; nothing was returned.`, 6);
     if (back.code !== 0 && fs.existsSync(task.worktree)) refuse(`treehouse did not take the working copy back (${lastLine(back.stderr || back.stdout)}); it was kept: ${task.worktree}`, 6);
     if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
@@ -831,7 +867,7 @@ function cmdFinish(args) {
   }
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
   // A published self-fix is on main; its branch has nothing left to keep.
-  if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', `crew/${id}`]);
+  if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', branchOf(task)]);
   if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
   // An emptied folder that something still sits in (a helper process the agent left behind)
   // is not worth failing for: the work is gone from disk and from git; say so and move on.
@@ -887,8 +923,8 @@ function cmdReview(args) {
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
   const text = [
-    `Review the work of task ${id}. It is the branch \`crew/${id}\` of this repository; you are on the commit it started from.`,
-    '', `- See it with \`git log HEAD..crew/${id}\` and \`git diff HEAD...crew/${id}\`. Read the changed files whole where the diff is not enough.`,
+    `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
+    '', `- See it with \`git log HEAD..${branchOf(task)}\` and \`git diff HEAD...${branchOf(task)}\`. Read the changed files whole where the diff is not enough.`,
     `- What it was asked to do is in \`${task.brief}\`; what its author says it did is in \`${task.report}\`.`,
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
@@ -916,7 +952,7 @@ function cmdLand(args) {
   const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
   const no = (why, code = 6) => refuse(`Task ${id} was not delivered: ${why}`, code);
-  if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone. Its commits are still on branch crew/${id} in ${project.path}.`);
+  if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone. Its commits are still on branch ${branchOf(task)} in ${project.path}.`);
   const dirty = git('status', '--porcelain');
   if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). Tell the worker to commit them: crew tell ${id} "..."`);
   const remote = git('remote', 'get-url', 'origin');
@@ -932,7 +968,7 @@ function cmdLand(args) {
     backlogMove(h, id, 'done', ['--pr', found]);
     return;
   }
-  if (remote.code !== 0) no(`the project has no \`origin\` to push to. The work stays on branch crew/${id} in ${project.path}.`);
+  if (remote.code !== 0) no(`the project has no \`origin\` to push to. The work stays on branch ${branchOf(task)} in ${project.path}.`);
   // The pull request goes against the branch the project folder is on, if that branch is
   // published; otherwise against the repository's default branch.
   const current = run('git', ['-C', project.path, 'rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim();
@@ -942,7 +978,7 @@ function cmdLand(args) {
   if (git('fetch', '--quiet', 'origin', base).code !== 0) no('the project\'s origin could not be reached. Try again.', 4);
   const subjects = git('log', '--reverse', '--format=%s', `FETCH_HEAD..HEAD`).stdout.split(/\r?\n/).filter(Boolean);
   if (!subjects.length) no(`its branch has no commits beyond ${base}.`);
-  const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/crew/${id}`);
+  const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/${branchOf(task)}`);
   if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}).`, 4);
   const bodyFile = path.join(taskDir(h, id), 'pull-request.md');
   const report = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/).slice(0, 200).join('\n') : '';
@@ -951,9 +987,9 @@ function cmdLand(args) {
   // the repository, the pull request is opened as that one.
   const owner = githubOwner(remote.stdout), token = owner ? gh(['auth', 'token', '--user', owner]) : null;
   const env = token?.code === 0 && token.stdout.trim() ? { ...process.env, GH_TOKEN: token.stdout.trim() } : process.env;
-  const made = gh(['pr', 'create', '--base', base, '--head', `crew/${id}`, '--title', title || subjects[0], '--body-file', bodyFile], { cwd: wt, env, timeout: 120000 });
+  const made = gh(['pr', 'create', '--base', base, '--head', `${branchOf(task)}`, '--title', title || subjects[0], '--body-file', bodyFile], { cwd: wt, env, timeout: 120000 });
   const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
-  if (made.error || made.code !== 0 || !url) no(`its branch crew/${id} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
+  if (made.error || made.code !== 0 || !url) no(`its branch ${branchOf(task)} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
   console.log(`delivered ${id}: ${url} (against ${base}, ${subjects.length} commit${subjects.length === 1 ? '' : 's'}). Merging it is the person's decision.`);
   backlogMove(h, id, 'done', ['--pr', url]);
@@ -966,8 +1002,15 @@ function cmdLand(args) {
 // stays inside crew/, it sits on top of the published main, and the whole test suite passes.
 // Machines pick the result up at their next `crew start`; `crew rollback` undoes it locally.
 const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || path.join(HERE, '..')));
-const STATE = path.join(os.homedir(), '.crew');
-const PREVIOUS = path.join(STATE, 'tool-previous'), PINNED = path.join(STATE, 'tool-pinned'), CRASHES = path.join(STATE, 'crashes');
+// Update and crash records. Before 0.7 they sat directly in ~/.crew; one found there is moved
+// on first use.
+const STATE = path.join(CREW_DIR, 'state');
+function stateFile(name, before) {
+  const file = path.join(STATE, name), old = path.join(CREW_DIR, before);
+  try { if (!fs.existsSync(file) && fs.existsSync(old)) { fs.mkdirSync(STATE, { recursive: true }); fs.renameSync(old, file); } } catch { /* stays where it was */ }
+  return file;
+}
+const PREVIOUS = stateFile('previous', 'tool-previous'), PINNED = stateFile('pinned', 'tool-pinned'), CRASHES = stateFile('crashes', 'crashes');
 const SELF_PROJECT = 'crew:self'; // not a valid project name, so it can never be a registered one
 const toolGit = (...args) => run('git', ['-C', TOOL_ROOT, ...args], { timeout: 120000 });
 const toolRevision = () => { const r = toolGit('rev-parse', 'HEAD'); return r.code === 0 ? r.stdout.trim() : null; };
@@ -976,7 +1019,7 @@ const lastLine = text => String(text ?? '').trim().split(/\r?\n/).filter(Boolean
 const readLine = file => { try { return fs.readFileSync(file, 'utf8').trim() || null; } catch { return null; } };
 const isClone = () => fs.existsSync(path.join(TOOL_ROOT, '.git'));
 // Only the copy Herdr installed updates itself; a developer's checkout is left alone.
-const installedCopy = () => process.env.CREW_AUTO_UPDATE === '1' || slash(path.resolve(STATE, 'tool')).toLowerCase() === TOOL_ROOT.toLowerCase();
+const installedCopy = () => process.env.CREW_AUTO_UPDATE === '1' || ['core', 'tool'].some(name => slash(path.join(CREW_DIR, name)).toLowerCase() === TOOL_ROOT.toLowerCase());
 
 // Fast-forwards the tool to the published main. Never merges, rebases or discards anything.
 function updateTool({ respectPin = false } = {}) {
@@ -1010,6 +1053,7 @@ function cmdRollback() {
   if (toolGit('status', '--porcelain', '--untracked-files=no').stdout.trim()) refuse(`${TOOL_ROOT} has uncommitted changes; nothing was rolled back.`, 6);
   const back = toolGit('reset', '--hard', '--quiet', previous);
   if (back.code !== 0) refuse(`Could not go back to ${short(previous)}: ${lastLine(back.stderr)}`, 6);
+  fs.mkdirSync(STATE, { recursive: true });
   fs.writeFileSync(PINNED, `${current}\n`);
   fs.rmSync(PREVIOUS, { force: true });
   console.log(`crew went back ${short(current)} -> ${short(previous)} on this machine. It stays there until something newer than ${short(current)} is published, or until \`crew update\`.`);
@@ -1138,11 +1182,11 @@ function cmdStatus(args) {
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
-  crew init [folder]                       create a crew home (default ~/.crew/crew)
+  crew init [folder]                       create a crew home (default ~/.crew)
   crew project add <name> <git folder> [--treehouse] [--gate-skip <steps>|none]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
-  crew spawn <id> --project <name> [--kind scout|ship] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
+  crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"
   crew wait <id>... [--timeout seconds]    block until each worker reports
   crew status [--all] [--json]             tasks and their terminals
   crew stop <id> [--force]                 ask the worker to leave
