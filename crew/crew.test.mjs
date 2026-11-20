@@ -917,9 +917,27 @@ if (a[0] === '--version') process.exit(0);`);
       assert.equal(JSON.parse(crew2(['status', '--all', '--json']).out).tasks.find(t => t.id === 'plain').copyToReturn.why, 'marked to keep');
       // Once the marker is gone the next finish of another task returns plain's copy.
       fs.rmSync(path.join(plain.worktree, '.artifacts'), { recursive: true });
+      // A commit made in the (detached) scout copy after finish leaves status clean, but no
+      // branch holds it: the copy waits rather than lose it.
+      git('-C', plain.worktree, ...who, 'commit', '--allow-empty', '-qm', 'mine');
+      const mineCommit = git('-C', plain.worktree, 'rev-parse', 'HEAD').trim();
       q = crew2(['spawn', 'other2', '--project', 'demo', 'x']); assert.equal(q.code, 0, q.out);
       q = crew2(['finish', 'other2']); assert.equal(q.code, 0, q.out);
+      assert.match(q.out, new RegExp(`the working copy of finished task plain waits: it has commits made since finish that no branch holds \\(${mineCommit.slice(0, 8)}\\)`));
+      assert.ok(fs.existsSync(plain.worktree)); assert.equal(JSON.parse(crew2(['status', '--all', '--json']).out).tasks.find(t => t.id === 'plain').copyToReturn.why, 'commits');
+      // Moving back to where it was does not hide it: the copy's own reflog still names it.
+      git('-C', plain.worktree, 'checkout', '-q', '--detach', 'HEAD~1');
+      assert.match(crew2(['start']).out, /plain waits: it has commits made since finish that no branch holds/);
+      // Once a branch holds the commit, nothing is lost with the copy and it goes back. A branch
+      // created and checked out there, and a stash made there, live in the repository and stay.
+      git('-C', plain.worktree, 'switch', '-q', '-c', 'keep-mine', mineCommit);
+      fs.writeFileSync(path.join(plain.worktree, 'stashed.txt'), 'put aside');
+      git('-C', plain.worktree, ...who, 'stash', 'push', '-q', '-u', '-m', 'put aside in the copy');
+      q = crew2(['finish', 'other2']); assert.equal(q.code, 0, q.out);
       assert.match(q.out, /returned the working copy of finished task plain/); assert.match(q.out, /1 working copy of finished tasks still held by another terminal/);
+      assert.equal(git('-C', project, 'rev-parse', 'keep-mine').trim(), mineCommit, 'The branch made in the copy outlives it');
+      assert.match(git('-C', project, 'stash', 'list'), /put aside in the copy/, 'So does a stash made there');
+      git('-C', project, 'stash', 'drop', '-q'); git('-C', project, 'branch', '-D', 'keep-mine');
       assert.ok(!fs.existsSync(plain.worktree) && !task2('plain').copyToReturn && task2('plain').copyReturned, 'Returned and no longer marked');
       assert.ok(fs.existsSync(dirty.worktree), 'A copy still held is left');
       // The guest of dirty closes after writing into the copy: start keeps the copy and its work.
@@ -976,6 +994,15 @@ if (a[0] === '--version') process.exit(0);`);
       fs.mkdirSync(path.join(forced.worktree, 'scratch')); fs.writeFileSync(path.join(forced.worktree, 'scratch', 'notes.md'), 'mine');
       q = crew2(['start']); assert.match(q.out, /forced waits: it has work written since finish \(scratch\/\)/); assert.ok(fs.existsSync(path.join(forced.worktree, 'scratch', 'notes.md')));
       fs.rmSync(path.join(forced.worktree, 'scratch'), { recursive: true });
+      // A merge (or rebase, cherry-pick...) begun in the copy after finish keeps it as well.
+      const forcedGitDir = git('-C', forced.worktree, 'rev-parse', '--absolute-git-dir').trim();
+      fs.writeFileSync(path.join(forcedGitDir, 'MERGE_HEAD'), `${git('-C', forced.worktree, 'rev-parse', 'HEAD').trim()}\n`);
+      q = crew2(['start']); assert.match(q.out, /forced waits: it has a merge in progress since finish/); assert.ok(fs.existsSync(forced.worktree));
+      fs.rmSync(path.join(forcedGitDir, 'MERGE_HEAD'));
+      // `git worktree lock` is somebody's word to keep it.
+      git('-C', project, 'worktree', 'lock', forced.worktree);
+      q = crew2(['start']); assert.match(q.out, /forced waits: it has a lock \(git worktree lock\) since finish/); assert.ok(fs.existsSync(forced.worktree));
+      git('-C', project, 'worktree', 'unlock', forced.worktree);
       q = crew2(['start']); assert.match(q.out, /returned the working copy of finished task forced/); assert.ok(!fs.existsSync(forced.worktree));
       // A waiting copy keeps its project, which is needed to hand it back.
       assert.equal(crew2(['project', 'add', 'side', project]).code, 0);

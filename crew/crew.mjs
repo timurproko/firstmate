@@ -1337,7 +1337,31 @@ function snapshotCopy(folder) {
   if (!changed || !ignored) return null;
   const files = {};
   for (const { file } of [...changed, ...ignored.filter(e => e.code === '!!')]) files[file] = stamp(file);
-  return { files, keep: stamp(path.join('.artifacts', 'KEEP')) };
+  return { files, keep: stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
+}
+// Where the copy's history stood: its HEAD and branch, how many entries its own HEAD reflog
+// has (a linked copy's reflog is its own and goes with it), and which git operations are
+// under way in it. Commits made in the copy after finish show up as new reflog entries.
+// `locked` is `git worktree lock`: somebody's explicit word to keep the copy.
+const OPERATIONS = { 'rebase-merge': 'a rebase in progress', 'rebase-apply': 'a rebase or patch series in progress', MERGE_HEAD: 'a merge in progress', CHERRY_PICK_HEAD: 'a cherry-pick in progress',
+  REVERT_HEAD: 'a revert in progress', BISECT_LOG: 'a bisect in progress', locked: 'a lock (git worktree lock)' };
+function historyOf(folder) {
+  if (!fs.existsSync(path.join(folder, '.git'))) return { head: null, branch: null, reflog: 0, operations: [] };
+  const git = (...a) => run('git', ['-C', folder, ...a]);
+  const reflog = git('reflog', 'show', '--format=%H', 'HEAD'), dir = git('rev-parse', '--absolute-git-dir').stdout.trim();
+  return { head: git('rev-parse', '-q', '--verify', 'HEAD').stdout.trim() || null, branch: git('symbolic-ref', '--short', '-q', 'HEAD').stdout.trim() || null,
+    reflog: reflog.code === 0 ? reflog.stdout.split(/\r?\n/).filter(Boolean).length : 0,
+    operations: dir ? Object.keys(OPERATIONS).filter(name => fs.existsSync(path.join(dir, name))) : [] };
+}
+// Commits the copy's HEAD reached since finish that no branch or tag holds: they would be
+// lost with the copy (a scout's copy is detached, and its reflog goes with it).
+function commitsOnlyInCopy(folder, before) {
+  const git = (...a) => run('git', ['-C', folder, ...a]);
+  const log = git('reflog', 'show', '--format=%H', 'HEAD'), entries = log.code === 0 ? log.stdout.split(/\r?\n/).filter(Boolean) : [];
+  const now = git('rev-parse', '-q', '--verify', 'HEAD').stdout.trim();
+  const reached = new Set(entries.slice(0, Math.max(0, entries.length - (before.reflog ?? 0))));
+  if (now && now !== before.head) reached.add(now);
+  return [...reached].filter(sha => !git('for-each-ref', '--count=1', '--contains', sha, '--format=%(refname)', 'refs/heads', 'refs/tags').stdout.trim());
 }
 // Whether a postponed copy can go back unasked. The copy was held by a terminal somebody
 // works in, so anything written or marked after finish is theirs and keeps it: a file that
@@ -1350,6 +1374,10 @@ function checkWaitingCopy(task) {
   if (seen.keep !== null && seen.keep !== before.keep) return { kept: { why: 'marked to keep', text: 'it was marked to keep by .artifacts/KEEP since finish' }, leftovers: true };
   const added = Object.keys(seen.files).filter(file => !(file in before.files) || before.files[file] !== seen.files[file]);
   if (added.length) return { kept: { why: 'uncommitted work', text: `it has work written since finish (${listFiles(added)})` }, leftovers: true };
+  const started = seen.operations.filter(name => !(before.operations ?? []).includes(name));
+  if (started.length) return { kept: { why: 'operation in progress', text: `it has ${started.map(name => OPERATIONS[name]).join(' and ')} since finish` }, leftovers: true };
+  const commits = commitsOnlyInCopy(task.worktree, before);
+  if (commits.length) return { kept: { why: 'commits', text: `it has commits made since finish that no branch holds (${listFiles(commits.map(sha => sha.slice(0, 8)))})` }, leftovers: true };
   return { kept: null, leftovers: Object.keys(seen.files).length > 0 || seen.keep !== null };
 }
 

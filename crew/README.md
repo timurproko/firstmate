@@ -246,8 +246,10 @@ says so. A copy deleted by hand meanwhile is pruned from git and its merged bran
 wait for next time with one summary line; a failed return is reported in one line and never fails the command.
 Since somebody worked in the copy meanwhile, finish records what the copy held when it was postponed (changed,
 untracked and ignored files with their times, and the keep marker). The later return keeps the copy waiting,
-with a line that says why, when a file is new or changed since then or a `.artifacts/KEEP` marker appeared, for
-any kind of task. A `--force` given at finish covers only what was there then. `crew finish <id>` on such a
+with a line that says why, when a file is new or changed since then, a `.artifacts/KEEP` marker appeared, a
+rebase, merge, cherry-pick, revert, bisect or `git worktree lock` began there, or the copy's HEAD reached a
+commit that no branch or tag holds (its own reflog is read, so moving back does not hide it), for any kind of
+task. Stashes and branches made in the copy live in the repository and outlive it. A `--force` given at finish covers only what was there then. `crew finish <id>` on such a
 closed task tries its copy again and says how it stands; `crew finish <id> --force` discards what was found and
 returns the copy, never while a terminal holds it. A Core that does not answer keeps every waiting copy and
 says which. A project keeps its registration while one of its finished tasks still waits for its copy. `crew status --all` lists such a task with who holds its copy; plain `crew status`
