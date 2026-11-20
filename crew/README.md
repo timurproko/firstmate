@@ -242,8 +242,12 @@ acts on.
 Crew has no background process, so the postponed copies are returned at the next `crew start` and at every
 `crew finish` (of any task): each one that no terminal holds any more goes back the way finish would have taken
 it (delivery, the legacy treehouse path, or `git worktree remove`), its merged branch is dropped, and one line
-says so. Copies still held wait for next time with one summary line; a failed return is reported in one line
-and never fails the command. `crew status --all` lists such a task with who holds its copy; plain `crew status`
+says so. A copy deleted by hand meanwhile is pruned from git and its merged branch dropped. Copies still held
+wait for next time with one summary line; a failed return is reported in one line and never fails the command.
+Since somebody worked in the copy meanwhile, the return checks it again as finish would: uncommitted ship work or
+a `.artifacts/KEEP` marker keeps it waiting with a line that says why (unless finish was forced).
+`crew finish <id> --force` on such a closed task discards that and returns the copy, never while a terminal
+holds it. `crew status --all` lists such a task with who holds its copy; plain `crew status`
 ends with a line counting them.
 
 The refusals that protect work come first and are unchanged: uncommitted ship work, the `.artifacts/KEEP`
