@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.10.1';
+export const VERSION = '0.11.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -299,6 +299,8 @@ behind it. Crew reads the quota itself (quota-axi, each saved Claude account sep
   report is not a failure: \`crew wait\` hands its
   task to the next in the list, in the same working copy, and keeps waiting. It says so in a
   line; pass that on to the person. \`crew relaunch <id> [--agent ...]\` does the same by hand.
+- \`crew wait\` tells a worker stopped on a provider or network error to continue, then hands the task over if that does not help.
+  It reports each action in a line; pass it on to the person afterwards rather than asking them to resume the worker.
 - "Nobody can take this work now" lists why for each candidate. Tell the person exactly that;
   do not retry in a loop.
 
@@ -1247,7 +1249,7 @@ function cmdWait(args) {
         const moved = relaunch(h, loadTask(h, id), reason);
         if (moved.pick) console.log(`== ${id}: ${from} is gone: ${reason}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
         else { blocked.set(id, `${from} is gone: ${reason}, and ${moved.why}`); settled.set(id, 'needs a person'); }
-      } else if (handover && t.status?.state && t.status.state !== 'working' && stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12)) {
+      } else if (handover && t.status?.state && !['working', 'blocked'].includes(t.status.state) && stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12)) {
         // The worker cannot go on for want of quota or a login: the next candidate of its
         // chain takes the task over in the same working copy, and the wait goes on.
         const reason = stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12), from = pickLabel(task.launch ?? { harness: task.agent });
@@ -2062,6 +2064,8 @@ function cmdStatus(args) {
     return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel),
       standbyStatus: (t.chain ?? []).map(c => { const fact = t.candidateChecks?.facts?.[pickKey(c)]; return { ...c, label: pickLabel(c), status: fact?.status ?? 'unknown', note: fact?.note ?? 'no recorded reading', remaining: fact?.remaining ?? null, passedOver: Boolean(fact && !['ok', 'unknown'].includes(fact.status)), checkedAt: t.candidateChecks?.checkedAt ?? null }; }), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
+      nudges: t.nudges ?? [], continuations: (t.nudges ?? []).filter(n => n.kind === 'error' && n.terminal === t.terminal).length,
+      recovery: t.recovery?.terminal === t.terminal ? t.recovery : null,
       report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime),
       deliveryKind: t.kind === 'ship' ? t.gate ? 'gate' : t.workflow ? 'workflow' : 'plain' : null,
       ...(t.workflow ? { workflow: t.workflow, stage: t.stage ?? null } : {}),
@@ -2075,7 +2079,7 @@ function cmdStatus(args) {
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
   // A workflow task's stage is what its last report said it is; GitHub is not asked here.
   const stageOf = t => (!t.stage ? '' : t.stage === 'plan' && t.state === 'reported' ? ' (plan awaiting approval)' : ` (${t.stage})`);
-  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.pending ? `waits: ${t.copyToReturn.pending}${t.copyToReturn.heldBy ? `; held by ${t.copyToReturn.heldBy}` : ''}` : t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state}${t.core.status === 'error' ? `; told to continue ${t.continuations} ${t.continuations === 1 ? 'time' : 'times'}` : ''})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.pending ? `waits: ${t.copyToReturn.pending}${t.copyToReturn.heldBy ? `; held by ${t.copyToReturn.heldBy}` : ''}` : t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
   if (waiting) console.log(`${waiting} working ${waiting === 1 ? 'copy' : 'copies'} of finished tasks still to be returned (crew status --all)`);
 }
 // Where a postponed copy stands now, asked of Core: { worktree, since, heldBy, free }.
@@ -2101,10 +2105,11 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked
   crew relaunch <id> [who] ["<why>"]       end the current session, even busy; hand over working, stopped or failed work; copy stays
       no choice: reread all untried saved candidates, including earlier skips; a choice rebuilds the list and excludes only the current worker
-  crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; the owner can hand over quota/login stops
-      CREW_NO_FALLBACK=1 also disables hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
+  crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
+      CREW_NO_FALLBACK=1 also disables recovery and hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
   crew status [--all] [--json]             tasks, terminals, PR links and elapsed time; --all also shows why finished copies wait
       JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
+      recovery: current Core errors and continuation counts; JSON includes nudges history and the active recovery record; no messages sent
   crew stop <id> [--force]                 ask the worker to leave
   crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
       protective refusals use the accepted baseline before stop; later uncertainty postpones return; status alone returns nothing

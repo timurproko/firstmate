@@ -536,6 +536,7 @@ try {
     // only after land recorded it, never merely because a pull request is open.
     const rules = fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8');
     assert.ok(rules.includes('task only once `crew land` has recorded the pull request') && !rules.includes('once the pull request is open'), rules);
+    assert.ok(rules.includes('provider or network error') && rules.includes('pass it on to the person afterwards'), rules);
   }
   assert.equal(fs.readFileSync(path.join(homeDir, 'coordinator', 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
   assert.equal(crew(['init', homeDir]).code, 2, 'A home is never re-initialised');
@@ -1314,7 +1315,7 @@ if (a[0] === '--version') process.exit(0);`);
     const recovering = (id, terminalPatch = {}, taskPatch = {}) => {
       const dir = path.join(home2, 'tasks', id), address = `recover-${id}`;
       fs.mkdirSync(dir);
-      const task = { ...task2('plain'), id, terminal: address, state: 'working', tells: 2, chain: [],
+      const task = { ...task2('plain'), id, terminal: address, state: 'working', tells: 2, candidates: taskPatch.chain ?? [], chain: [],
         worktree: path.join(dir, 'copy'), brief: path.join(dir, 'brief.md'), report: path.join(dir, 'report.md'), ...taskPatch };
       fs.mkdirSync(task.worktree);
       fs.writeFileSync(path.join(dir, 'task.json'), JSON.stringify(task));
@@ -1339,6 +1340,7 @@ if (a[0] === '--version') process.exit(0);`);
       q = quickWait(task.id, { CREW_RECOVERY_SECONDS: '0.06' }); assert.equal(q.code, 7, q.out);
       const nudges = task2(task.id).nudges;
       assert.deepEqual(nudges.map(n => [n.kind, n.attempt]), [['error', 1], ['error', 2], ['error', 3]]);
+      assert.ok(Date.parse(nudges[0].at) - Date.parse(task2(task.id).recovery.since) >= 60, 'First message waits one unit');
       assert.ok(Date.parse(nudges[1].at) - Date.parse(nudges[0].at) >= 240, 'Second message waits four units');
       assert.ok(Date.parse(nudges[2].at) - Date.parse(nudges[1].at) >= 600, 'Third message waits ten units');
       assert.equal(task2(task.id).tells, 2); assert.equal(task2(task.id).state, 'working');
@@ -1350,13 +1352,14 @@ if (a[0] === '--version') process.exit(0);`);
       assert.equal(sendsTo(task.terminal).length, 3, 'Another wait cannot bypass the cap');
     }
     {
-      const task = recovering('error-handover', {}, { chain: [{ harness: 'a1', model: 'openai-codex/gpt-x' }] });
+      const lastError = 'Error: upstream connect error or disconnect/reset before headers: remote connection failure';
+      const task = recovering('error-handover', { onSends: [{}, {}, { screen: `${lastError}\n` }] }, { chain: [{ harness: 'a1', model: 'openai-codex/gpt-x' }] });
       q = quickWait(task.id, {}, [], 'k1', '2'); assert.equal(q.code, 124, q.out);
       const moved = task2(task.id);
       assert.notEqual(moved.terminal, task.terminal, q.out); assert.equal(sendsTo(task.terminal).length, 3);
-      assert.equal(moved.fallbacks.at(-1).why, 'Error: no healthy upstream');
+      assert.equal(moved.fallbacks.at(-1).why, lastError);
       assert.equal(readWorld().terminals[moved.terminal].cwd, task.worktree);
-      assert.ok(lastRun().includes('Error: no healthy upstream'), lastRun());
+      assert.ok(lastRun().includes(lastError), lastRun());
     }
     {
       const task = recovering('error-reset', { onSends: [
@@ -1424,7 +1427,7 @@ if (a[0] === '--version') process.exit(0);`);
       assert.equal(sendsTo(task.terminal).length, 1); assert.equal(task2(task.id).state, 'working');
     }
     {
-      const task = recovering('idle-blocked', { status: { state: 'blocked', msg: 'Allow this command?' } });
+      const task = recovering('idle-blocked', { status: { state: 'blocked', msg: 'Allow this command?' }, screen: 'Error: usage limit reached\n' });
       q = quickWait(task.id); assert.equal(q.code, 7, q.out);
       assert.match(q.out, /needs a person - Allow this command\?/);
       assert.equal(sendsTo(task.terminal).length, 0);
@@ -1441,6 +1444,27 @@ if (a[0] === '--version') process.exit(0);`);
       setTerminal(task.terminal, { reportOnSend: path.join(home2, 'tasks', task.id, 'task.json') });
       q = quickWait(task.id); assert.equal(q.code, 0, q.out);
       assert.equal(task2(task.id).state, 'reported'); assert.equal(task2(task.id).nudges.length, 1);
+    }
+
+    // Status combines live Core state with recorded sends and never performs recovery.
+    {
+      const task = task2('error-cap'), before = task2(task.id), sent = sendsTo(task.terminal).length;
+      q = crew2(['status']); assert.equal(q.code, 0, q.out);
+      assert.match(q.out, /error-cap\tworking\t[^\r\n]*\(error; told to continue 3 times\)/);
+      q = crew2(['status', '--json']); assert.equal(q.code, 0, q.out);
+      const shown = JSON.parse(q.out).tasks.find(t => t.id === task.id);
+      assert.equal(shown.core.status, 'error'); assert.equal(shown.continuations, 3);
+      assert.deepEqual(shown.nudges, task.nudges); assert.equal(shown.recovery.errors, 3);
+      assert.deepEqual(task2(task.id), before); assert.equal(sendsTo(task.terminal).length, sent);
+      setTerminal(task.terminal, workingState);
+      const changed = JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === task.id);
+      assert.equal(changed.core.status, 'working'); assert.equal(changed.continuations, 3);
+      assert.deepEqual(task2(task.id), before, 'Status does not reset recovery or send messages');
+      const fresh = recovering('status-error', {}, { nudges: [{ kind: 'error', terminal: 'old-worker', attempt: 1 }] });
+      q = crew2(['status']); assert.match(q.out, /status-error\tworking\t[^\r\n]*\(error; told to continue 0 times\)/);
+      const zero = JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === fresh.id);
+      assert.equal(zero.continuations, 0); assert.equal(zero.nudges.length, 1);
+      assert.equal(sendsTo(fresh.terminal).length, 0);
     }
 
     // finish never takes somebody else's terminal down with the working copy: returning a pool slot

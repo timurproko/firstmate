@@ -38,8 +38,8 @@ crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<tas
     who: [--agent a1|pi|claude] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]
 crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   candidates and quota now, next choice marked
 crew relaunch <id> [who] ["<why>"]       end the current session and hand over working, stopped or failed work; copy stays
-crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; the owner can hand over quota/login stops
-crew status [--all] [--json]             tasks, terminals and elapsed time; JSON also shows delivery kind and standby eligibility
+crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
+crew status [--all] [--json]             tasks, terminals and elapsed time; JSON also shows delivery kind, standby eligibility and recovery
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
 crew done [<id>]                         (worker) my report is written
@@ -66,9 +66,9 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
   space/tab labels. The agent starts with one instruction as its command-line argument
   ("read the brief…"), so nothing is typed into it.
 - **Report.** The worker writes `tasks/<id>/report.md` and runs `crew done` from its own
-  terminal. `crew wait` reads the task file once a second. Every few seconds it asks Core
-  about ended terminals, missing agents, quota/login stops on non-working screens, and
-  questions or permissions that need a person.
+  terminal.
+  `crew wait` reads the task file once a second.
+  Every few seconds it asks Core about ended terminals, missing agents, quota/login stops on non-working screens, provider errors, idle workers, and questions or permissions that need a person, as described under work under way below.
 - **Finish.** A worker still working is never closed without `--force`. A1 leaves through
   its integration API (`session.exit`, proven by `session-unavailable`); other agents are
   closed once idle. The terminal is removed; the copy's return can be postponed. The report
@@ -165,10 +165,27 @@ Claude profile.
   the current session even if busy, without an idle test or `--force`; the copy stays. Without
   selection flags it uses the saved list and excludes every tried candidate. A selection flag
   rebuilds the list from current configuration and excludes only the current candidate.
-- `crew agents` shows rows in original order and marks the next choice, not a sorted fallback
-  list. `crew status` shows the current worker. JSON retains `standby` labels and adds
-  `standbyStatus`: each remaining candidate's recorded status, note, `passedOver` and
-  `checkedAt`. Status does not reread quota; an old task can only reconsider the chain it saved.
+  A provider or network error is different: after two consecutive Core `error` observations, crew sends a short message to continue from where the worker stopped.
+  The first message waits 30 seconds from the first error observation; the second waits two minutes after the first message, and the third waits five minutes after the second.
+  After three messages and two further error observations without recovery, the existing hand-over starts the next candidate with the last screen error as its reason.
+  With nobody left, the wait ends with "needs a person" and says what was tried.
+  Thirty seconds of observed working ends a stop and resets its retry allowance; a brief working flicker does not.
+  Attempts and retry timing survive another `crew wait`, and a replacement worker gets its own allowance.
+  Quota or login stops are still checked first and handed over immediately, without continuation messages.
+  A worker that stays `idle` or `done` for two minutes while its task is still working and has no report gets one reminder to continue, or write the report and run `crew done` if finished.
+  If it stays idle for another two minutes after the reminder, the wait ends with "needs a person" instead of sending repeated reminders.
+  Reported tasks and idle workers with an existing report are never nudged; a `blocked` permission or question still needs a person immediately.
+  Only the session owning the home sends recovery messages or hands tasks over, and `--no-fallback` or `CREW_NO_FALLBACK=1` disables both.
+  Automatic messages are recorded as `nudges`, not coordinator follow-ups: they do not change task state, report stage, or `tells`.
+  Each action prints one line for the coordinator to pass on to the person afterwards, rather than asking them to resume the worker.
+  `CREW_RECOVERY_SECONDS` overrides the common delay unit (a non-negative number, default `30`): error delays are 1, 4, and 10 units, idle intervals are 4 units, and sustained-working recovery is 1 unit.
+  Core checks normally remain five seconds apart; units below five seconds shorten checks too, down to 10 milliseconds, so tests can use `CREW_RECOVERY_SECONDS=0` while retaining the consecutive-observation checks.
+- `crew agents` shows rows in original order and marks the next choice, not a sorted fallback list.
+  Status JSON retains `standby` labels and `standbyStatus`: each remaining candidate's recorded status, note, `passedOver` and `checkedAt`.
+  Status does not reread quota; an old task can only reconsider the chain it saved.
+  `crew status` shows who works on each task, its current Core error state, and how many continuation messages that worker received.
+  `crew status --json` also includes `nudges` history, the worker's `continuations` count, and its active `recovery` record.
+  Both status forms only read; they never send recovery messages.
 
 ## Delivering a code change
 
