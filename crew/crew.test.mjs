@@ -181,6 +181,39 @@ gapTests.finish = () => {
   patch({ silentAfterRm: false, silent: false }); r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(removal.worktree));
 };
 
+gapTests.chain = () => {
+  const dir = path.join(root, 'gap-quota'); fs.mkdirSync(dir); const bin = path.join(dir, 'bin'); fs.mkdirSync(bin);
+  for (const name of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, name), '');
+  const quota = path.join(dir, 'quota.json'), log = path.join(dir, 'reads.log'), tool = path.join(dir, 'quota.mjs');
+  fs.writeFileSync(tool, `import fs from 'node:fs';
+const q = JSON.parse(fs.readFileSync(${JSON.stringify(quota)}, 'utf8')), a = process.argv.slice(2), families = a[a.indexOf('--provider') + 1].split(',');
+fs.appendFileSync(${JSON.stringify(log)}, families.join(',') + '\\n');
+console.log(JSON.stringify({providers: families.map(provider => q[provider] === 'login' ? {provider, state: {error: 'unauthorized'}, quotaSemantics: {status: 'unknown'}} : {provider, quotaSemantics: {status: 'known', effectiveAvailability: [{scope: 'all_models', effectivePercentRemaining: q[provider]}]}})}));`);
+  const setQuota = q => fs.writeFileSync(quota, JSON.stringify(q)); setQuota({ codex: 0, claude: 'login', copilot: 70 });
+  const f = gapFixture('chain', { CREW_TOOL_QUOTA_AXI: tool, CREW_AGENT_PATH: bin }); fs.mkdirSync(path.join(f.home, 'config'));
+  fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify({ default: [
+    { harness: 'a1', model: 'custom/gpt-x', provider: 'codex' }, { harness: 'claude', model: 'opus' }, { harness: 'pi', model: 'github-copilot/gpt-x' }] }));
+  const task = f.spawn('recover'); assert.equal(task.agent, 'pi');
+  assert.deepEqual(task.chain.map(c => c.harness), ['a1', 'claude'], 'Passed-over candidates remain in the original chain');
+  let shown = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === task.id);
+  assert.deepEqual(shown.standbyStatus.map(c => [c.status, c.passedOver]), [['exhausted', true], ['signed-out', true]]);
+  assert.ok(shown.standbyStatus.every(c => c.checkedAt && c.note));
+  setQuota({ codex: 60, claude: 'login', copilot: 0 }); fs.writeFileSync(log, '');
+  setTerminal(task.terminal, { status: { state: 'error', app: 'pi' }, screen: 'usage limit reached' });
+  let r = f.call(['wait', task.id, '--timeout', '6']); assert.equal(r.code, 124, r.out);
+  assert.equal(f.task(task.id).agent, 'a1', 'Automatic hand-over reconsiders recovered candidates');
+  assert.equal(f.task(task.id).launch.family, 'codex', 'The quota-family override survives saving and hand-over');
+  assert.ok(!fs.readFileSync(log, 'utf8').includes('copilot'), 'The current/tried worker is not read again');
+  setQuota({ codex: 0, claude: 70, copilot: 80 }); fs.writeFileSync(log, '');
+  r = f.call(['relaunch', task.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).agent, 'claude', 'Unnamed relaunch reconsiders a recovered login');
+  assert.equal(fs.readFileSync(log, 'utf8').trim(), 'claude', 'Only the untried candidate is read');
+  assert.deepEqual(f.task(task.id).candidates.map(c => c.harness), ['a1', 'claude', 'pi']);
+  assert.equal(f.call(['relaunch', task.id]).code, 8, 'Unnamed relaunch never repeats an already tried candidate');
+  setQuota({ codex: 70, claude: 70, copilot: 80 });
+  assert.equal(f.call(['relaunch', task.id, '--agent', 'a1', '--model', 'openai-codex/gpt-x']).code, 0, 'A named relaunch may retry an earlier choice');
+  assert.equal(f.call(['finish', task.id, '--force']).code, 0);
+};
+
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
   for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
@@ -1011,7 +1044,7 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['spawn', 'acc', '--project', 'demo', '--agent', 'claude', '--model', 'opus', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /passed over claude opus as one@example\.com: quota used up/); assert.match(q.out, /; claude opus as two@example\.com\r?\n/);
     assert.ok(lastRun().includes("claude-as.sh' --as 'two@example.com' --command") && lastRun().includes("'--model' 'opus' '--permission-mode'"), lastRun());
-    assert.deepEqual(task2('acc').chain, [], 'A login that is gone or empty is not kept as a fallback');
+    assert.deepEqual(task2('acc').chain.map(c => c.account), ['one@example.com', 'gone@example.com'], 'An exhausted or rejected login remains available for reconsideration');
     assert.deepEqual(fs.readFileSync(quotaLog, 'utf8').trim().split('\n'), ['one@example.com', 'two@example.com'], 'Each saved account is read by itself; the one whose login is gone is not');
 
     // The person's list: Firstmate's dispatch file, with roles and an account-less Claude profile.
@@ -1037,9 +1070,9 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['spawn', 'cfg', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /passed over a1 openai-codex\/gpt-x \(high\): quota used up/); assert.match(q.out, /; a1 github-copilot\/gpt-x, 2 more can take over/);
     assert.ok(lastRun().includes("'a1' '--provider' 'github-copilot' '--model' 'gpt-x' 'Read the brief"), lastRun());
-    assert.deepEqual(task2('cfg').chain.map(c => c.account), ['one@example.com', 'two@example.com']);
+    assert.deepEqual(task2('cfg').chain.map(c => c.account), [undefined, undefined, 'one@example.com', 'two@example.com', 'gone@example.com']);
     assert.match(crew2(['status']).out, /cfg\tworking\tscout\/a1 github-copilot\/gpt-x\t/);
-    assert.equal(JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === 'cfg').standby.length, 2);
+    assert.equal(JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === 'cfg').standby.length, 5);
 
     // The worker stops on a limit: `crew wait` hands the task to the next candidate and goes on waiting.
     const first = task2('cfg').terminal;
@@ -1048,7 +1081,7 @@ if (a[0] === '--version') process.exit(0);`);
     assert.match(q.out, /== cfg: a1 github-copilot\/gpt-x stopped \(Error: Codex error: The usage limit has been reached\); claude opus as one@example\.com continues it in terminal/);
     const moved = task2('cfg');
     assert.equal(moved.agent, 'claude'); assert.equal(moved.state, 'working'); assert.notEqual(moved.terminal, first); assert.equal(readWorld().terminals[first], undefined, 'The stopped worker\'s terminal is gone');
-    assert.deepEqual(moved.chain.map(c => c.account), ['two@example.com']); assert.equal(moved.fallbacks.length, 1);
+    assert.deepEqual(moved.chain.map(c => c.account), [undefined, undefined, 'two@example.com', 'gone@example.com']); assert.equal(moved.fallbacks.length, 1);
     assert.ok(lastRun().includes("--as 'one@example.com'") && lastRun().includes('Another worker (a1 github-copilot/gpt-x) began this task and had to stop') && lastRun().includes('continue from there'), lastRun());
     assert.equal(readWorld().terminals[moved.terminal].cwd, moved.worktree, 'Same working copy');
     assert.match(crew2(['status']).out, /scout\/claude opus as one@example\.com \(after a1 github-copilot\/gpt-x\)/);
@@ -1063,7 +1096,7 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['wait', 'cfg', '--timeout', '6']); assert.match(q.out, /claude opus as two@example\.com continues it/);
     setTerminal(task2('cfg').terminal, { status: { state: 'idle', app: 'claude' }, screen: 'Please run /login' });
     q = crew2(['wait', 'cfg', '--timeout', '8']); assert.equal(q.code, 7, q.out);
-    assert.match(q.out, /== cfg: needs a person - claude opus as two@example\.com stopped \(Please run \/login\) and there is no other candidate in its chain/);
+    assert.match(q.out, /== cfg: needs a person - claude opus as two@example\.com stopped \(Please run \/login\) and nobody else can take it:/);
     // By hand: the coordinator (or the person) names who takes it. The quota has come back for codex.
     setQuota({ codex: 30, copilot: null, 'one@example.com': 70, 'two@example.com': 55 });
     q = crew2(['relaunch', 'cfg', '--agent', 'a1', '--model', 'openai-codex/gpt-x', 'quota is back']); assert.equal(q.code, 0, q.out);
@@ -1246,7 +1279,7 @@ if (a[0] === '--version') process.exit(0);`);
     setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 80 });
     q = crew2(['spawn', 'floor1', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /passed over claude opus as one@example\.com: 49% left, under its floor of 50%/); assert.equal(task2('floor1').launch.account, 'two@example.com');
-    assert.deepEqual(task2('floor1').chain.map(c => [c.account, c.floor]), [['one@example.com', 50]], 'The account under its floor stands last, with its floor kept');
+    assert.deepEqual(task2('floor1').chain.map(c => [c.account, c.floor]), [[undefined, undefined], ['one@example.com', 50], ['gone@example.com', undefined]], 'The complete original order and floors survive for later reconsideration');
     setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 20 });
     q = crew2(['spawn', 'floor2', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /claude opus as one@example\.com is under its floor \(49% left, under its floor of 50%\), but nobody above their floor can take the work/); assert.equal(task2('floor2').launch.account, 'one@example.com');

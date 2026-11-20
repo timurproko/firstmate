@@ -598,7 +598,8 @@ export function cleanProfile(raw, where = '') {
     out.floor = floor;
   }
   // Firstmate's optional `provider` is the quota-axi family the profile spends from.
-  if (typeof p.provider === 'string' && WORD.test(p.provider)) out.family = p.provider;
+  const provider = p.provider ?? p.family; // `family` is the normalized form in saved candidates.
+  if (typeof provider === 'string' && WORD.test(provider)) out.family = provider;
   return out;
 }
 
@@ -750,20 +751,21 @@ function agentInstalled(harness, env = process.env) {
   return !dirs.length || dirs.some(dir => names.some(name => fs.existsSync(path.join(dir, name))));
 }
 
-// Reads the candidates' quota and keeps, in their own order, those that can take work now.
-// The order is the person's preference and is not rearranged; a candidate is only dropped
-// for a known reason. One known to be under its own `floor` is kept but goes behind the
+// Reads quota and selects candidates that can work now. Only floors rearrange the order;
+// each group otherwise keeps the person's preference. Known exclusions apply to this
+// selection, never to the saved original chain. One known to be under its own `floor` is kept but goes behind the
 // others, in order: it is saved for when nobody else can work, so a floor never stops work.
-// With a single candidate there is nothing to choose and nothing is read.
+// Ordinary initial selection skips reads for one candidate; agents and relaunch check it.
 function usableCandidates(candidates, { shared = false, always = false, env = process.env } = {}) {
   const check = candidates.length > 1 || always, facts = check ? quotaFacts(candidates, { shared, env }) : new Map();
   if (check) for (const c of candidates) if (!agentInstalled(c.harness, env)) facts.set(pickKey(c), { status: 'missing', note: `${AGENTS[c.harness].command} is not installed on this machine` });
   const rows = candidates.map(c => ({ ...c, fact: facts.get(pickKey(c)) ?? { status: 'unknown', note: 'not checked: the only candidate' } }));
   for (const r of rows) if (r.fact.status === 'ok' && r.floor !== undefined && r.fact.remaining < r.floor) r.fact = { ...r.fact, status: 'low', note: `${r.fact.note}, under its floor of ${r.floor}%` };
-  const strip = ({ fact, family, ...c }) => c;
+  const strip = ({ fact, ...c }) => c;
   return { rows, usable: [...rows.filter(r => ['ok', 'unknown'].includes(r.fact.status)), ...rows.filter(r => r.fact.status === 'low')].map(strip) };
 }
 const candidateLines = rows => rows.map(r => `  ${pickLabel(r)} - ${r.fact.note}`).join('\n');
+const candidateChecks = rows => ({ checkedAt: now(), facts: Object.fromEntries(rows.map(r => [pickKey(r), r.fact])) });
 
 // Who takes a new piece of work, and who stands behind them.
 function chooseWorker(h, role, flags, legacy, project = null) {
@@ -773,7 +775,7 @@ function chooseWorker(h, role, flags, legacy, project = null) {
   const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
   for (const r of rows) { if (r === taken) break; console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`); }
   if (taken.fact.status === 'low') console.log(`${pickLabel(taken)} is under its floor (${taken.fact.note}), but nobody above their floor can take the work`);
-  return { pick: usable[0], rest: usable.slice(1), source };
+  return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source };
 }
 
 function cmdAgents(args) {
@@ -995,8 +997,9 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
-    // What the worker was started with, and the candidates left to take over from it.
-    launch: { ...pick, source: chosen.source }, chain: chosen.rest,
+    // Keep the original order, even for candidates that cannot work now: hand-over rereads
+    // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
+    launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
   saveTask(h, record);
 
@@ -1037,7 +1040,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // writing the record this command started with over an accepted report.
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
-  const detail = pickLabel(pick) !== pick.harness || chosen.rest.length ? `; ${pickLabel(pick)}${chosen.rest.length ? `, ${chosen.rest.length} more can take over` : ''}` : '';
+  const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
   console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}`);
   backlogMove(h, id, 'start');
 }
@@ -1052,10 +1055,15 @@ function relaunch(h, task, reason, flags = null) {
   const config = dispatchConfig(h);
   // The task's own chain as it stood at launch; a task from before there were chains, or an
   // explicit choice on the command line, takes the configured one as it stands now.
-  const candidates = (named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.chain).filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
-  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
-  if (!usable.length) return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+  const original = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.candidates ?? task.chain;
+  const candidates = original.filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
+  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true }), checks = candidateChecks(rows);
+  if (!usable.length) {
+    saveTask(h, { ...task, candidateChecks: checks });
+    return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+  }
   const [pick, ...rest] = usable;
+  const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
   if (task.terminal) {
     let seen = probe(task.terminal).state;
     if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; task ${task.id} was left as it is. Try again.`, 4);
@@ -1070,7 +1078,7 @@ function relaunch(h, task, reason, flags = null) {
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const { error, ...kept } = task;
-  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, chain: rest, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
+  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
     fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
@@ -1937,7 +1945,8 @@ function cmdStatus(args) {
   const currentTime = Date.now();
   const tasks = allTasks(h).filter(t => all || t.state !== 'closed').map(t => {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
-    return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
+    return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel),
+      standbyStatus: (t.chain ?? []).map(c => { const fact = t.candidateChecks?.facts?.[pickKey(c)]; return { ...c, label: pickLabel(c), status: fact?.status ?? 'unknown', note: fact?.note ?? 'no recorded reading', remaining: fact?.remaining ?? null, passedOver: Boolean(fact && !['ok', 'unknown'].includes(fact.status)), checkedAt: t.candidateChecks?.checkedAt ?? null }; }), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
       report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime),
       ...(t.workflow ? { workflow: t.workflow, stage: t.stage ?? null } : {}),
