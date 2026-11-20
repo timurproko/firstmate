@@ -35,7 +35,7 @@ crew spawn <id> --project <name> [--kind scout|ship] [--agent a1|pi|claude] "<ta
 crew wait <id>... [--timeout seconds]    block until each worker reports
 crew status [--all] [--json]             tasks and their terminals
 crew stop <id> [--force]                 ask the worker to leave
-crew finish <id> [--force]               stop it, remove its terminal and working copy
+crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
 crew done [<id>]                         (worker) my report is written
 crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)

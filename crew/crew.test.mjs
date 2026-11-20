@@ -65,6 +65,12 @@ function crew(args, { terminal, cwd = homeDir, env: extra = {} } = {}) {
   return { code: r.status, out: r.stdout + r.stderr };
 }
 const git = (...args) => { const r = spawnSync('git', args, { encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
+const who = ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid'];
+const commit = (folder, files, message) => {
+  for (const [name, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(folder, name)), { recursive: true }); fs.writeFileSync(path.join(folder, name), text); }
+  git('-C', folder, 'add', '-A'); git('-C', folder, ...who, 'commit', '-q', '-m', message);
+  return git('-C', folder, 'rev-parse', 'HEAD').trim();
+};
 
 try {
   // Status uses spawn time (creation while preparing), freezes settled tasks, and formats
@@ -304,12 +310,18 @@ try {
   assert.equal(JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', 'f1', 'task.json'), 'utf8')).state, 'stopped');
 
   // (2) A ship task's uncommitted work is not thrown away by an ordinary finish.
+  commit(f1copy, { 'saved.txt': 'kept\n' }, 'Saved work');
   fs.writeFileSync(path.join(f1copy, 'half-done.txt'), 'unsaved');
   r = crew(['finish', 'f1'], { terminal: 'c2' }); assert.equal(r.code, 6); assert.match(r.out, /has uncommitted work .*half-done\.txt/);
   assert.equal(fs.readFileSync(path.join(f1copy, 'half-done.txt'), 'utf8'), 'unsaved');
   assert.equal(crew(['finish', 'f1', '--force'], { terminal: 'c2' }).code, 0);
   assert.ok(!fs.existsSync(f1copy), 'Discarding was asked for');
   assert.ok(git('-C', project, 'branch', '--list', 'crew/f1').includes('crew/f1'), 'The branch stays');
+  // A branch whose commits are merged holds nothing more and goes with the working copy.
+  assert.equal(crew(['spawn', 'f4', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
+  commit(path.join(copies, 'f4'), { 'merged.txt': 'in\n' }, 'Merged work'); git('-C', project, 'merge', '-q', '--ff-only', 'crew/f4');
+  r = crew(['finish', 'f4', '--force'], { terminal: 'c2' }); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch crew\/f4 deleted/);
+  assert.equal(git('-C', project, 'branch', '--list', 'crew/f4').trim(), '', 'A merged branch is deleted');
   // A scout's leftovers are scratch.
   assert.equal(crew(['spawn', 'f2', '--project', 'demo', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
   fs.writeFileSync(path.join(copies, 'f2', 'notes.tmp'), 'x');
@@ -333,12 +345,6 @@ if (a[0] === 'run') {`));
   // A published source (bare), this machine's installed tool (a clone of it) and another
   // machine (a second clone). The "suite" is a small script that fails when crew/broken exists.
   const origin = path.join(root, 'origin.git'), tool = path.join(root, 'tool'), peer = path.join(root, 'peer'), seed = path.join(root, 'seed');
-  const who = ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid'];
-  const commit = (folder, files, message) => {
-    for (const [name, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(folder, name)), { recursive: true }); fs.writeFileSync(path.join(folder, name), text); }
-    git('-C', folder, 'add', '-A'); git('-C', folder, ...who, 'commit', '-q', '-m', message);
-    return git('-C', folder, 'rev-parse', 'HEAD').trim();
-  };
   fs.mkdirSync(seed); git('-C', seed, 'init', '-q', '-b', 'main');
   commit(seed, { 'crew/check.mjs': "import fs from 'node:fs'; process.exit(fs.existsSync('crew/broken') ? 1 : 0);\n", 'crew/tool.txt': 'one\n', 'README.md': 'outside\n' }, 'seed');
   git('clone', '-q', '--bare', seed, origin); git('clone', '-q', origin, tool); git('clone', '-q', origin, peer);
@@ -424,13 +430,14 @@ if (a[0] === 'run') {`));
 
   // --- follow-ups, review and delivery ---------------------------------------------------
   assert.deepEqual(['https://github.com/acme/tool.git', 'git@github.com:acme/tool', 'https://github.com/acme/tool/', path.join(root, 'x.git')].map(githubOwner), ['acme', 'acme', 'acme', null]);
-  const fakeGh = path.join(root, 'fake-gh.mjs'), ghLog = path.join(root, 'gh-log.json'), ghDown = path.join(root, 'gh-down');
+  const fakeGh = path.join(root, 'fake-gh.mjs'), ghLog = path.join(root, 'gh-log.json'), ghDown = path.join(root, 'gh-down'), ghMerged = path.join(root, 'gh-merged');
   fs.writeFileSync(ghLog, '[]');
   fs.writeFileSync(fakeGh, `import fs from 'node:fs';
 const a = process.argv.slice(2), file = ${JSON.stringify(ghLog)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
 log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
 if (a[0] === 'auth') process.exit(1);
 if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
+if (a[0] === 'pr' && a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(ghMerged)}) ? fs.readFileSync(${JSON.stringify(ghMerged)}, 'utf8') : ''); process.exit(0); }
 console.log('https://example.invalid/acme/demo/pull/7');
 `);
   const own = (args, terminal = 'c2') => crew(args, { terminal, env: { CREW_GH: fakeGh } });
@@ -487,6 +494,19 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.match(r.out, /^s1\t[^\r\n]*\thttps:\/\/example\.invalid\/acme\/demo\/pull\/7\r?$/m);
   assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
   for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
+  assert.ok(git('-C', project, 'branch', '--list', 'crew/s1').includes('crew/s1'), 'A branch whose pull request is not merged stays');
+  // A squash merge leaves no ancestry: GitHub's merged pull request with this exact head counts.
+  assert.equal(own(['spawn', 'm1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  const m1head = commit(path.join(copies, 'm1'), { 'squashed.txt': 'x\n' }, 'Squashed work');
+  fs.writeFileSync(ghMerged, 'another-commit\n');
+  assert.equal(own(['spawn', 'm2', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  commit(path.join(copies, 'm2'), { 'later.txt': 'x\n' }, 'Work after the merged head');
+  r = own(['finish', 'm2', '--force']); assert.equal(r.code, 0, r.out); assert.ok(!r.out.includes('deleted'), r.out);
+  assert.ok(git('-C', project, 'branch', '--list', 'crew/m2').includes('crew/m2'), 'Commits the merged pull request did not have keep the branch');
+  fs.writeFileSync(ghMerged, m1head + '\n');
+  r = own(['finish', 'm1', '--force']); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch crew\/m1 deleted/);
+  assert.equal(git('-C', project, 'branch', '--list', 'crew/m1').trim(), '');
+  fs.rmSync(ghMerged);
 
   // --- the tools Firstmate works with ----------------------------------------------------
   assert.deepEqual(TOOLS.map(t => t.id), ['gh', 'gh-axi', 'chrome-devtools-axi', 'lavish-axi', 'tasks-axi', 'quota-axi', 'treehouse', 'no-mistakes', 'jq']);
@@ -519,6 +539,7 @@ else if (a[0] === 'get') {
   if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
   console.error('Leased worktree'); console.log(JSON.stringify({ path: slot, lease_id: 'x' }));
 } else if (a[0] === 'return' && fs.existsSync(${JSON.stringify(path.join(root, 'pool-stuck'))})) { console.error('foreign process remains'); process.exit(1); }
+else if (a[0] === 'return') spawnSync('git', ['-C', a[1], 'checkout', '-q', '--detach']);
 `);
   const T = { CREW_GH: fakeGh, CREW_TOOL_TASKS_AXI: fakeTasks, CREW_TOOL_TREEHOUSE: fakeTree, CREW_TOOL_NO_MISTAKES: fakeVersion };
   const tl = (args, terminal = 'c2', env = T) => crew(args, { terminal, env });
@@ -569,6 +590,7 @@ else if (a[0] === 'get') {
   r = tl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to treehouse/);
   assert.deepEqual(JSON.parse(fs.readFileSync(treeLog, 'utf8')).at(-1).a, ['return', p1.worktree]);
   assert.equal(taskOf('p1').state, 'closed');
+  assert.match(r.out, /; merged branch crew\/p1 deleted/); assert.equal(git('-C', project, 'branch', '--list', 'crew/p1').trim(), '', 'A returned slot leaves no merged branch behind');
 
   // no-mistakes: a project with the gate is delivered by it; crew only records the result.
   git('-C', project, 'remote', 'add', 'no-mistakes', projectOrigin);
