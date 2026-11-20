@@ -168,8 +168,11 @@ try {
     fs.rmSync(now, { recursive: true, force: true });
     m = crew(['home', '--ensure'], { cwd: root });
     assert.ok(m.code === 0 && fs.existsSync(path.join(now, 'crew.json')), 'With no home at all, --ensure creates the default one');
-    // Update and crash records from before 0.7 move into state/ on first use.
+    // Update and crash records from before 0.7 move into state/ when a command uses them, and
+    // not before: a command that has nothing to do with them leaves them where they are.
     fs.writeFileSync(path.join(now, 'tool-previous'), 'abc\n'); crew(['home'], { cwd: root });
+    assert.ok(fs.existsSync(path.join(now, 'tool-previous')) && !fs.existsSync(path.join(now, 'state')), 'Nothing moves until it is used');
+    assert.equal(crew(['rollback'], { cwd: root, env: { CREW_TOOL_ROOT: root } }).code, 2, 'A folder that is no clone has no revision to go back from');
     assert.ok(!fs.existsSync(path.join(now, 'tool-previous')) && fs.readFileSync(path.join(now, 'state', 'previous'), 'utf8') === 'abc\n');
   }
   fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });

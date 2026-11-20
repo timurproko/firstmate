@@ -1003,14 +1003,16 @@ function cmdLand(args) {
 // Machines pick the result up at their next `crew start`; `crew rollback` undoes it locally.
 const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || path.join(HERE, '..')));
 // Update and crash records. Before 0.7 they sat directly in ~/.crew; one found there is moved
-// on first use.
+// the first time a command uses it.
 const STATE = path.join(CREW_DIR, 'state');
 function stateFile(name, before) {
   const file = path.join(STATE, name), old = path.join(CREW_DIR, before);
   try { if (!fs.existsSync(file) && fs.existsSync(old)) { fs.mkdirSync(STATE, { recursive: true }); fs.renameSync(old, file); } } catch { /* stays where it was */ }
   return file;
 }
-const PREVIOUS = stateFile('previous', 'tool-previous'), PINNED = stateFile('pinned', 'tool-pinned'), CRASHES = stateFile('crashes', 'crashes');
+// Functions, not values: nothing on disk moves until a command really uses the record, so
+// importing this file (the tests do) never touches the machine's own ~/.crew.
+const PREVIOUS = () => stateFile('previous', 'tool-previous'), PINNED = () => stateFile('pinned', 'tool-pinned'), CRASHES = () => stateFile('crashes', 'crashes');
 const SELF_PROJECT = 'crew:self'; // not a valid project name, so it can never be a registered one
 const toolGit = (...args) => run('git', ['-C', TOOL_ROOT, ...args], { timeout: 120000 });
 const toolRevision = () => { const r = toolGit('rev-parse', 'HEAD'); return r.code === 0 ? r.stdout.trim() : null; };
@@ -1028,15 +1030,15 @@ function updateTool({ respectPin = false } = {}) {
   const fetched = toolGit('fetch', '--quiet', 'origin', 'main');
   if (fetched.code !== 0) return { failed: true, note: `the source could not be reached (${lastLine(fetched.stderr)})` };
   const target = toolGit('rev-parse', 'origin/main').stdout.trim();
-  const pinned = readLine(PINNED);
+  const pinned = readLine(PINNED());
   if (pinned && respectPin && pinned === target) return { pinned };
-  if (pinned) fs.rmSync(PINNED, { force: true });
+  if (pinned) fs.rmSync(PINNED(), { force: true });
   if (!target || target === before) return { changed: false, revision: before };
   if (toolGit('merge-base', '--is-ancestor', before, target).code !== 0) return { failed: true, note: 'this copy has commits the published main does not have; it was left as it is' };
   const merged = toolGit('merge', '--ff-only', '--quiet', target);
   if (merged.code !== 0) return { failed: true, note: lastLine(merged.stderr) };
   fs.mkdirSync(STATE, { recursive: true });
-  fs.writeFileSync(PREVIOUS, `${before}\n`);
+  fs.writeFileSync(PREVIOUS(), `${before}\n`);
   return { changed: true, from: before, revision: target };
 }
 
@@ -1047,22 +1049,22 @@ function cmdUpdate() {
 }
 
 function cmdRollback() {
-  const previous = readLine(PREVIOUS), current = toolRevision();
+  const previous = readLine(PREVIOUS()), current = toolRevision();
   if (!previous || !current) refuse('No earlier crew revision is recorded on this machine.');
   if (previous === current) refuse(`crew is already at ${short(previous)}.`);
   if (toolGit('status', '--porcelain', '--untracked-files=no').stdout.trim()) refuse(`${TOOL_ROOT} has uncommitted changes; nothing was rolled back.`, 6);
   const back = toolGit('reset', '--hard', '--quiet', previous);
   if (back.code !== 0) refuse(`Could not go back to ${short(previous)}: ${lastLine(back.stderr)}`, 6);
   fs.mkdirSync(STATE, { recursive: true });
-  fs.writeFileSync(PINNED, `${current}\n`);
-  fs.rmSync(PREVIOUS, { force: true });
+  fs.writeFileSync(PINNED(), `${current}\n`);
+  fs.rmSync(PREVIOUS(), { force: true });
   console.log(`crew went back ${short(current)} -> ${short(previous)} on this machine. It stays there until something newer than ${short(current)} is published, or until \`crew update\`.`);
 }
 
 function recordCrash(argv, error) {
   try {
-    fs.mkdirSync(CRASHES, { recursive: true });
-    const file = path.join(CRASHES, `${now().replace(/[:.]/g, '-')}-${process.pid}.txt`);
+    fs.mkdirSync(CRASHES(), { recursive: true });
+    const file = path.join(CRASHES(), `${now().replace(/[:.]/g, '-')}-${process.pid}.txt`);
     fs.writeFileSync(file, [`crew ${VERSION} at ${short(toolRevision())} (${TOOL_ROOT})`, `when: ${now()}`, `platform: ${process.platform}, node ${process.version}`,
       `command: crew ${argv.join(' ')}`, `folder: ${slash(process.cwd())}`, '', String(error?.stack ?? error), ''].join('\n'));
     return file;
@@ -1070,7 +1072,7 @@ function recordCrash(argv, error) {
 }
 function recentCrashes() {
   try {
-    return fs.readdirSync(CRASHES).filter(n => n.endsWith('.txt')).sort().slice(-3).map(n => path.join(CRASHES, n))
+    return fs.readdirSync(CRASHES()).filter(n => n.endsWith('.txt')).sort().slice(-3).map(n => path.join(CRASHES(), n))
       .filter(f => Date.now() - fs.statSync(f).mtimeMs < 24 * 3600 * 1000);
   } catch { return []; }
 }
