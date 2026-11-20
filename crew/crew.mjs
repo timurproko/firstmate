@@ -1305,11 +1305,23 @@ const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : 
 // could not tell, keep }.
 function workInCopy(task) {
   let dirty = [];
-  if (task.kind === 'ship' && fs.existsSync(path.join(task.worktree, '.git'))) {
-    const r = run('git', ['-C', task.worktree, 'status', '--porcelain']);
-    dirty = r.code !== 0 ? null : r.stdout.split(/\r?\n/).filter(Boolean).map(l => l.slice(3));
-  }
+  if (task.kind === 'ship' && fs.existsSync(path.join(task.worktree, '.git'))) dirty = gitStatus(task.worktree)?.map(e => e.file) ?? null;
   return { dirty, keep: fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP')) };
+}
+// `git status` of a folder as [{ code, file }], or null when git could not tell. Read with -z:
+// the text form quotes names with non-ASCII or special characters, and such a quoted name is
+// not a path that can be looked at. A rename or copy names its source in one more field.
+function gitStatus(folder, ...more) {
+  const r = run('git', ['-C', folder, 'status', '--porcelain', '-z', ...more]);
+  if (r.code !== 0) return null;
+  const fields = r.stdout.split('\0'), entries = [];
+  for (let i = 0; i < fields.length; i++) {
+    if (!fields[i]) continue;
+    const code = fields[i].slice(0, 2);
+    entries.push({ code, file: fields[i].slice(3) });
+    if (/[RC]/.test(code)) i++;
+  }
+  return entries;
 }
 const listFiles = files => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ', …' : ''}`;
 // What a postponed copy held when finish accepted to discard it: every changed or untracked
@@ -1318,16 +1330,13 @@ const listFiles = files => `${files.slice(0, 5).join(', ')}${files.length > 5 ? 
 // could not tell.
 function snapshotCopy(folder) {
   const stamp = p => { try { return fs.statSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
-  const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? run('git', ['-C', folder, 'status', '--porcelain', ...a]) : { code: 0, stdout: '' });
+  const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : []);
   // Ignored files go with the copy too (a forced removal takes everything), so they count;
   // they are listed by folder, whose time changes when something is written into it.
-  const r = git('--untracked-files=all'), ignored = git('--ignored');
-  if (r.code !== 0 || ignored.code !== 0) return null;
+  const changed = git('--untracked-files=all'), ignored = git('--ignored');
+  if (!changed || !ignored) return null;
   const files = {};
-  for (const line of `${r.stdout}\n${ignored.stdout.split(/\r?\n/).filter(l => l.startsWith('!! ')).join('\n')}`.split(/\r?\n/).filter(Boolean)) {
-    const file = line.slice(3).split(' -> ').pop().replace(/^"|"$/g, '');
-    files[file] = stamp(file);
-  }
+  for (const { file } of [...changed, ...ignored.filter(e => e.code === '!!')]) files[file] = stamp(file);
   return { files, keep: stamp(path.join('.artifacts', 'KEEP')) };
 }
 // Whether a postponed copy can go back unasked. The copy was held by a terminal somebody

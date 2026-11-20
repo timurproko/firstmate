@@ -955,6 +955,9 @@ if (a[0] === '--version') process.exit(0);`);
       setTerminal(forced.terminal, { status: { state: 'working', app: 'a1' } });
       setWorld(v => { v.terminals.guest6 = { address: 'guest6', state: 'live', labels: {}, status: null, cwd: forced.worktree }; });
       fs.writeFileSync(path.join(forced.worktree, 'half.txt'), 'covered by --force');
+      // git quotes a name like this in its text output; the snapshot must still see the file.
+      const notes = 'заметки ü.md';
+      fs.writeFileSync(path.join(forced.worktree, notes), 'covered by --force');
       q = crew2(['finish', 'forced', '--force']); assert.equal(q.code, 0, q.out); assert.match(q.out, /finished forced \(cancelled; terminal ended\); its working copy is kept for now/);
       fs.writeFileSync(path.join(forced.worktree, 'later.txt'), 'written after finish');
       setWorld(v => { delete v.terminals.guest6; });
@@ -963,6 +966,11 @@ if (a[0] === '--version') process.exit(0);`);
       fs.writeFileSync(path.join(forced.worktree, 'half.txt'), 'changed after finish');
       q = crew2(['start']); assert.match(q.out, /forced waits: it has work written since finish \(half\.txt, later\.txt\)/, 'A covered file changed later counts as new work');
       fs.rmSync(path.join(forced.worktree, 'later.txt')); fs.rmSync(path.join(forced.worktree, 'half.txt'));
+      assert.ok(Object.entries(task2('forced').copyToReturn.left.files).some(([file, time]) => file === notes && typeof time === 'number'), 'The quoted name is recorded with its time');
+      fs.writeFileSync(path.join(forced.worktree, notes), 'changed after finish');
+      q = crew2(['start']); assert.match(q.out, /forced waits: it has work written since finish \(заметки ü\.md\)/, 'A covered file with a quoted name changed later counts as new work');
+      assert.equal(fs.readFileSync(path.join(forced.worktree, notes), 'utf8'), 'changed after finish');
+      fs.rmSync(path.join(forced.worktree, notes));
       // An ignored file goes with the copy too, so one written since finish keeps it as well.
       const exclude = path.join(project, '.git', 'info', 'exclude'); fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, '\nscratch/\n');
       fs.mkdirSync(path.join(forced.worktree, 'scratch')); fs.writeFileSync(path.join(forced.worktree, 'scratch', 'notes.md'), 'mine');
