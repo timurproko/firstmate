@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, githubOwner, AGENTS, TOOLS, main } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -47,6 +47,7 @@ else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
 else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; save(); }
 else if (a[0] === 'rm') { delete w.terminals[a.at(-1)]; save(); }
+else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
 else save();
 `);
 const readWorld = () => JSON.parse(fs.readFileSync(world, 'utf8'));
@@ -731,7 +732,153 @@ else console.log('session: opened\\nurl: "http://127.0.0.1:4387/session/d849b898
   fs.writeFileSync(path.join(root, 'broken.html'), 'x');
   r = crew(['show', path.join(root, 'broken.html')], { terminal: 'c2', env: L }); assert.equal(r.code, 4); assert.match(r.out, /did not open the page: error: the user ended this session/);
 
-  console.log('PASS: Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  // --- who does the work: profiles, accounts, quota and fallback ---------------------------
+  // Pure parts first.
+  assert.deepEqual(cleanProfile({ harness: 'a1', model: 'github-copilot/gpt-x', effort: 'high' }), { harness: 'a1', model: 'github-copilot/gpt-x', effort: 'high' });
+  assert.throws(() => cleanProfile({ harness: 'a1', account: 'me@example.com' }), /Only Claude Code has saved accounts/);
+  assert.throws(() => cleanProfile({ harness: 'a1', model: "x'; rm -rf ~" }), /Not a usable model/);
+  assert.throws(() => cleanProfile({ harness: 'gpt' }), /Unknown agent: gpt/);
+  assert.equal(agentCommand('a1', AGENTS.a1, 'do it', {}, { harness: 'a1', model: 'github-copilot/gpt-x', effort: 'high' }), "'a1' '--provider' 'github-copilot' '--model' 'gpt-x' '--thinking' 'high' 'do it'", 'A1 takes provider and model before the instruction');
+  assert.equal(agentCommand('pi', AGENTS.pi, 'do it', {}, { harness: 'pi', model: 'plain' }), "'pi' '--model' 'plain' 'do it'");
+  assert.ok(agentCommand('claude', AGENTS.claude, 'do it', {}, { harness: 'claude', model: 'opus', effort: 'low' }).startsWith("'claude' 'do it' '--model' 'opus' '--effort' 'low' '--permission-mode'"), 'Claude takes its options after the instruction');
+  assert.throws(() => agentCommand('claude', AGENTS.claude, 'x', { CREW_CLAUDE_LAUNCHER: path.join(root, 'missing.sh') }, { harness: 'claude', account: 'me@example.com' }), /cannot be started as me@example.com/, 'A chosen account never silently becomes the default one');
+  {
+    const row = (left, runway) => ({ provider: 'codex', windows: [{ id: 'weekly', kind: 'weekly', resetsAt: '2030-01-01T00:00:00Z' }], state: { status: 'fresh' },
+      quotaSemantics: { status: 'known', effectiveAvailability: [{ scope: 'all_models', effectivePercentRemaining: left, limitingWindowIds: ['weekly'], runway: { status: runway } }, { scope: 'model:other', effectivePercentRemaining: 0, runway: { status: 'exhausted_now' } }] } });
+    assert.equal(quotaVerdict(row(40, 'projected_exhaustion'), 'openai-codex/gpt-x').status, 'ok', 'Another model\'s empty scope does not count');
+    assert.match(quotaVerdict(row(0, 'exhausted_now'), 'gpt-x').note, /quota used up, back 2030/);
+    assert.equal(quotaVerdict(row(40, 'ok'), 'openai-codex/other').status, 'exhausted', 'The model\'s own scope counts');
+    assert.equal(quotaVerdict({ provider: 'copilot', state: { status: 'unavailable', error: 'keychain_prompt_required' }, quotaSemantics: { status: 'unknown' } }).status, 'unknown', 'An unreadable quota is uncertainty, not an empty account');
+    assert.equal(quotaVerdict({ provider: 'claude', state: { status: 'unavailable', error: 'unauthorized' }, quotaSemantics: { status: 'unknown' } }).status, 'signed-out');
+    assert.equal(quotaVerdict(undefined).status, 'unknown');
+  }
+  {
+    // A home of its own, a fake quota-axi and a fake account-switcher with three saved logins.
+    const home2 = path.join(root, 'home2'), bin = path.join(root, 'agents-bin'), switcher = path.join(root, 'switcher'), quotaFile = path.join(root, 'quota.json'), quotaLog = path.join(root, 'quota.log');
+    fs.mkdirSync(bin); fs.mkdirSync(switcher);
+    for (const name of ['a1', 'claude']) fs.writeFileSync(path.join(bin, name), '');
+    fs.writeFileSync(path.join(switcher, 'claude-as.sh'), '#!/bin/sh');
+    fs.writeFileSync(path.join(switcher, 'session-dir.js'), `
+const fs = require('fs'), path = require('path'), [cmd, ...rest] = process.argv.slice(2);
+if (cmd === 'list') console.log('1. one@example.com  (Org, max)\\n2. two@example.com\\n3. gone@example.com\\n4. empty@example.com  (no saved login)');
+else if (cmd === 'refresh') {
+  if (rest[0] === 'gone@example.com') { console.log(JSON.stringify({ state: 'failed', email: rest[0], error: 'invalid_grant' })); process.exit(2); }
+  fs.writeFileSync(path.join(rest[rest.indexOf('--into') + 1], '.credentials.json'), JSON.stringify({ who: rest[0] }));
+  console.log(JSON.stringify({ state: 'fresh', email: rest[0] }));
+}`);
+    const fakeQuota = path.join(root, 'fake-quota.mjs');
+    fs.writeFileSync(fakeQuota, `
+import fs from 'node:fs'; import path from 'node:path';
+const a = process.argv.slice(2), q = JSON.parse(fs.readFileSync(${JSON.stringify(quotaFile)}, 'utf8')), dir = process.env.CLAUDE_CONFIG_DIR;
+const who = a.includes('--profile-only') ? JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8')).who : null;
+fs.appendFileSync(${JSON.stringify(quotaLog)}, (who ?? a[a.indexOf('--provider') + 1]) + '\\n');
+const row = (provider, left) => left === undefined ? { provider, notSetUp: true } : left === null ? { provider, state: { status: 'unavailable', error: 'keychain_prompt_required' }, quotaSemantics: { status: 'unknown' } }
+  : { provider, windows: [], state: { status: 'fresh' }, quotaSemantics: { status: 'known', effectiveAvailability: [{ scope: 'all_models', effectivePercentRemaining: left, runway: { status: left > 0 ? 'ok' : 'exhausted_now' } }] } };
+console.log(JSON.stringify({ schemaVersion: 5, providers: who ? [row('claude', q[who])] : a[a.indexOf('--provider') + 1].split(',').map(p => row(p, q[p])) }));
+if (a[0] === '--version') process.exit(0);`);
+    const setQuota = q => fs.writeFileSync(quotaFile, JSON.stringify(q));
+    const E = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: path.join(switcher, 'claude-as.sh'), CREW_TOOL_QUOTA_AXI: fakeQuota, CREW_HOME: home2 };
+    const crew2 = (args, terminal = 'k1') => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E } }); return { code: r.status, out: r.stdout + r.stderr }; };
+    const task2 = id => JSON.parse(fs.readFileSync(path.join(home2, 'tasks', id, 'task.json'), 'utf8'));
+    const lastRun = () => readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
+    assert.equal(crew2(['init', home2]).code, 0); assert.equal(crew2(['project', 'add', 'demo', project]).code, 0); assert.equal(crew2(['start']).code, 0);
+
+    // Without a configuration nothing changes: a1 as before, no quota reading for a single candidate.
+    setQuota({});
+    let q = crew2(['spawn', 'plain', '--project', 'demo', 'Count lines.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /spawned plain: a1 scout in terminal \S+, working copy \S+\r?\n/); assert.ok(lastRun().includes("'a1' 'Read the brief"), lastRun());
+    assert.deepEqual(task2('plain').launch, { harness: 'a1', source: 'built-in' }); assert.ok(!fs.existsSync(quotaLog), 'One candidate: quota is not read');
+    q = crew2(['spawn', 'bogus', '--project', 'demo', '--modle', 'x', 'Count.']); assert.equal(q.code, 2); assert.match(q.out, /Unknown option: --modle/); assert.ok(!fs.existsSync(path.join(home2, 'tasks', 'bogus')), 'A mistyped option makes no task');
+    q = crew2(['spawn', 'bogus', '--project', 'demo', '--agent', 'a1', '--account', 'one@example.com', 'Count.']); assert.equal(q.code, 2); assert.match(q.out, /Only Claude Code has saved accounts/);
+    // --agent claude alone stands for every saved login, the unusable ones passed over.
+    setQuota({ 'one@example.com': 0, 'two@example.com': 55 });
+    q = crew2(['spawn', 'acc', '--project', 'demo', '--agent', 'claude', '--model', 'opus', 'Count.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /passed over claude opus as one@example\.com: quota used up/); assert.match(q.out, /; claude opus as two@example\.com\r?\n/);
+    assert.ok(lastRun().includes("claude-as.sh' --as 'two@example.com' --command") && lastRun().includes("'--model' 'opus' '--permission-mode'"), lastRun());
+    assert.deepEqual(task2('acc').chain, [], 'A login that is gone or empty is not kept as a fallback');
+    assert.deepEqual(fs.readFileSync(quotaLog, 'utf8').trim().split('\n'), ['one@example.com', 'two@example.com'], 'Each saved account is read by itself; the one whose login is gone is not');
+
+    // The person's list: Firstmate's dispatch file, with roles and an account-less Claude profile.
+    fs.mkdirSync(path.join(home2, 'config'));
+    const dispatch = path.join(home2, 'config', 'crew-dispatch.json');
+    fs.writeFileSync(dispatch, '{ broken');
+    q = crew2(['spawn', 'cfg', '--project', 'demo', 'Count.']); assert.equal(q.code, 2); assert.match(q.out, /crew-dispatch\.json is not valid JSON/);
+    fs.writeFileSync(dispatch, JSON.stringify({
+      default: [{ harness: 'a1', model: 'openai-codex/gpt-x', effort: 'high' }, { harness: 'a1', model: 'github-copilot/gpt-x' }, { harness: 'pi', model: 'openai-codex/gpt-x' }, { harness: 'claude', model: 'opus' }],
+      roles: { review: [{ harness: 'claude', model: 'sonnet', account: 'two@example.com' }] },
+      rules: [{ when: 'A small mechanical edit', use: { harness: 'claude', model: 'haiku', effort: 'low' }, why: 'cheap' }] }));
+    setQuota({ codex: 0, copilot: null, 'one@example.com': 70, 'two@example.com': 55 });
+    q = crew2(['agents', '--json']); assert.equal(q.code, 0, q.out);
+    const shown = JSON.parse(q.out);
+    assert.deepEqual(shown.candidates.map(c => [c.label, c.status, c.next]), [
+      ['a1 openai-codex/gpt-x (high)', 'exhausted', false], ['a1 github-copilot/gpt-x', 'unknown', true], ['pi openai-codex/gpt-x', 'missing', false],
+      ['claude opus as one@example.com', 'ok', false], ['claude opus as two@example.com', 'ok', false], ['claude opus as gone@example.com', 'signed-out', false]]);
+    assert.equal(shown.rules[0].use[0], 'claude haiku (low)');
+    assert.match(crew2(['agents', '--role', 'review']).out, /-> claude sonnet as two@example\.com\s+ok\s+55% left/);
+    assert.match(crew2(['agents']).out, /rule 1: A small mechanical edit\r?\n\s+use claude haiku \(low\)/);
+
+    // Spawn: the exhausted first choice is passed over, the rest stands behind the worker.
+    q = crew2(['spawn', 'cfg', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /passed over a1 openai-codex\/gpt-x \(high\): quota used up/); assert.match(q.out, /; a1 github-copilot\/gpt-x, 2 more can take over/);
+    assert.ok(lastRun().includes("'a1' '--provider' 'github-copilot' '--model' 'gpt-x' 'Read the brief"), lastRun());
+    assert.deepEqual(task2('cfg').chain.map(c => c.account), ['one@example.com', 'two@example.com']);
+    assert.match(crew2(['status']).out, /cfg\tworking\tscout\/a1 github-copilot\/gpt-x\t/);
+    assert.equal(JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === 'cfg').standby.length, 2);
+
+    // The worker stops on a limit: `crew wait` hands the task to the next candidate and goes on waiting.
+    const first = task2('cfg').terminal;
+    setTerminal(first, { status: { state: 'error', app: 'a1' }, screen: 'read crew.mjs\n Error: Codex error: The usage limit has been reached\n' });
+    q = crew2(['wait', 'cfg', '--timeout', '8']); assert.equal(q.code, 124, q.out);
+    assert.match(q.out, /== cfg: a1 github-copilot\/gpt-x stopped \(Error: Codex error: The usage limit has been reached\); claude opus as one@example\.com continues it in terminal/);
+    const moved = task2('cfg');
+    assert.equal(moved.agent, 'claude'); assert.equal(moved.state, 'working'); assert.notEqual(moved.terminal, first); assert.equal(readWorld().terminals[first], undefined, 'The stopped worker\'s terminal is gone');
+    assert.deepEqual(moved.chain.map(c => c.account), ['two@example.com']); assert.equal(moved.fallbacks.length, 1);
+    assert.ok(lastRun().includes("--as 'one@example.com'") && lastRun().includes('Another worker (a1 github-copilot/gpt-x) began this task and had to stop') && lastRun().includes('continue from there'), lastRun());
+    assert.equal(readWorld().terminals[moved.terminal].cwd, moved.worktree, 'Same working copy');
+    assert.match(crew2(['status']).out, /scout\/claude opus as one@example\.com \(after a1 github-copilot\/gpt-x\)/);
+    // A worker that is merely idle, or working with old text on screen, is left alone.
+    setTerminal(moved.terminal, { status: { state: 'working', app: 'claude' }, screen: 'usage limit reached' });
+    q = crew2(['wait', 'cfg', '--timeout', '6']); assert.equal(q.code, 124); assert.equal(task2('cfg').terminal, moved.terminal, 'A working agent is never replaced');
+    // --no-fallback keeps the worker; a session that does not hold the home never hands over.
+    setTerminal(moved.terminal, { status: { state: 'idle', app: 'claude' }, screen: "You've hit your limit · resets 3pm" });
+    q = crew2(['wait', 'cfg', '--timeout', '6', '--no-fallback']); assert.equal(q.code, 124); assert.equal(task2('cfg').terminal, moved.terminal);
+    q = crew2(['wait', 'cfg', '--timeout', '6'], 'k9'); assert.equal(q.code, 124); assert.equal(task2('cfg').terminal, moved.terminal, 'Only the owner hands work over');
+    // Two more limits: the last candidate, then nobody. That is said, not looped on.
+    q = crew2(['wait', 'cfg', '--timeout', '6']); assert.match(q.out, /claude opus as two@example\.com continues it/);
+    setTerminal(task2('cfg').terminal, { status: { state: 'idle', app: 'claude' }, screen: 'Please run /login' });
+    q = crew2(['wait', 'cfg', '--timeout', '8']); assert.equal(q.code, 7, q.out);
+    assert.match(q.out, /== cfg: needs a person - claude opus as two@example\.com stopped \(Please run \/login\) and there is no other candidate in its chain/);
+    // By hand: the coordinator (or the person) names who takes it. The quota has come back for codex.
+    setQuota({ codex: 30, copilot: null, 'one@example.com': 70, 'two@example.com': 55 });
+    q = crew2(['relaunch', 'cfg', '--agent', 'a1', '--model', 'openai-codex/gpt-x', 'quota is back']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /relaunched cfg: a1 openai-codex\/gpt-x in terminal/); assert.equal(task2('cfg').agent, 'a1'); assert.ok(lastRun().includes('had to stop: quota is back'), lastRun());
+
+    // A rule, a role, and nobody left.
+    q = crew2(['spawn', 'ruled', '--project', 'demo', '--rule', '1', 'Rename x.']); assert.equal(q.code, 0, q.out);
+    assert.deepEqual([task2('ruled').launch.model, task2('ruled').launch.effort, task2('ruled').launch.source], ['haiku', 'low', 'rule 1']);
+    assert.equal(crew2(['spawn', 'ruled2', '--project', 'demo', '--rule', '4', 'x']).code, 2);
+    setQuota({ codex: 0, copilot: 0, 'one@example.com': 0, 'two@example.com': 0 });
+    q = crew2(['spawn', 'nobody', '--project', 'demo', 'Count.']); assert.equal(q.code, 8, q.out);
+    assert.match(q.out, /Nobody can take this work now:\r?\n\s+a1 openai-codex\/gpt-x \(high\) - quota used up/); assert.match(q.out, /pi openai-codex\/gpt-x - pi is not installed/); assert.match(q.out, /gone@example\.com - its saved login is no longer accepted \(invalid_grant\)/);
+    assert.ok(!fs.existsSync(path.join(home2, 'tasks', 'nobody')), 'No task, copy or terminal is made when nobody can work');
+    // shared_quota: Firstmate's switch for one shared pool; nothing is read and the order decides.
+    fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
+    // A floor: an account under it yields to the next, and is still used when nobody else can work.
+    fs.writeFileSync(dispatch, JSON.stringify({ default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', model: 'opus', account: 'one@example.com', floor: 50 }, { harness: 'claude', model: 'opus', account: 'two@example.com', floor: 50 }, { harness: 'claude', model: 'opus', account: 'gone@example.com' }] }));
+    setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 80 });
+    q = crew2(['spawn', 'floor1', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /passed over claude opus as one@example\.com: 49% left, under its floor of 50%/); assert.equal(task2('floor1').launch.account, 'two@example.com');
+    assert.deepEqual(task2('floor1').chain.map(c => [c.account, c.floor]), [['one@example.com', 50]], 'The account under its floor stands last, with its floor kept');
+    setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 20 });
+    q = crew2(['spawn', 'floor2', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /claude opus as one@example\.com is under its floor \(49% left, under its floor of 50%\), but nobody above their floor can take the work/); assert.equal(task2('floor2').launch.account, 'one@example.com');
+    assert.match(crew2(['agents']).out, /claude opus as two@example\.com\s+low\s+20% left, under its floor of 50%/);
+    assert.throws(() => cleanProfile({ harness: 'claude', floor: 140 }), /Not a usable floor/);
+    fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
+    fs.rmSync(quotaLog); q = crew2(['spawn', 'pool', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out); assert.equal(task2('pool').launch.model, 'openai-codex/gpt-x'); assert.ok(!fs.existsSync(quotaLog));
+  }
+
+  console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
