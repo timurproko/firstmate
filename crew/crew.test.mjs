@@ -60,8 +60,8 @@ if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forE
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
-else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; save(); }
-else if (a[0] === 'rm') { delete w.terminals[a.at(-1)]; save(); }
+else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); save(); }
+else if (a[0] === 'rm') { if (!w.failRm) delete w.terminals[a.at(-1)]; if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
@@ -144,6 +144,41 @@ gapTests.ignored = () => {
   delete saved.copyToReturn.left.ignoredVersion; delete saved.copyToReturn.left.incomplete; f.save(saved);
   r = f.call(['start']); assert.ok(fs.existsSync(uncertain.worktree)); assert.match(r.out, /older snapshot/);
   assert.equal(f.call(['finish', uncertain.id, '--force']).code, 0);
+};
+
+gapTests.finish = () => {
+  const f = gapFixture('finish'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const dirty = f.spawn('dirty', ['--kind', 'ship']);
+  const untouched = (task, message) => {
+    const before = readWorld().log.length, original = fs.readFileSync(path.join(f.home, 'tasks', task.id, 'task.json'), 'utf8');
+    const r = f.call(['finish', task.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, message);
+    assert.equal(readWorld().terminals[task.terminal].state, 'live', 'Refusing finish must leave the worker alive');
+    assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])), 'A refusal sends no stop/removal command');
+    assert.equal(fs.readFileSync(path.join(f.home, 'tasks', task.id, 'task.json'), 'utf8'), original);
+    assert.ok(fs.existsSync(task.worktree));
+  };
+  fs.writeFileSync(path.join(dirty.worktree, 'half.txt'), 'unsaved'); untouched(dirty, /has uncommitted work/); fs.rmSync(path.join(dirty.worktree, 'half.txt'));
+  const keep = f.spawn('keep'); fs.mkdirSync(path.join(keep.worktree, '.artifacts')); fs.writeFileSync(path.join(keep.worktree, '.artifacts', 'KEEP'), '');
+  untouched(keep, /marked to keep/); fs.rmSync(path.join(keep.worktree, '.artifacts'), { recursive: true });
+  const gitFile = path.join(dirty.worktree, '.git'); fs.renameSync(gitFile, `${gitFile}-saved`); fs.writeFileSync(gitFile, 'gitdir: missing\n');
+  untouched(dirty, /Could not check.*uncommitted work/); fs.rmSync(gitFile); fs.renameSync(`${gitFile}-saved`, gitFile);
+  assert.equal(f.call(['finish', keep.id]).code, 0);
+
+  patch({ writeOnKill: path.join(dirty.worktree, 'late.txt') });
+  let r = f.call(['finish', dirty.id]); assert.equal(r.code, 0, r.out); patch({ writeOnKill: null });
+  assert.equal(f.task(dirty.id).state, 'closed'); assert.ok(fs.existsSync(path.join(dirty.worktree, 'late.txt'))); assert.match(r.out, /kept for now.*work written|kept for now.*uncommitted/);
+  r = f.call(['start']); assert.ok(fs.existsSync(dirty.worktree)); assert.match(r.out, /work written since finish/);
+  assert.equal(f.call(['finish', dirty.id, '--force']).code, 0);
+
+  const second = f.spawn('second'); patch({ silentLsAfterRm: true });
+  r = f.call(['finish', second.id]); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(second.id).state, 'closed'); assert.ok(f.task(second.id).copyToReturn && fs.existsSync(second.worktree));
+  assert.match(r.out, /Core did not say.*crew (?:start|finish)|Core did not say.*next.*(?:start|finish)/);
+  patch({ silentLsAfterRm: false, silentLs: false }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(second.worktree));
+
+  const removal = f.spawn('removal'); patch({ silentAfterRm: true });
+  r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(removal.id).copyToReturn && fs.existsSync(removal.worktree));
+  patch({ silentAfterRm: false, silent: false }); r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(removal.worktree));
 };
 
 try {
