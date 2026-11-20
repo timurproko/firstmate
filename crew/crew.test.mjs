@@ -47,6 +47,8 @@ else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
 else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; save(); }
 else if (a[0] === 'rm') { delete w.terminals[a.at(-1)]; save(); }
+else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
+else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
 else save();
 `);
@@ -853,6 +855,21 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['relaunch', 'cfg', '--agent', 'a1', '--model', 'openai-codex/gpt-x', 'quota is back']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /relaunched cfg: a1 openai-codex\/gpt-x in terminal/); assert.equal(task2('cfg').agent, 'a1'); assert.ok(lastRun().includes('had to stop: quota is back'), lastRun());
 
+    // finish never takes somebody else's terminal down with the working copy: returning a pool slot
+    // ends every process that sits in it, and a person's own session may have been opened there.
+    {
+      const mine = task2('plain'), w = readWorld();
+      w.terminals.guest = { address: 'guest', agent: 'claude-code', state: 'live', labels: {}, status: null, cwd: mine.worktree.replace(/\//g, '\\').toUpperCase() };
+      w.terminals['pc2/t1'] = { address: 'pc2/t1', state: 'live', labels: {}, status: null, cwd: mine.worktree };
+      w.terminals.sibling = { address: 'sibling', state: 'live', labels: {}, status: null, cwd: `${mine.worktree}-other` };
+      fs.writeFileSync(world, JSON.stringify(w));
+      for (const more of [[], ['--force']]) { q = crew2(['finish', 'plain', ...more]); assert.equal(q.code, 6, q.out); assert.match(q.out, /another terminal is open in its working copy \S+ \(guest claude-code\)\. Removing the copy would end what runs there/); }
+      assert.ok(fs.existsSync(mine.worktree) && readWorld().terminals[mine.terminal]?.state === 'live', 'Nothing was stopped or removed');
+      const silent = readWorld(); silent.silentLs = true; fs.writeFileSync(world, JSON.stringify(silent));
+      q = crew2(['finish', 'plain']); assert.equal(q.code, 4, q.out); assert.match(q.out, /Core did not answer about the terminals in/);
+      const after = readWorld(); delete after.silentLs; delete after.terminals.guest; fs.writeFileSync(world, JSON.stringify(after));
+      q = crew2(['finish', 'plain']); assert.equal(q.code, 0, q.out); assert.ok(!fs.existsSync(mine.worktree), 'A terminal of another machine or of a sibling folder does not hold the copy');
+    }
     // A rule, a role, and nobody left.
     q = crew2(['spawn', 'ruled', '--project', 'demo', '--rule', '1', 'Rename x.']); assert.equal(q.code, 0, q.out);
     assert.deepEqual([task2('ruled').launch.model, task2('ruled').launch.effort, task2('ruled').launch.source], ['haiku', 'low', 'rule 1']);
