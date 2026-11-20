@@ -60,7 +60,7 @@ if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forE
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
-else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); save(); }
+else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); if (w.silentAfterKill) w.silent = true; save(); }
 else if (a[0] === 'rm') { if (!w.failRm) delete w.terminals[a.at(-1)]; if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
@@ -132,11 +132,21 @@ gapTests.ignored = () => {
   f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(untouched.worktree), r.out);
 
   const uncertain = f.spawn('uncertain'); fill(uncertain); f.guest(uncertain);
+  const tree = path.join(uncertain.worktree, 'scratch'), first = snapshotCopy(uncertain.worktree).ignored['scratch/'];
+  fs.rmSync(path.join(tree, '0.txt'));
+  assert.equal(snapshotCopy(uncertain.worktree).ignored['scratch/'].files, count - 1, 'Removal changes the fingerprint');
+  fs.writeFileSync(path.join(tree, 'added.txt'), 'old');
+  assert.notEqual(snapshotCopy(uncertain.worktree).ignored['scratch/'].metadata, first.metadata, 'Same-count, same-size replacement changes the metadata digest');
+  const outside = path.join(f.dir, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'external.txt'), 'one');
+  fs.symlinkSync(outside, path.join(tree, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+  const linked = snapshotCopy(uncertain.worktree).ignored['scratch/'];
+  fs.writeFileSync(path.join(outside, 'external.txt'), 'changed outside');
+  assert.deepEqual(snapshotCopy(uncertain.worktree).ignored['scratch/'], linked, 'Directory symlink targets are not inspected');
   assert.match(snapshotCopy(uncertain.worktree, { budgetMs: 0 }).incomplete, /time budget/);
   const lstat = fs.lstatSync;
   try {
-    fs.lstatSync = (file, ...args) => { if (String(file).endsWith(`${path.sep}0.txt`)) throw Object.assign(new Error('denied'), { code: 'EACCES' }); return lstat(file, ...args); };
-    assert.match(snapshotCopy(uncertain.worktree).incomplete, /could not read.*0\.txt/);
+    fs.lstatSync = (file, ...args) => { if (String(file).endsWith(`${path.sep}added.txt`)) throw Object.assign(new Error('denied'), { code: 'EACCES' }); return lstat(file, ...args); };
+    assert.match(snapshotCopy(uncertain.worktree).incomplete, /could not read.*added\.txt/);
   } finally { fs.lstatSync = lstat; }
   r = f.call(['finish', uncertain.id]); assert.equal(r.code, 0, r.out); f.leave();
   const saved = f.task(uncertain.id); saved.copyToReturn.left.incomplete = 'ignored walk exceeded its time budget'; f.save(saved);
@@ -170,6 +180,11 @@ gapTests.finish = () => {
   r = f.call(['start']); assert.ok(fs.existsSync(dirty.worktree)); assert.match(r.out, /work written since finish/);
   assert.equal(f.call(['finish', dirty.id, '--force']).code, 0);
 
+  const stopping = f.spawn('stopping'); patch({ silentAfterKill: true });
+  r = f.call(['finish', stopping.id]); assert.equal(r.code, 0, r.out);
+  assert.ok(f.task(stopping.id).copyToReturn?.stopPending && fs.existsSync(stopping.worktree), 'An unconfirmed stop postpones return instead of refusing after changing the worker');
+  patch({ silentAfterKill: false, silent: false }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(stopping.worktree));
+
   const second = f.spawn('second'); patch({ silentLsAfterRm: true });
   r = f.call(['finish', second.id]); assert.equal(r.code, 0, r.out);
   assert.equal(f.task(second.id).state, 'closed'); assert.ok(f.task(second.id).copyToReturn && fs.existsSync(second.worktree));
@@ -179,6 +194,13 @@ gapTests.finish = () => {
   const removal = f.spawn('removal'); patch({ silentAfterRm: true });
   r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(removal.id).copyToReturn && fs.existsSync(removal.worktree));
   patch({ silentAfterRm: false, silent: false }); r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(removal.worktree));
+
+  // A proved API exit can leave the wrapper shell live. A persisted cleanup retries that
+  // shell too; it must never become an indefinitely held copy after the worker has left.
+  const shell = f.spawn('shell');
+  f.save({ ...shell, state: 'closed', closed: new Date().toISOString(), copyToReturn: { since: new Date().toISOString(), left: snapshotCopy(shell.worktree), cleanupTerminal: true } });
+  r = f.call(['finish', shell.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(shell.worktree), r.out);
+  assert.ok(!readWorld().terminals[shell.terminal]);
 };
 
 gapTests.chain = () => {
@@ -229,6 +251,8 @@ try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
   for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
   if (!onlyGaps) {
+  // The focused fixtures have their own homes and copies, but share the fake Core transport.
+  fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
   // Status uses spawn time (creation while preparing), freezes settled tasks, and formats
   // elapsed time without contacting Core or depending on the wall clock.
   {
@@ -810,10 +834,10 @@ if (a[0] === 'start') {
   git('-C', project, 'worktree', 'add', '-q', '-b', 'feature/taken', path.join(root, 'taken'), 'HEAD');
   r = dl(['spawn', 'taken', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']); assert.equal(r.code, 5); assert.match(r.out, /feature\/taken already has a working copy at .*; it was left alone/);
   assert.equal(taskOf('taken').state, 'failed'); assert.ok(fs.existsSync(path.join(root, 'taken')) && !calls().some(e => e.a[0] === 'finish'));
-  // Finish hands the copy back; a refusal keeps the task open and says why.
+  // A failure after stopping closes the task with a durable postponed return, not a dead worker on an open task.
   fs.writeFileSync(stuck, '');
-  r = dl(['finish', 'p1']); assert.equal(r.code, 6); assert.match(r.out, /delivery did not take the working copy back \(kept .*the worktree is locked/);
-  assert.equal(taskOf('p1').state, 'working', 'A copy that was not taken back keeps its task open');
+  r = dl(['finish', 'p1']); assert.equal(r.code, 0); assert.match(r.out, /delivery did not take the working copy back \(kept .*the worktree is locked/);
+  assert.equal(taskOf('p1').state, 'closed'); assert.ok(taskOf('p1').copyToReturn, 'A failed return remains retryable');
   fs.rmSync(stuck);
   r = dl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to the pool/);
   assert.deepEqual(calls().at(-1).a, ['finish', p1.worktree, '--force']);

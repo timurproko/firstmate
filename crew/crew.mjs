@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.10.0';
+export const VERSION = '0.10.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -1216,7 +1216,7 @@ function a1Api(type, target) {
 // `stopped: true` is returned only for something that was observed: Core says the terminal
 // is finished or gone, or A1 itself says the session no longer exists. A Core that does not
 // answer is never read as "gone".
-function stopWorker(task, { force = false } = {}) {
+function stopWorker(task, { force = false, onStop = null } = {}) {
   let { state, t } = probe(task.terminal);
   if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
   if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
@@ -1234,17 +1234,22 @@ function stopWorker(task, { force = false } = {}) {
     const target = { sessionId: t.labels['a1.session'], runtimeId: t.labels['a1.runtime'] };
     const reply = a1Api('session.exit', target);
     if (reply?.success) {
+      onStop?.();
       for (let i = 0; i < 15; i++) {
         if (a1Api('session.lifecycle', target)?.error?.code === 'session-unavailable') return { stopped: true, how: 'a1 exit api' };
         sleep(1000);
       }
       return { stopped: false, how: 'a1 admitted the exit but is still there' };
     }
+    // No reply cannot prove the exit request was rejected; only an explicit rejection can
+    // still be a refusal with the worker intact. Finish must retain an unconfirmed attempt.
+    if (onStop && !reply && !force) { onStop(); return { stopped: false, how: 'A1 did not confirm the exit request' }; }
     if (!force) refuse(`A1 refused to exit (${reply?.error?.code ?? 'no answer'}). Nothing was closed.`, 6);
   }
   // Every other agent (and a forced stop of an A1 that would not leave) is stopped by ending
   // the terminal's program, then asking Core again: only a terminal seen finished or gone
   // counts.
+  onStop?.();
   hc(['kill', task.terminal]);
   for (let i = 0; i < 10; i++) {
     const after = probe(task.terminal).state;
@@ -1402,9 +1407,9 @@ export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
   let incomplete = null;
   const checkTime = () => { if (performance.now() >= deadline) throw new Error('ignored walk exceeded its time budget'); };
   try {
-    for (const { file } of changed) {
+    for (const { code, file } of changed) {
       files[file] = stamp(file);
-      if (files[file] === null) throw new Error(`could not read ${file}`);
+      if (files[file] === null && !code.includes('D')) throw new Error(`could not read ${file}`);
     }
     for (const { file } of roots.filter(e => e.code === '!!')) {
       const hash = createHash('sha256'), summary = { files: 0, newestMtimeMs: 0, totalSize: 0 };
@@ -1500,11 +1505,12 @@ function returnWaitingCopies(h, { skip = null } = {}) {
   }
   if (held) console.log(`${held} working ${held === 1 ? 'copy' : 'copies'} of finished tasks still held by another terminal; crew returns ${held === 1 ? 'it' : 'them'} once nothing holds ${held === 1 ? 'it' : 'them'}`);
 }
-// After stopping, Core may stop answering or fail to remove the terminal. Only remove a
-// terminal proved ended; persist the retry instead of treating uncertainty as absence.
+// Called only after a proved worker stop (or its persisted retry). A1's API exit can leave
+// the wrapper shell live: end that shell too. Unknown answers still postpone removal.
 function removeStoppedTerminal(task) {
   try {
     let seen = probe(task.terminal).state;
+    if (seen === 'live') { hc(['kill', task.terminal]); seen = probe(task.terminal).state; }
     if (seen === 'finished') { hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
     return seen === 'absent' ? null : { state: seen === 'unknown' ? 'silent' : 'held',
       text: `Core ${seen === 'unknown' ? 'did not confirm removal of' : 'still has'} worker terminal ${task.terminal}` };
@@ -1519,6 +1525,19 @@ function removeStoppedTerminal(task) {
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
 function returnWaiting(h, task, { force = false } = {}) {
   const { copyToReturn, ...rest } = task, project = projectOf(h, task);
+  if (copyToReturn.stopPending) {
+    // The stop was requested but not confirmed. Reapply idle/busy protection before any
+    // further lifecycle action; uncertainty never grants permission to discard the copy.
+    try {
+      const result = stopWorker(task);
+      if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
+      copyToReturn.stopPending = false;
+      saveTask(h, task);
+    } catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      return { state: error.exitCode === 4 ? 'silent' : 'held', line: `The working copy of ${task.id} is kept: ${error.message}` };
+    }
+  }
   if (copyToReturn.cleanupTerminal) {
     const pending = removeStoppedTerminal(task);
     if (pending) return { state: pending.state, line: `${pending.text}; the working copy of ${task.id} is kept. The next crew finish or crew start retries it.` };
@@ -1575,15 +1594,20 @@ function cmdFinish(args) {
   // A copy marked to keep (the shared delivery workflow's marker) is not removed unasked.
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
   const left = snapshotCopy(task.worktree);
-  const result = stopWorker(task, { force });
-  if (!result.stopped) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
+  let attempted = false, result;
+  try { result = stopWorker(task, { force, onStop: () => { attempted = true; } }); }
+  catch (error) {
+    if (!attempted || !(error instanceof Refusal)) throw error;
+    result = { stopped: false, how: error.message };
+  }
+  if (!result.stopped && !attempted) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
   const project = projectOf(h, task);
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
   const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
   // Record the remaining work before asking Core again, so an interrupted removal is retried.
-  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, cleanupTerminal: true } };
+  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, cleanupTerminal: true } };
   saveTask(h, waiting);
-  const cleanup = removeStoppedTerminal(task);
+  const cleanup = result.stopped ? removeStoppedTerminal(task) : { text: `its worker stop is not confirmed (${result.how})` };
   waiting.copyToReturn.cleanupTerminal = Boolean(cleanup);
   // Only after the stop can we know whether the worker wrote more while leaving. Never
   // refuse here with a dead worker: postpone return and keep the pre-stop snapshot instead.
@@ -1598,7 +1622,7 @@ function cmdFinish(args) {
   if (reason) {
     waiting.copyToReturn.heldBy = holders?.map(t => t.address) ?? [];
     saveTask(h, waiting);
-    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason}) and crew returns it by itself once nothing holds it; report kept at ${task.report}${cleanup || holders === null ? '; the next crew finish or crew start retries its return' : ''}`);
+    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}`);
   } else {
     saveTask(h, closed);
     console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
@@ -1977,26 +2001,47 @@ const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmd
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
   crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
+      re-adding replaces the registration: omitted workflow and gate-skip choices are dropped
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
       who: ${PICK_USAGE}
-  crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   who would do the work now: profiles, quota, fallback order
-  crew relaunch <id> [who] ["<why>"]       hand unfinished work to another agent in the same working copy
-  crew wait <id>... [--timeout seconds] [--no-fallback]   block until each worker reports; one that ran out of quota is replaced
-  crew status [--all] [--json]             tasks and their terminals
+  crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked
+  crew relaunch <id> [who] ["<why>"]       end the current session, even busy; hand over working, stopped or failed work; copy stays
+      no choice: reread all untried saved candidates, including earlier skips; a choice rebuilds the list and excludes only the current worker
+  crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; the owner can hand over quota/login stops
+      CREW_NO_FALLBACK=1 also disables hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
+  crew status [--all] [--json]             tasks, terminals, PR links and elapsed time; --all also shows why finished copies wait
+      JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
   crew stop <id> [--force]                 ask the worker to leave
-  crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
+  crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
+      protective refusals precede stop; later uncertainty postpones return for the next start/finish; status alone returns nothing
+      sweeps follow successful handling only; forced finish of a closed task refuses held, silent or failed returns
+      backlog: only reported scouts move here (not reviewers, except legacy treehouse); ships move at land
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
-  crew review <id> [who]                   start a reviewer on a ship task's branch
-  crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
+  crew review <id> [who]                   start a read-only reviewer; use its printed ID (truncated or numbered when needed)
+  crew land <id> [--title "<title>"]       push/open a plain PR, or record the workflow/gate PR
+      first land requires a reported worker, existing copy and clean tracked/untracked files; an already-landed PR can return early
+      plain PR text uses the first 200 report lines plus attribution; workflow draft/outcome summary is best-effort
   crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
   crew fix [who] "<problem>"               start a worker that repairs crew itself
   crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
-  crew update | crew rollback              bring this machine's crew up to date, or back one step`;
+  crew update | crew rollback              bring this machine's crew up to date, or back one step
+
+  Choices: --agent starts clean; model/effort/account alone modify the first selected profile.
+  --rule replaces the list by its one-based number; descriptions are not matched to tasks.
+  --no-fallback keeps one profile before Claude account expansion; also name --account for one login.
+  Lists override legacy defaults: spawn a1, review CREW_REVIEW_AGENT or author, fix CREW_FIX_AGENT or a1.
+  Only floors rearrange candidates: normal/unknown before low, order kept within groups.
+  Profiles sharing agent/model/account are one attempt even if effort or floor differs.
+  Profile provider selects the quota family, not the launch provider; floors use applicable effective availability.
+  Initial selection skips reads for one candidate; agents/hand-over check even one. Shared quota,
+  CREW_NO_QUOTA=1 or missing quota-axi skips quota reads, not applicable installation checks.
+  Gate delivery needs both the no-mistakes remote and installed tool; otherwise workflow/plain.
+`;
 
 export function main(argv) {
   const [name, ...args] = argv;
