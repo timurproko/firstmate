@@ -227,12 +227,28 @@ reaches every machine at its next session; `crew rollback` is per machine.
 
 ## Finish and other terminals
 
-`crew finish` removes a working copy only when the task's own terminal is the only one in it. Handing a pool slot
-back ends every process whose working folder is in the slot (treehouse does that so the next task gets a quiet
-folder), and on Windows a shell keeps the folder it was opened in even after `cd`. A terminal a person opened
-from a worker's tab, with their own agent in it, would be ended with the worker. So finish asks Core for the
-live terminals of this machine, and when another one sits in the copy it stops, names it and removes nothing,
-with or without `--force`. A Core that does not answer is treated the same way.
+`crew finish` hands a working copy back only when the task's own terminal was the only one in it. Handing a pool
+slot back ends every process whose working folder is in the slot (treehouse does that so the next task gets a
+quiet folder), and on Windows a shell keeps the folder it was opened in even after `cd`. A terminal a person
+opened from a worker's tab, with their own agent in it, would be ended with the worker. So finish asks Core for
+the live terminals of this machine. When another one sits in the copy, with or without `--force`, finish still
+does everything else (stops the worker, removes its terminal, forgets the Claude folder trust, closes the task,
+moves the backlog item) and only postpones handing the copy back. The task record keeps `copyToReturn`, and the
+output names the terminal that holds the copy. Herdr's shell integration reports where a shell is now in the
+label `custom.cwd`; when that is elsewhere, the message says "opened in the copy, now in <folder>", so a tab
+that looks unrelated is recognised. Holding is still decided by Core's `cwd`, because that is what treehouse
+acts on.
+
+Crew has no background process, so the postponed copies are returned at the next `crew start` and at every
+`crew finish` (of any task): each one that no terminal holds any more goes back the way finish would have taken
+it (delivery, the legacy treehouse path, or `git worktree remove`), its merged branch is dropped, and one line
+says so. Copies still held wait for next time with one summary line; a failed return is reported in one line
+and never fails the command. `crew status --all` lists such a task with who holds its copy; plain `crew status`
+ends with a line counting them.
+
+The refusals that protect work come first and are unchanged: uncommitted ship work, the `.artifacts/KEEP`
+marker, a worker still working without `--force`, and a Core that does not answer (about the worker or the
+terminal listing) all stop finish with nothing removed.
 
 ## Tests
 

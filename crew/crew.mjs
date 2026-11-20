@@ -290,9 +290,10 @@ behind it. Crew reads the quota itself (quota-axi, each saved Claude account sep
 - Never work in a worker's copy yourself and never edit a project directly.
 - When the person has you do a piece of work yourself, follow the shared delivery workflow
   (the \`change-delivery\` skill) for your working copy, as workers do.
-- \`crew finish\` refusing because another terminal is open in the working copy: that terminal
-  is the person's or another agent's and would be ended with the copy. Tell the person which
-  one; never close it yourself.
+- \`crew finish\` saying the working copy is kept because another terminal holds it: the task is
+  finished; only the copy waits, since returning it would end that terminal (the person's or
+  another agent's). Crew returns the copy by itself at a later \`crew start\` or \`crew finish\`
+  once nothing holds it. Never close that terminal yourself.
 - \`crew wait\` saying a worker needs a person: tell the person which terminal is waiting and
   why; do not finish it. Wait again once they have answered.
 - A worker that failed or went quiet: read \`crew status\`, look at its terminal with
@@ -448,6 +449,7 @@ function cmdStart() {
   const open = allTasks(h).filter(t => t.state !== 'closed');
   console.log(`you hold ${slash(h.dir)} (terminal ${mine})`);
   console.log(open.length ? `unfinished tasks: ${open.map(t => `${t.id}[${t.state}]`).join(' ')}` : 'no unfinished tasks');
+  returnWaitingCopies(h);
 }
 
 function cmdEnd() {
@@ -1222,6 +1224,98 @@ function otherTerminalsIn(folder, own) {
   // A terminal of another machine (`machine/t1`) names a folder there, not here.
   return value.terminals.filter(t => t.state === 'live' && t.address !== own && !String(t.address).includes('/') && t.cwd && (norm(t.cwd) === root || norm(t.cwd).startsWith(`${root}/`)));
 }
+// The terminals holding a copy, named so the person recognises them. Holding is decided by
+// Core's `cwd` alone, because that is the folder treehouse acts on. Herdr's shell integration
+// reports where the shell is now in the label `custom.cwd`; `hc ls` does not carry labels, so
+// each holder is asked once. A tab that moved on is said to have, since it looks unrelated.
+function describeHolders(holders, folder) {
+  const norm = p => slash(path.resolve(String(p))).replace(/\/+$/, '').toLowerCase(), root = norm(folder);
+  return holders.map(t => {
+    const name = `${t.address}${t.agent ? ` ${String(t.agent).split(/[\\/]/).pop()}` : ''}`;
+    const now = probe(t.address).t?.labels?.['custom.cwd'];
+    const moved = now && norm(now) !== root && !norm(now).startsWith(`${root}/`);
+    return moved ? `${name} (opened in the copy, now in ${slash(now)})` : name;
+  }).join(', ');
+}
+
+// Hands a closed worker's copy back the way it was made: through the delivery workflow, the
+// legacy treehouse pool, or git. Never refuses: { ok, said, leftover } or { ok: false, why },
+// so finish can refuse with `why` and the later sweep can report it and go on.
+function returnCopy(task, project, { force = false } = {}) {
+  if (task.via === 'delivery') {
+    // The shared delivery workflow made the copy, so it takes it back: a pool slot is returned,
+    // a plain folder removed. Crew has already refused unsaved ship work and a keep marker,
+    // so what is left in the copy is scratch and `--force` is crew's word to discard it.
+    // A first try can fail while the closed terminal's processes let go of the folder.
+    let back = { code: 0, stdout: '', stderr: '' };
+    for (let i = 0; fs.existsSync(path.join(task.worktree, '.git')) && i < 6; i++) {
+      back = runTool('delivery', ['finish', task.worktree, '--force'], { cwd: project?.path, timeout: 180000 });
+      if (!back) return { ok: false, why: `Task ${task.id}'s working copy was made by the shared delivery workflow, which is not installed here now; nothing was removed: ${task.worktree}` };
+      if (back.code === 0) break;
+      sleep(1000);
+    }
+    if (back.code !== 0) return { ok: false, why: `delivery did not take the working copy back (${lastLine(back.stdout || back.stderr)}); it was kept: ${task.worktree}` };
+    return { ok: true, said: `; working copy ${task.pooled ? 'returned to the pool' : 'removed'}`, leftover: '', released: true };
+  }
+  // Compatibility: a task from before 0.8 whose project took its copies from treehouse directly.
+  if (task.pool === 'treehouse') {
+    // The copy is a pool slot: it goes back to treehouse, which cleans it and keeps it.
+    // treehouse refuses a slot with loose files unless told to clean it. A scout's leftovers
+    // are scratch, and --force is the person's word to discard; a ship task's unsaved work
+    // without --force was refused by finish.
+    const back = runTool('treehouse', ['return', ...(force || task.kind === 'scout' ? ['--force'] : []), task.worktree], { cwd: project?.path, timeout: 180000 });
+    if (!back) return { ok: false, why: `Task ${task.id} uses a treehouse working copy, and treehouse is not installed here; nothing was returned.` };
+    if (back.code !== 0 && fs.existsSync(task.worktree)) return { ok: false, why: `treehouse did not take the working copy back (${lastLine(back.stderr || back.stdout)}); it was kept: ${task.worktree}` };
+    return { ok: true, said: '; working copy returned to treehouse', leftover: '', released: true };
+  }
+  // Git removes the copy. A first try can fail while the closed terminal's processes let go
+  // of the folder, so it is retried. The folder is deleted directly only when git no longer
+  // knows it as a working copy (an earlier, half-finished removal) or with --force.
+  let removal = { code: 0, stderr: '' };
+  for (let i = 0; fs.existsSync(task.worktree) && i < 8; i++) {
+    if (project) removal = run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
+    if (!fs.existsSync(task.worktree)) break;
+    const detached = !project || /is not a working tree/i.test(removal.stderr);
+    if (detached || force) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { /* still held: retry */ } }
+    if (fs.existsSync(task.worktree)) sleep(1000);
+  }
+  if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
+  // A published self-fix is on main; its branch has nothing left to keep.
+  if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', branchOf(task)]);
+  // An emptied folder that something still sits in (a helper process the agent left behind)
+  // is not worth failing for: the work is gone from disk and from git; say so and move on.
+  if (fs.existsSync(task.worktree)) {
+    if (fs.readdirSync(task.worktree).length) return { ok: false, why: `The terminal is closed, but the working copy is still in use and could not be removed: ${task.worktree}` };
+    return { ok: true, said: '', leftover: `; its empty folder is still held by another process (${task.worktree})`, released: false };
+  }
+  return { ok: true, said: '', leftover: '', released: true };
+}
+const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : h.config.projects[task.project]);
+
+// Copies whose return finish postponed because another terminal held them. They go back
+// here, at `crew start` and at every `crew finish`, once nothing holds them any more: crew is
+// one short process per command and has no watcher to do it in between. Nothing in here
+// fails the command that triggered it; a copy that cannot go back now waits for next time.
+function returnWaitingCopies(h) {
+  let held = 0;
+  for (const task of allTasks(h).filter(t => t.state === 'closed' && t.copyToReturn)) {
+    try {
+      const { copyToReturn, ...rest } = task;
+      if (!fs.existsSync(task.worktree)) { saveTask(h, { ...rest, copyReturned: now() }); continue; }
+      const holders = otherTerminalsIn(task.worktree, task.terminal);
+      if (holders === null) return; // Core is silent: nobody is seen, so nothing is removed.
+      if (holders.length) { held++; continue; }
+      const project = projectOf(h, task), back = returnCopy(task, project, { force: copyToReturn.force });
+      if (!back.ok) { console.log(`the working copy of ${task.id} was not returned yet: ${back.why}`); continue; }
+      saveTask(h, { ...rest, copyReturned: now() });
+      console.log(`returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
+    } catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      console.log(`the working copy of ${task.id} was not returned yet: ${error.message}`);
+    }
+  }
+  if (held) console.log(`${held} working ${held === 1 ? 'copy' : 'copies'} of finished tasks still held by another terminal; crew returns ${held === 1 ? 'it' : 'them'} once nothing holds ${held === 1 ? 'it' : 'them'}`);
+}
 
 function cmdFinish(args) {
   const h = home();
@@ -1229,17 +1323,15 @@ function cmdFinish(args) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);
-  if (task.state === 'closed') { console.log(`${id} is already closed`); return; }
-  // Somebody else's terminal in the copy is never ended with it, forced or not. Asked before anything is stopped.
-  if (fs.existsSync(task.worktree)) {
-    const others = otherTerminalsIn(task.worktree, task.terminal);
-    if (others === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
-    if (others.length) refuse(`Task ${id} was not finished: ${others.length === 1 ? 'another terminal is' : 'other terminals are'} open in its working copy ${task.worktree} (${others.map(t => `${t.address}${t.agent ? ` ${String(t.agent).split(/[\\/]/).pop()}` : ''}`).join(', ')}). Removing the copy would end what runs there. Close ${others.length === 1 ? 'it' : 'them'} or have the person do so, then finish again. Nothing was removed.`, 6);
-  }
+  if (task.state === 'closed') { console.log(`${id} is already closed`); returnWaitingCopies(h); return; }
+  // Somebody else's terminal in the copy is never ended with it, forced or not: the copy then
+  // stays until it is free, and everything else is finished. Core is asked before anything is
+  // stopped, so a Core that cannot list its terminals still leaves everything as it was.
+  if (fs.existsSync(task.worktree) && otherTerminalsIn(task.worktree, task.terminal) === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
   const result = stopWorker(task, { force });
   if (!result.stopped) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
   // A self-fix works on crew's own source, which is not a registered project.
-  const project = task.projectPath ? { path: task.projectPath } : h.config.projects[task.project];
+  const project = projectOf(h, task);
   // Work that exists only in the working copy is lost when the copy goes: a ship task's
   // branch keeps commits, nothing keeps uncommitted or untracked files. So a ship task
   // with such files is not cleaned up unless discarding them was asked for. (A scout is
@@ -1258,65 +1350,25 @@ function cmdFinish(args) {
     if (seen !== 'absent') { hc(['kill', task.terminal]); hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
     if (seen !== 'absent') refuse(`Core ${seen === 'unknown' ? 'did not confirm that' : 'still has'} terminal ${task.terminal}${seen === 'unknown' ? ' is gone' : ''}; the working copy was kept.`, 6);
   }
-  // Git removes the copy. A first try can fail while the closed terminal's processes let go
-  // of the folder, so it is retried. The folder is deleted directly only when git no longer
-  // knows it as a working copy (an earlier, half-finished removal) or with --force.
-  let removal = { code: 0, stderr: '' };
-  if (task.via === 'delivery') {
-    // The shared delivery workflow made the copy, so it takes it back: a pool slot is returned,
-    // a plain folder removed. Crew has already refused unsaved ship work and a keep marker,
-    // so what is left in the copy is scratch and `--force` is crew's word to discard it.
-    // A first try can fail while the closed terminal's processes let go of the folder.
-    let back = { code: 0, stdout: '', stderr: '' };
-    for (let i = 0; fs.existsSync(path.join(task.worktree, '.git')) && i < 6; i++) {
-      back = runTool('delivery', ['finish', task.worktree, '--force'], { cwd: project?.path, timeout: 180000 });
-      if (!back) refuse(`Task ${id}'s working copy was made by the shared delivery workflow, which is not installed here now; nothing was removed: ${task.worktree}`, 6);
-      if (back.code === 0) break;
-      sleep(1000);
-    }
-    if (back.code !== 0) refuse(`delivery did not take the working copy back (${lastLine(back.stdout || back.stderr)}); it was kept: ${task.worktree}`, 6);
-    if (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) forgetClaudeFolder(task.worktree);
-    saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
-    console.log(`finished ${id} (${result.how}); working copy ${task.pooled ? 'returned to the pool' : 'removed'}; report kept at ${task.report}${dropMergedBranch(project, task)}`);
-    if (task.kind === 'scout' && task.state === 'reported' && !task.reviews) backlogMove(h, id, 'done');
-    return;
+  const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
+  const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
+  // Asked again now that the worker's own terminal is gone: a tab may have been opened since.
+  // Treehouse would end it with the copy, so the copy waits and only its return is postponed.
+  const holders = fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
+  if (holders === null || holders.length) {
+    const by = holders === null ? 'Core did not say which terminals are in it' : `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it`;
+    forget();
+    saveTask(h, { ...closed, copyToReturn: { since: now(), force, heldBy: holders?.map(t => t.address) ?? [] } });
+    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${by}) and crew returns it by itself once nothing holds it; report kept at ${task.report}`);
+  } else {
+    const back = returnCopy(task, project, { force });
+    if (!back.ok) refuse(back.why, 6);
+    forget();
+    saveTask(h, closed);
+    console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
   }
-  // Compatibility: a task from before 0.8 whose project took its copies from treehouse directly.
-  if (task.pool === 'treehouse') {
-    // The copy is a pool slot: it goes back to treehouse, which cleans it and keeps it.
-    // treehouse refuses a slot with loose files unless told to clean it. A scout's leftovers
-    // are scratch, and --force is the person's word to discard; a ship task's unsaved work
-    // without --force was refused above.
-    const back = runTool('treehouse', ['return', ...(force || task.kind === 'scout' ? ['--force'] : []), task.worktree], { cwd: project?.path, timeout: 180000 });
-    if (!back) refuse(`Task ${id} uses a treehouse working copy, and treehouse is not installed here; nothing was returned.`, 6);
-    if (back.code !== 0 && fs.existsSync(task.worktree)) refuse(`treehouse did not take the working copy back (${lastLine(back.stderr || back.stdout)}); it was kept: ${task.worktree}`, 6);
-    if (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) forgetClaudeFolder(task.worktree);
-    saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
-    console.log(`finished ${id} (${result.how}); working copy returned to treehouse; report kept at ${task.report}${dropMergedBranch(project, task)}`);
-    if (task.kind === 'scout' && task.state === 'reported') backlogMove(h, id, 'done');
-    return;
-  }
-  for (let i = 0; fs.existsSync(task.worktree) && i < 8; i++) {
-    if (project) removal = run('git', ['-C', project.path, 'worktree', 'remove', '--force', task.worktree]);
-    if (!fs.existsSync(task.worktree)) break;
-    const detached = !project || /is not a working tree/i.test(removal.stderr);
-    if (detached || force) { try { fs.rmSync(task.worktree, { recursive: true, force: true }); } catch { /* still held: retry */ } }
-    if (fs.existsSync(task.worktree)) sleep(1000);
-  }
-  if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
-  // A published self-fix is on main; its branch has nothing left to keep.
-  if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', branchOf(task)]);
-  if (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) forgetClaudeFolder(task.worktree);
-  // An emptied folder that something still sits in (a helper process the agent left behind)
-  // is not worth failing for: the work is gone from disk and from git; say so and move on.
-  let leftover = '';
-  if (fs.existsSync(task.worktree)) {
-    if (fs.readdirSync(task.worktree).length) refuse(`The terminal is closed, but the working copy is still in use and could not be removed: ${task.worktree}`, 6);
-    leftover = `; its empty folder is still held by another process (${task.worktree})`;
-  }
-  saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
-  console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}${fs.existsSync(task.worktree) ? '' : dropMergedBranch(project, task)}`);
   if (task.kind === 'scout' && task.state === 'reported' && !task.reviews) backlogMove(h, id, 'done');
+  returnWaitingCopies(h);
 }
 
 // --- follow-ups, review and delivery ------------------------------------------------
@@ -1613,12 +1665,22 @@ function cmdStatus(args) {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
     return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
-      report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime) };
+      report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime),
+      ...(t.copyToReturn ? { copyToReturn: copyWaiting(t) } : {}) };
   });
-  if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks })); return; }
+  // A closed task whose copy still waits to be returned is not hidden: --all lists it with its
+  // holders, and plain status (which is about unfinished work) says how many there are.
+  const waiting = all ? 0 : allTasks(h).filter(t => t.state === 'closed' && t.copyToReturn).length;
+  if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }) })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
-  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
+  if (waiting) console.log(`${waiting} working ${waiting === 1 ? 'copy' : 'copies'} of finished tasks still to be returned (crew status --all)`);
+}
+// Where a postponed copy stands now, asked of Core: { worktree, since, heldBy, free }.
+function copyWaiting(task) {
+  const holders = fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
+  return { worktree: task.worktree, since: task.copyToReturn.since ?? null, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, free: Array.isArray(holders) && !holders.length };
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
