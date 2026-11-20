@@ -217,6 +217,15 @@ reaches every machine at its next session; `crew rollback` is per machine.
   out unless the project asks for it.
 - One machine per home. Tested live on Windows with A1 and Pi workers and an A1 coordinator.
 
+## Finish and other terminals
+
+`crew finish` removes a working copy only when the task's own terminal is the only one in it. Handing a pool slot
+back ends every process whose working folder is in the slot (treehouse does that so the next task gets a quiet
+folder), and on Windows a shell keeps the folder it was opened in even after `cd`. A terminal a person opened
+from a worker's tab, with their own agent in it, would be ended with the worker. So finish asks Core for the
+live terminals of this machine, and when another one sits in the copy it stops, names it and removes nothing,
+with or without `--force`. A Core that does not answer is treated the same way.
+
 ## Tests
 
 `node crew/crew.test.mjs` runs everything against a fake Core.

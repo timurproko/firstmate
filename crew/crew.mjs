@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.9.0';
+export const VERSION = '0.9.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -286,6 +286,9 @@ behind it. Crew reads the quota itself (quota-axi, each saved Claude account sep
 - Never work in a worker's copy yourself and never edit a project directly.
 - When the person has you do a piece of work yourself, follow the shared delivery workflow
   (the \`change-delivery\` skill) for your working copy, as workers do.
+- \`crew finish\` refusing because another terminal is open in the working copy: that terminal
+  is the person's or another agent's and would be ended with the copy. Tell the person which
+  one; never close it yourself.
 - \`crew wait\` saying a worker needs a person: tell the person which terminal is waiting and
   why; do not finish it. Wait again once they have answered.
 - A worker that failed or went quiet: read \`crew status\`, look at its terminal with
@@ -1169,6 +1172,19 @@ function dropMergedBranch(project, task) {
   return merged && git('branch', '-D', branch).code === 0 ? `; merged branch ${branch} deleted` : '';
 }
 
+// Other terminals whose folder is inside a working copy. Removing a copy ends what runs in it:
+// the delivery workflow returns a pool slot through treehouse, which terminates every process
+// whose working folder is in the slot, and a shell opened there keeps that folder for the
+// system even after `cd`. A person's own session started from such a shell would die with the
+// worker. `null` when Core could not be asked.
+function otherTerminalsIn(folder, own) {
+  const { code, value } = hcJson(['ls', '--json']);
+  if (code !== 0 || !Array.isArray(value?.terminals)) return null;
+  const norm = p => slash(path.resolve(String(p))).replace(/\/+$/, '').toLowerCase(), root = norm(folder);
+  // A terminal of another machine (`machine/t1`) names a folder there, not here.
+  return value.terminals.filter(t => t.state === 'live' && t.address !== own && !String(t.address).includes('/') && t.cwd && (norm(t.cwd) === root || norm(t.cwd).startsWith(`${root}/`)));
+}
+
 function cmdFinish(args) {
   const h = home();
   requireOwner(h);
@@ -1176,6 +1192,12 @@ function cmdFinish(args) {
   if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);
   if (task.state === 'closed') { console.log(`${id} is already closed`); return; }
+  // Somebody else's terminal in the copy is never ended with it, forced or not. Asked before anything is stopped.
+  if (fs.existsSync(task.worktree)) {
+    const others = otherTerminalsIn(task.worktree, task.terminal);
+    if (others === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
+    if (others.length) refuse(`Task ${id} was not finished: ${others.length === 1 ? 'another terminal is' : 'other terminals are'} open in its working copy ${task.worktree} (${others.map(t => `${t.address}${t.agent ? ` ${String(t.agent).split(/[\\/]/).pop()}` : ''}`).join(', ')}). Removing the copy would end what runs there. Close ${others.length === 1 ? 'it' : 'them'} or have the person do so, then finish again. Nothing was removed.`, 6);
+  }
   const result = stopWorker(task, { force });
   if (!result.stopped) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
   // A self-fix works on crew's own source, which is not a registered project.
