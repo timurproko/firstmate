@@ -111,6 +111,10 @@ Claude profile.
   with `account` is started through the plugin's launcher as that account. A Claude profile
   without one stands for every saved account, each a candidate of its own, with
   `CREW_CLAUDE_ACCOUNT` (what Herdr's account choice sets) first.
+- **A floor** (`"floor": 50` on a profile, Firstmate's field) is the share of its quota, in percent, a profile
+  keeps in reserve: once it is known to have less left, it yields to the next. It is not dropped but moved
+  behind the others, so when everybody else is out it is still used and work goes on. The figure is the
+  tightest of the account's windows (for Claude: the session window or the week, whichever has less left).
 - **The list is a fallback chain, in the person's order.** The order is never rearranged; a
   candidate is only passed over for a known reason: its quota is used up, its login is no
   longer accepted, or its program is not installed. A quota that could not be read is

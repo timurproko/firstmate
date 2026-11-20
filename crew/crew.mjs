@@ -499,6 +499,7 @@ export function agentCommand(name, agent, instruction, env = process.env, pick =
 // turns quota reading off. Added for crew: `roles` (an array per scout, ship, review, fix),
 // and `account` on a Claude profile, a login saved by the account-switcher plugin. A Claude
 // profile without one stands for every saved account, each a candidate of its own.
+// `floor` (Firstmate's too) is the share of quota, in percent, a profile keeps in reserve.
 // The resulting ordered list is a fallback chain. Before a worker starts, candidates whose
 // quota is used up or whose login is gone are passed over; when a running worker stops on a
 // limit or a lost login, `crew wait` hands its task to the next one (see relaunch). Work
@@ -537,6 +538,12 @@ export function cleanProfile(raw, where = '') {
     out[key] = String(p[key]);
   }
   if (out.account && harness !== 'claude') refuse(`${at}Only Claude Code has saved accounts. ${harness} chooses its login with the model, as in "github-copilot/<id>".`);
+  // Firstmate's optional `floor`: the share of quota, in percent, below which this profile yields to the next.
+  if (p.floor !== undefined && p.floor !== null) {
+    const floor = Number(p.floor);
+    if (!Number.isFinite(floor) || floor < 0 || floor > 100) refuse(`${at}Not a usable floor (0 to 100): ${p.floor}`);
+    out.floor = floor;
+  }
   // Firstmate's optional `provider` is the quota-axi family the profile spends from.
   if (typeof p.provider === 'string' && WORD.test(p.provider)) out.family = p.provider;
   return out;
@@ -683,12 +690,16 @@ function agentInstalled(harness, env = process.env) {
 
 // Reads the candidates' quota and keeps, in their own order, those that can take work now.
 // The order is the person's preference and is not rearranged; a candidate is only dropped
-// for a known reason. With a single candidate there is nothing to choose and nothing is read.
+// for a known reason. One known to be under its own `floor` is kept but goes behind the
+// others, in order: it is saved for when nobody else can work, so a floor never stops work.
+// With a single candidate there is nothing to choose and nothing is read.
 function usableCandidates(candidates, { shared = false, always = false, env = process.env } = {}) {
   const check = candidates.length > 1 || always, facts = check ? quotaFacts(candidates, { shared, env }) : new Map();
   if (check) for (const c of candidates) if (!agentInstalled(c.harness, env)) facts.set(pickKey(c), { status: 'missing', note: `${AGENTS[c.harness].command} is not installed on this machine` });
   const rows = candidates.map(c => ({ ...c, fact: facts.get(pickKey(c)) ?? { status: 'unknown', note: 'not checked: the only candidate' } }));
-  return { rows, usable: rows.filter(r => ['ok', 'unknown'].includes(r.fact.status)).map(({ fact, family, ...c }) => c) };
+  for (const r of rows) if (r.fact.status === 'ok' && r.floor !== undefined && r.fact.remaining < r.floor) r.fact = { ...r.fact, status: 'low', note: `${r.fact.note}, under its floor of ${r.floor}%` };
+  const strip = ({ fact, family, ...c }) => c;
+  return { rows, usable: [...rows.filter(r => ['ok', 'unknown'].includes(r.fact.status)), ...rows.filter(r => r.fact.status === 'low')].map(strip) };
 }
 const candidateLines = rows => rows.map(r => `  ${pickLabel(r)} - ${r.fact.note}`).join('\n');
 
@@ -697,7 +708,9 @@ function chooseWorker(h, role, flags, legacy) {
   const { candidates, config, source } = workChain(h, role, flags, legacy);
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared });
   if (!usable.length) refuse(`Nobody can take this work now:\n${candidateLines(rows)}\nAdd another profile to ${slash(config.file)}, or name one: --agent <agent> [--model <id>] [--account <account>].`, 8);
-  for (const r of rows.slice(0, rows.findIndex(r => pickKey(r) === pickKey(usable[0])))) console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`);
+  const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
+  for (const r of rows) { if (r === taken) break; console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`); }
+  if (taken.fact.status === 'low') console.log(`${pickLabel(taken)} is under its floor (${taken.fact.note}), but nobody above their floor can take the work`);
   return { pick: usable[0], rest: usable.slice(1), source };
 }
 

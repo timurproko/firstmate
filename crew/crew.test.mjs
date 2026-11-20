@@ -863,6 +863,18 @@ if (a[0] === '--version') process.exit(0);`);
     assert.ok(!fs.existsSync(path.join(home2, 'tasks', 'nobody')), 'No task, copy or terminal is made when nobody can work');
     // shared_quota: Firstmate's switch for one shared pool; nothing is read and the order decides.
     fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
+    // A floor: an account under it yields to the next, and is still used when nobody else can work.
+    fs.writeFileSync(dispatch, JSON.stringify({ default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', model: 'opus', account: 'one@example.com', floor: 50 }, { harness: 'claude', model: 'opus', account: 'two@example.com', floor: 50 }, { harness: 'claude', model: 'opus', account: 'gone@example.com' }] }));
+    setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 80 });
+    q = crew2(['spawn', 'floor1', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /passed over claude opus as one@example\.com: 49% left, under its floor of 50%/); assert.equal(task2('floor1').launch.account, 'two@example.com');
+    assert.deepEqual(task2('floor1').chain.map(c => [c.account, c.floor]), [['one@example.com', 50]], 'The account under its floor stands last, with its floor kept');
+    setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 20 });
+    q = crew2(['spawn', 'floor2', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
+    assert.match(q.out, /claude opus as one@example\.com is under its floor \(49% left, under its floor of 50%\), but nobody above their floor can take the work/); assert.equal(task2('floor2').launch.account, 'one@example.com');
+    assert.match(crew2(['agents']).out, /claude opus as two@example\.com\s+low\s+20% left, under its floor of 50%/);
+    assert.throws(() => cleanProfile({ harness: 'claude', floor: 140 }), /Not a usable floor/);
+    fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
     fs.rmSync(quotaLog); q = crew2(['spawn', 'pool', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out); assert.equal(task2('pool').launch.model, 'openai-codex/gpt-x'); assert.ok(!fs.existsSync(quotaLog));
   }
 
