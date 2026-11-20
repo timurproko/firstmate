@@ -763,6 +763,23 @@ function cmdStop(args) {
   if (!result.stopped) process.exitCode = 6;
 }
 
+// A ship task's branch crew/<id> outlives its working copy on purpose: it holds the commits.
+// Once they are merged it holds nothing, so it goes with the copy. Merged means: reachable
+// from the project's current or default branch, or GitHub has a merged pull request whose
+// head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
+function dropMergedBranch(project, task) {
+  if (task.kind !== 'ship' || task.selfFix || !project?.path) return '';
+  const branch = `crew/${task.id}`, git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
+  const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
+  if (!tip) return '';
+  let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
+  if (!merged && git('remote', 'get-url', 'origin').code === 0) {
+    const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid', '--jq', '.[0].headRefOid'], { cwd: project.path, timeout: 60000 });
+    merged = asked.code === 0 && asked.stdout.trim() === tip;
+  }
+  return merged && git('branch', '-D', branch).code === 0 ? `; merged branch ${branch} deleted` : '';
+}
+
 function cmdFinish(args) {
   const h = home();
   requireOwner(h);
@@ -801,7 +818,7 @@ function cmdFinish(args) {
     if (back.code !== 0 && fs.existsSync(task.worktree)) refuse(`treehouse did not take the working copy back (${lastLine(back.stderr || back.stdout)}); it was kept: ${task.worktree}`, 6);
     if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
     saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
-    console.log(`finished ${id} (${result.how}); working copy returned to treehouse; report kept at ${task.report}`);
+    console.log(`finished ${id} (${result.how}); working copy returned to treehouse; report kept at ${task.report}${dropMergedBranch(project, task)}`);
     if (task.kind === 'scout' && task.state === 'reported') backlogMove(h, id, 'done');
     return;
   }
@@ -824,7 +841,7 @@ function cmdFinish(args) {
     leftover = `; its empty folder is still held by another process (${task.worktree})`;
   }
   saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
-  console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}`);
+  console.log(`finished ${id} (${result.how}); report kept at ${task.report}${leftover}${fs.existsSync(task.worktree) ? '' : dropMergedBranch(project, task)}`);
   if (task.kind === 'scout' && task.state === 'reported' && !task.reviews) backlogMove(h, id, 'done');
 }
 
@@ -1129,7 +1146,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew wait <id>... [--timeout seconds]    block until each worker reports
   crew status [--all] [--json]             tasks and their terminals
   crew stop <id> [--force]                 ask the worker to leave
-  crew finish <id> [--force]               stop it, remove its terminal and working copy
+  crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
   crew review <id> [--agent <agent>]       start a reviewer on a ship task's branch
