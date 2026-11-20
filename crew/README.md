@@ -115,6 +115,10 @@ Claude profile.
   keeps in reserve: once it is known to have less left, it yields to the next. It is not dropped but moved
   behind the others, so when everybody else is out it is still used and work goes on. The figure is the
   tightest of the account's windows (for Claude: the session window or the week, whichever has less left).
+- **A project's own list.** `"projects": { "<name>": [ ...profiles ] }` (or `{ "default": [...], "roles": {...} }`) is used
+  for that project instead of the general lists: for a project where an agent of the general list cannot work.
+  `"crew:self"` names crew's own source, which `crew fix` works on. Order of precedence: the project's role list,
+  the project's list, the general role list, `default`.
 - **The list is a fallback chain, in the person's order.** The order is never rearranged; a
   candidate is only passed over for a known reason: its quota is used up, its login is no
   longer accepted, or its program is not installed. A quota that could not be read is
@@ -134,6 +138,10 @@ Claude profile.
   of the task's chain is started in the same working copy and told to go on from what is
   there (`git status`, `git log`, the report). The task keeps its id; its record holds
   `launch` (who works now), `chain` (who is left) and `fallbacks` (who stopped, and why).
+  The same happens when the agent is gone: the terminal is still there but Core sees no agent in it and no
+  report was written (a crash at start, an agent that left). That counts only 45 seconds after the worker
+  was started (`CREW_DEAD_SECONDS`) and when two checks in a row see it, since a starting agent looks the same,
+  and only for agents Core recognises in a terminal (`a1`, `claude`).
   `crew relaunch <id>` does the same by hand. Only when nobody is left does the wait end with
   "needs a person", and a spawn with "Nobody can take this work now", each with the reason
   per candidate.

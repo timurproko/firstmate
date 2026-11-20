@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.9.1';
+export const VERSION = '0.9.2';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -28,12 +28,14 @@ export const DEFAULT_HOME = CREW_DIR;
 // one more tool name. A Claude worker keeps its permission system; it is only told up front
 // that editing files and using its ordinary tools inside its own working copy is expected,
 // so it does not stop to ask for each one. Folder trust: see trustClaudeFolder below.
+// `seen` marks an agent Core recognises in a terminal (it reports the agent and whether it is
+// working); only for those can crew tell that the agent is gone while the terminal lives on.
 // PowerShell is in the list beside Bash: on Windows Claude Code runs its commands through
 // that tool, and without it every command (`crew done` included) waits for a person.
 export const AGENTS = {
-  a1: { command: 'a1', exit: 'a1-api' },
+  a1: { command: 'a1', exit: 'a1-api', seen: true },
   pi: { command: 'pi', exit: 'close' },
-  claude: { command: 'claude', exit: 'close', trust: 'claude', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'] },
+  claude: { command: 'claude', exit: 'close', seen: true, trust: 'claude', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'] },
 };
 
 // --- small helpers -----------------------------------------------------------
@@ -270,13 +272,15 @@ The person's agents, models and accounts are in \`config/crew-dispatch.json\` of
 ordered list: the first that has quota and a working login takes the task, the others stand
 behind it. Crew reads the quota itself (quota-axi, each saved Claude account separately).
 - \`crew agents\` shows the list as it stands now, with quota, and its numbered rules.
-  \`crew agents --role ship|review|fix\` shows it for that kind of work.
+  \`crew agents --role ship|review|fix\` shows it for that kind of work, \`--project <name>\` for a
+  project that has a list of its own.
 - Say nothing and crew chooses. When a rule's \`when\` describes the task, add \`--rule <n>\`.
 - When the person names an agent, model or account, pass it: \`--agent a1|pi|claude\`,
   \`--model <id>\` (for a1 and pi \`<provider>/<id>\`, e.g. \`github-copilot/...\`, which chooses the
   login), \`--effort <level>\`, \`--account <claude account>\`. The list still stands behind that
   choice; \`--no-fallback\` only when the person wants that one and nothing else.
-- A worker that runs out of quota or loses its login is not a failure: \`crew wait\` hands its
+- A worker that runs out of quota, loses its login, or whose agent crashed or left without a
+  report is not a failure: \`crew wait\` hands its
   task to the next in the list, in the same working copy, and keeps waiting. It says so in a
   line; pass that on to the person. \`crew relaunch <id> [--agent ...]\` does the same by hand.
 - "Nobody can take this work now" lists why for each candidate. Tell the person exactly that;
@@ -503,6 +507,8 @@ export function agentCommand(name, agent, instruction, env = process.env, pick =
 // and `account` on a Claude profile, a login saved by the account-switcher plugin. A Claude
 // profile without one stands for every saved account, each a candidate of its own.
 // `floor` (Firstmate's too) is the share of quota, in percent, a profile keeps in reserve.
+// `projects` gives one project a list of its own (an array, or { default, roles }), for a
+// project where an agent of the general list cannot work; "crew:self" is crew's own source.
 // The resulting ordered list is a fallback chain. Before a worker starts, candidates whose
 // quota is used up or whose login is gone are passed over; when a running worker stops on a
 // limit or a lost login, `crew wait` hands its task to the next one (see relaunch). Work
@@ -554,16 +560,22 @@ export function cleanProfile(raw, where = '') {
 
 const dispatchFile = h => path.join(h.dir, 'config', 'crew-dispatch.json');
 function dispatchConfig(h) {
-  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [] };
+  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [], projects: {} };
   if (!fs.existsSync(file)) return none;
   let raw;
   try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { refuse(`${slash(file)} is not valid JSON (${error.message}). Correct it, or remove it to use the built-in default.`); }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) refuse(`${slash(file)} must hold one object.`);
   const list = (value, where) => (value === undefined || value === null ? [] : Array.isArray(value) ? value : [value]).map((p, i) => cleanProfile(p, `${where}[${i}] in ${slash(file)}`));
-  const unknownRole = Object.keys(raw.roles ?? {}).find(r => !ROLES.includes(r));
-  if (unknownRole) refuse(`${slash(file)}: roles.${unknownRole} is not a role. Roles: ${ROLES.join(', ')}`);
+  const roles = (value, where) => {
+    const unknown = Object.keys(value ?? {}).find(r => !ROLES.includes(r));
+    if (unknown) refuse(`${slash(file)}: ${where}.${unknown} is not a role. Roles: ${ROLES.join(', ')}`);
+    return Object.fromEntries(Object.entries(value ?? {}).map(([role, v]) => [role, list(v, `${where}.${role}`)]));
+  };
+  // A project's own list: an array of profiles, or { default, roles } like the file itself.
+  const projects = Object.fromEntries(Object.entries(raw.projects ?? {}).map(([name, value]) => [name, Array.isArray(value) || typeof value !== 'object' || value === null || value.harness || value.agent
+    ? { default: list(value, `projects.${name}`), roles: {} } : { default: list(value.default, `projects.${name}.default`), roles: roles(value.roles, `projects.${name}.roles`) }]));
   return { file, present: true, shared: raw.shared_quota === true, default: list(raw.default, 'default'),
-    roles: Object.fromEntries(Object.entries(raw.roles ?? {}).map(([role, value]) => [role, list(value, `roles.${role}`)])),
+    roles: roles(raw.roles, 'roles'), projects,
     rules: (Array.isArray(raw.rules) ? raw.rules : []).map((r, i) => ({ when: String(r?.when ?? ''), why: String(r?.why ?? ''), use: list(r?.use, `rules[${i}].use`) })) };
 }
 
@@ -581,14 +593,17 @@ function claudeAccounts(env = process.env) {
 // The ordered candidates for one piece of work. What the command line names comes first and
 // the configured chain follows it as its fallback; `--no-fallback` keeps only the first.
 // `legacy` is the agent crew used before there was any configuration.
-function workChain(h, role, flags, legacy, env = process.env) {
-  const config = dispatchConfig(h);
+function workChain(h, role, flags, legacy, project = null, env = process.env) {
+  const config = dispatchConfig(h), own = config.projects[project] ?? null;
+  // The project's own list comes before the general one, a role's list before a default.
+  const [configured, from] = own?.roles[role]?.length ? [own.roles[role], `projects.${project}.roles.${role}`] : own?.default.length ? [own.default, `projects.${project}`]
+    : config.roles[role]?.length ? [config.roles[role], `roles.${role}`] : [config.default, config.default.length ? 'default' : 'built-in'];
   let base;
   if (flags.rule !== undefined) {
     const rule = config.rules[Number(flags.rule) - 1];
     if (!rule) refuse(`No rule ${flags.rule} in ${slash(config.file)}${config.rules.length ? ` (it has ${config.rules.length}; see \`crew agents\`)` : ' (it has none)'}.`);
     base = rule.use;
-  } else base = config.roles[role]?.length ? config.roles[role] : config.default;
+  } else base = configured;
   const named = ['agent', 'model', 'effort', 'account'].some(key => flags[key] !== undefined);
   // --agent starts a clean choice, so an account or model of another agent is never carried
   // over; --model, --effort or --account alone adjust the first configured profile.
@@ -603,7 +618,7 @@ function workChain(h, role, flags, legacy, env = process.env) {
     const each = profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
     for (const c of each) { if (!seen.has(pickKey(c))) { seen.add(pickKey(c)); candidates.push(c); } }
   }
-  return { candidates, config, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : config.roles[role]?.length ? `roles.${role}` : config.default.length ? 'default' : 'built-in' };
+  return { candidates, config, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from };
 }
 
 // The provider an A1 or Pi profile without a model spends from: the agent's own saved default.
@@ -707,8 +722,8 @@ function usableCandidates(candidates, { shared = false, always = false, env = pr
 const candidateLines = rows => rows.map(r => `  ${pickLabel(r)} - ${r.fact.note}`).join('\n');
 
 // Who takes a new piece of work, and who stands behind them.
-function chooseWorker(h, role, flags, legacy) {
-  const { candidates, config, source } = workChain(h, role, flags, legacy);
+function chooseWorker(h, role, flags, legacy, project = null) {
+  const { candidates, config, source } = workChain(h, role, flags, legacy, project);
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared });
   if (!usable.length) refuse(`Nobody can take this work now:\n${candidateLines(rows)}\nAdd another profile to ${slash(config.file)}, or name one: --agent <agent> [--model <id>] [--account <account>].`, 8);
   const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
@@ -719,9 +734,9 @@ function chooseWorker(h, role, flags, legacy) {
 
 function cmdAgents(args) {
   const h = home();
-  const { flags } = takeFlags(args, ['role', ...PICK_FLAGS], ['json', 'no-fallback']);
+  const { flags } = takeFlags(args, ['role', 'project', ...PICK_FLAGS], ['json', 'no-fallback']);
   if (flags.role !== undefined && !ROLES.includes(flags.role)) refuse(`Unknown role: ${flags.role}. Roles: ${ROLES.join(', ')}`);
-  const role = flags.role ?? 'scout', { candidates, config, source } = workChain(h, role, flags, 'a1');
+  const role = flags.role ?? 'scout', { candidates, config, source } = workChain(h, role, flags, 'a1', flags.project ?? null);
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
   const first = usable[0] ? pickKey(usable[0]) : null;
   if (flags.json) {
@@ -730,7 +745,7 @@ function cmdAgents(args) {
       rules: config.rules.map((r, i) => ({ rule: i + 1, when: r.when, why: r.why, use: r.use.map(pickLabel) })) }));
     return;
   }
-  console.log(config.present ? `profiles from ${slash(config.file)} (${source}), for ${role} work:` : `no ${slash(config.file)}: the built-in default, for ${role} work:`);
+  console.log(config.present ? `profiles from ${slash(config.file)} (${source}), for ${role} work${flags.project ? ` in ${flags.project}` : ''}:` : `no ${slash(config.file)}: the built-in default, for ${role} work:`);
   for (const r of rows) console.log(`${pickKey(r) === first ? '->' : '  '} ${pickLabel(r).padEnd(52)} ${r.fact.status.padEnd(11)}${r.fact.note}`);
   if (!first) console.log('Nobody can take work now.');
   config.rules.forEach((r, i) => console.log(`rule ${i + 1}: ${r.when}\n        use ${r.use.map(pickLabel).join(', then ')}  (--rule ${i + 1})`));
@@ -886,7 +901,7 @@ function cmdSpawn(args) {
   if (flags.agent !== undefined && !AGENTS[flags.agent]) refuse(`Unknown agent: ${flags.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
   if (fs.existsSync(taskDir(h, id))) refuse(`Task ${id} already exists.`);
-  launchWorker(h, { id, opts, chosen: chooseWorker(h, opts.kind, flags, 'a1'), project, task });
+  launchWorker(h, { id, opts, chosen: chooseWorker(h, opts.kind, flags, 'a1', opts.project), project, task });
 }
 const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]`;
 
@@ -982,7 +997,7 @@ function relaunch(h, task, reason, flags = null) {
   const config = dispatchConfig(h);
   // The task's own chain as it stood at launch; a task from before there were chains, or an
   // explicit choice on the command line, takes the configured one as it stands now.
-  const candidates = (named || !task.chain ? workChain(h, role, flags ?? {}, task.agent).candidates : task.chain).filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
+  const candidates = (named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.chain).filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
   if (!usable.length) return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
   const [pick, ...rest] = usable;
@@ -1000,7 +1015,7 @@ function relaunch(h, task, reason, flags = null) {
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const { error, ...kept } = task;
-  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, chain: rest, tried: [...tried], state: 'working', terminal: address,
+  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, chain: rest, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
     fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
@@ -1014,6 +1029,20 @@ function stoppedOn(address, lines) {
   if (read.code !== 0) return null;
   const hit = read.stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean).slice(-lines).reverse().find(l => STOPPED_ON.test(l));
   return hit ? hit.replace(/\s+/g, ' ').slice(0, 140) : null;
+}
+
+// A worker whose agent is gone: its terminal is live (the shell stays) but Core sees no agent in
+// it and no report was written. That is an agent that crashed at start or left mid-task. Core
+// also shows no agent in the first moments of a start, so this only counts some time after the
+// worker was started (CREW_DEAD_SECONDS, default 45) and when seen twice in a row.
+const DEAD_AFTER = () => (process.env.CREW_DEAD_SECONDS !== undefined ? Number(process.env.CREW_DEAD_SECONDS) : 45) * 1000;
+const startedLongAgo = task => Date.now() - Date.parse(task.relaunched ?? task.spawned ?? task.created) > DEAD_AFTER();
+// What the agent last said, for the person and for whoever takes over.
+function lastWords(address) {
+  const read = hc(['read', address, '--lines', '30']);
+  if (read.code !== 0) return '';
+  const lines = read.stdout.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('[hc]'));
+  return (lines.reverse().find(l => /error|stopp|crash|fatal|exception|unexpected|denied|not found/i.test(l)) ?? '').replace(/\s+/g, ' ').slice(0, 160);
 }
 
 function cmdRelaunch(args) {
@@ -1052,6 +1081,7 @@ function cmdWait(args) {
   if (!ids.length) refuse('Usage: crew wait <id> [<id>...] [--timeout seconds] [--no-fallback]');
   // Handing a stopped worker's task to the next candidate changes the home, so only its owner does it.
   const handover = !flags['no-fallback'] && process.env.CREW_NO_FALLBACK !== '1' && ownerState(h).mine;
+  const quiet = new Map(); // how many checks in a row found no agent in a worker's terminal
   ids.forEach(id => loadTask(h, id));
   const deadline = Date.now() + timeout * 1000, settled = new Map(), blocked = new Map();
   for (let tick = 0; settled.size < ids.length && Date.now() < deadline; tick++) {
@@ -1064,9 +1094,17 @@ function cmdWait(args) {
       if (tick % 5 !== 4 || !task.terminal) continue;
       const { state: seen, t } = probe(task.terminal);
       if (seen === 'unknown') continue; // Core did not answer: that says nothing about the worker
+      if (t?.status?.state) quiet.delete(id);
       if (seen !== 'live') {
         saveTask(h, { ...task, state: 'failed', error: 'The worker terminal ended without a report.' });
         settled.set(id, 'failed');
+      } else if (handover && AGENTS[task.agent]?.seen && !t.status?.state && startedLongAgo(task) && quiet.set(id, (quiet.get(id) ?? 0) + 1).get(id) >= 2) {
+        // The agent is gone and left no report: the next candidate takes the task over.
+        quiet.delete(id);
+        const said = lastWords(task.terminal), reason = `its agent ended without a report${said ? ` (${said})` : ''}`, from = pickLabel(task.launch ?? { harness: task.agent });
+        const moved = relaunch(h, loadTask(h, id), reason);
+        if (moved.pick) console.log(`== ${id}: ${from} is gone: ${reason}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
+        else { blocked.set(id, `${from} is gone: ${reason}, and ${moved.why}`); settled.set(id, 'needs a person'); }
       } else if (handover && t.status?.state && t.status.state !== 'working' && stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12)) {
         // The worker cannot go on for want of quota or a login: the next candidate of its
         // chain takes the task over in the same working copy, and the wait goes on.
@@ -1331,7 +1369,7 @@ function cmdReview(args) {
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy), project, task: text, extra: { reviews: id } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id } });
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
 
@@ -1506,7 +1544,7 @@ function cmdFix(args) {
     '5. Commit on this branch. Do not push: the coordinator publishes it with `crew selfmerge`.',
     '6. In the report give the cause, the change and the new check, each in a line or two.',
   ].join('\n');
-  launchWorker(h, { id, opts, chosen: chooseWorker(h, 'fix', flags, legacy), project: { path: TOOL_ROOT }, task, extra: { selfFix: true, projectPath: TOOL_ROOT, base: toolRevision() } });
+  launchWorker(h, { id, opts, chosen: chooseWorker(h, 'fix', flags, legacy, SELF_PROJECT), project: { path: TOOL_ROOT }, task, extra: { selfFix: true, projectPath: TOOL_ROOT, base: toolRevision() } });
   console.log(`next: crew wait ${id}, then crew selfmerge ${id}`);
 }
 
@@ -1592,7 +1630,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
       who: ${PICK_USAGE}
-  crew agents [--role scout|ship|review|fix] [who] [--json]   who would do the work now: profiles, quota, fallback order
+  crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   who would do the work now: profiles, quota, fallback order
   crew relaunch <id> [who] ["<why>"]       hand unfinished work to another agent in the same working copy
   crew wait <id>... [--timeout seconds] [--no-fallback]   block until each worker reports; one that ran out of quota is replaced
   crew status [--all] [--json]             tasks and their terminals

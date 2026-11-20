@@ -780,7 +780,7 @@ console.log(JSON.stringify({ schemaVersion: 5, providers: who ? [row('claude', q
 if (a[0] === '--version') process.exit(0);`);
     const setQuota = q => fs.writeFileSync(quotaFile, JSON.stringify(q));
     const E = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: path.join(switcher, 'claude-as.sh'), CREW_TOOL_QUOTA_AXI: fakeQuota, CREW_HOME: home2 };
-    const crew2 = (args, terminal = 'k1') => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E } }); return { code: r.status, out: r.stdout + r.stderr }; };
+    const crew2 = (args, terminal = 'k1', more = {}) => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E, ...more } }); return { code: r.status, out: r.stdout + r.stderr }; };
     const task2 = id => JSON.parse(fs.readFileSync(path.join(home2, 'tasks', id, 'task.json'), 'utf8'));
     const lastRun = () => readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
     assert.equal(crew2(['init', home2]).code, 0); assert.equal(crew2(['project', 'add', 'demo', project]).code, 0); assert.equal(crew2(['start']).code, 0);
@@ -893,6 +893,32 @@ if (a[0] === '--version') process.exit(0);`);
     assert.throws(() => cleanProfile({ harness: 'claude', floor: 140 }), /Not a usable floor/);
     fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
     fs.rmSync(quotaLog); q = crew2(['spawn', 'pool', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out); assert.equal(task2('pool').launch.model, 'openai-codex/gpt-x'); assert.ok(!fs.existsSync(quotaLog));
+
+    // A worker whose agent is gone (crashed at start, or left) with no report: the next candidate takes over.
+    const deadTerminal = task2('pool').terminal;
+    setTerminal(deadTerminal, { status: null, screen: 'A1 stopped after an unexpected error. Diagnostic: C:/x/fatal-1.json\ncrew on HEAD\n> ' });
+    q = crew2(['wait', 'pool', '--timeout', '8']); assert.equal(q.code, 124, q.out); assert.equal(task2('pool').terminal, deadTerminal, 'A worker that only just started is given time');
+    q = crew2(['wait', 'pool', '--timeout', '7'], 'k1', { CREW_DEAD_SECONDS: '0' }); assert.equal(q.code, 124); assert.equal(task2('pool').terminal, deadTerminal, 'One look is not enough');
+    q = crew2(['wait', 'pool', '--timeout', '13', '--no-fallback'], 'k1', { CREW_DEAD_SECONDS: '0' }); assert.equal(task2('pool').terminal, deadTerminal);
+    q = crew2(['wait', 'pool', '--timeout', '13'], 'k1', { CREW_DEAD_SECONDS: '0' }); assert.equal(q.code, 124, q.out);
+    assert.match(q.out, /== pool: a1 openai-codex\/gpt-x is gone: its agent ended without a report \(A1 stopped after an unexpected error\. Diagnostic: C:\/x\/fatal-1\.json\); claude as one@example\.com continues it in terminal/);
+    assert.equal(task2('pool').agent, 'claude'); assert.ok(lastRun().includes('had to stop: its agent ended without a report'), lastRun());
+    q = crew2(['wait', 'pool', '--timeout', '8'], 'k1', { CREW_DEAD_SECONDS: '0' }); assert.equal(q.code, 124, q.out); assert.equal(task2('pool').fallbacks.length, 1, 'The worker that took over gets its own time to start');
+    setTerminal(task2('pool').terminal, { status: null, screen: '' });
+    q = crew2(['wait', 'pool', '--timeout', '13'], 'k1', { CREW_DEAD_SECONDS: '0' }); assert.equal(q.code, 7, q.out);
+    assert.match(q.out, /== pool: needs a person - claude as one@example\.com is gone: its agent ended without a report, and there is no other candidate in its chain/);
+
+    // A project with a list of its own: for one where an agent of the general list cannot work.
+    fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }], roles: { review: [{ harness: 'a1' }] },
+      projects: { demo: [{ harness: 'claude', model: 'opus', account: 'two@example.com' }], other: { default: [{ harness: 'pi' }], roles: { ship: [{ harness: 'claude', account: 'one@example.com' }] } } } }));
+    assert.equal(JSON.parse(crew2(['agents', '--json']).out).candidates[0].label, 'a1 openai-codex/gpt-x');
+    let listed = JSON.parse(crew2(['agents', '--json', '--project', 'demo', '--role', 'review']).out); assert.deepEqual([listed.source, listed.candidates[0].label], ['projects.demo', 'claude opus as two@example.com'], 'A project list comes before the general role list');
+    listed = JSON.parse(crew2(['agents', '--json', '--project', 'other', '--role', 'ship']).out); assert.deepEqual([listed.source, listed.candidates[0].label], ['projects.other.roles.ship', 'claude as one@example.com']);
+    q = crew2(['spawn', 'proj', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out); assert.deepEqual([task2('proj').launch.account, task2('proj').launch.source], ['two@example.com', 'projects.demo']);
+    q = crew2(['spawn', 'proj2', '--project', 'demo', '--agent', 'a1', 'Count.']); assert.equal(q.code, 0, q.out); assert.deepEqual([task2('proj2').agent, task2('proj2').chain.map(c => c.account)], ['a1', ['two@example.com']], 'A named choice goes first and the project list stands behind it');
+    fs.writeFileSync(dispatch, JSON.stringify({ projects: { demo: { roles: { build: [{ harness: 'a1' }] } } } }));
+    q = crew2(['agents']); assert.equal(q.code, 2); assert.match(q.out, /projects\.demo\.roles\.build is not a role/);
+    fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
   }
 
   console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
