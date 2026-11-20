@@ -19,7 +19,7 @@ Where the work stands, why it went this way and what is left: [`docs/plan.md`](d
 ~/.crew/core/           this repository, when installed from the Herdr plugin
 ~/.crew/coordinator/    the coordinator's rules (AGENTS.md, CLAUDE.md); the folder it starts in
 ~/.crew/tasks/<id>/     task record, brief and report
-~/.crew/.worktrees/<id> workers' copies
+~/.crew/.worktrees/<id> workers' copies, on a machine without the shared delivery workflow
 ~/.crew/state/          update and crash records
 ```
 
@@ -58,7 +58,7 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
 - **Owner.** `crew start` records the calling Core terminal as the home's owner. Another
   session is refused and may only read while Core says that terminal is live; when it is
   gone, the next `start` takes over and is told which tasks were left unfinished.
-- **Spawn.** `git worktree add` (detached for `scout`, a new branch `<type>/<id>` for `ship`, where `--type` is `feature` (default), `fix`, `refactor`, `docs`, `test`, `chore` or `style`, as the shared delivery workflow names branches),
+- **Spawn.** Where the shared delivery workflow is installed, `delivery start` makes the copy and decides between a reused pool slot and a new folder (`<project>/.worktrees/<id>`); crew does not know which. Otherwise `git worktree add` (detached for `scout`, a new branch `<type>/<id>` for `ship`, where `--type` is `feature` (default), `fix`, `refactor`, `docs`, `test`, `chore` or `style`, as the shared delivery workflow names branches),
   a brief file, then one `hc run` with labels `crew.task`, `crew.home` and the Herdr
   space/tab labels. The agent starts with one instruction as its command-line argument
   ("read the brief…"), so nothing is typed into it.
@@ -106,7 +106,8 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
 | `lavish-axi`, `quota-axi` | The coordinator's rules say when to use them: showing a decision or long report as a page; checking which agent has room before a batch. |
 | `tasks-axi` | `crew backlog <tasks-axi command…>` keeps the durable list of work in `<home>/backlog.md`. A task with the same id as a backlog item moves it: In flight at spawn, Done at `land` (ship, with the pull request) or `finish` (scout). Reading is open to any session; changes are the owner's. |
-| `treehouse` | `crew project add <name> <folder> --treehouse`: that project's workers get a leased copy from the treehouse pool (`treehouse get --lease`), and `crew finish` gives it back (`treehouse return`, with `--force` for a scout's leftovers or when `crew finish --force` was given). The copy is cut from the branch treehouse infers, not from the folder's current commit. |
+| `delivery` | The shared delivery workflow's command. `crew spawn` asks it for the task's copy (`delivery start <type>/<id> --json`, or `--detach <id>` for a scout) and `crew finish` hands the copy back (`delivery finish <copy> --force`, after crew's own refusal of unsaved ship work and of a keep marker). The copy is cut from the project's published default branch. Whether copies are pooled is one setting of the machine, `delivery pool`. |
+| `treehouse` | The pool `delivery` takes reused copies from. Crew does not call it for new tasks; the `--treehouse` option of `crew project add` is accepted and ignored. |
 | `no-mistakes` | A project that has the gate (a `no-mistakes` remote) is delivered through it: the ship worker's brief tells it to run `no-mistakes axi run --yes --intent-file <task>` and follow it to a pull request. `crew land` then pushes nothing and only records that pull request (from the report, or from `gh pr view`). The gate's CI watch is left out by default (`--skip ci`): delivery ends at the open pull request. `crew project add <name> <folder> --gate-skip ci,lint` leaves out more steps (rebase, review, test, document, lint, ci) where they cannot run on the machine; `--gate-skip none` keeps the watch. |
 
 `CREW_TOOL_<NAME>` (for example `CREW_TOOL_TASKS_AXI`) names a tool's program explicitly;

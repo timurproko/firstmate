@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.7.0';
+export const VERSION = '0.8.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -292,8 +292,8 @@ is required. For any of them, read its \`--help\` before the first use instead o
   may be at another machine, and \`crew show\` also puts a Lavish link in the status bar of
   your terminal, and Herdr opens the page in their browser where they are. Say that it is open. Wait for
   their answer with \`lavish-axi poll <page.html>\`. A yes-or-no question stays in chat.
-- **treehouse**: a project added with \`crew project add <name> <folder> --treehouse\` gives
-  its workers prepared copies from the treehouse pool. Nothing else changes for you.
+- **delivery**: where the shared delivery workflow is installed, it makes each worker's copy
+  and decides between a reused pool slot and a new folder. Nothing changes for you.
 - **no-mistakes**: a project that has its gate is delivered through it. The worker runs the
   gate, which reviews, tests, pushes and opens the pull request; skip \`crew review\` for such
   a task, and \`crew land <id>\` then only records the pull request the gate opened. The gate
@@ -338,7 +338,7 @@ function cmdProject(args) {
   const h = home();
   const [verb, name, source] = args;
   if (verb === 'list' || !verb) {
-    for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}${p.worktrees ? `\t${p.worktrees}` : ''}`);
+    for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}`);
     return;
   }
   // The project list decides which repository a task works in and is cleaned up against, so
@@ -358,13 +358,13 @@ function cmdProject(args) {
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--treehouse] [--gate-skip <steps>|none] | crew project remove <name> | crew project list');
-  const pooled = args.includes('--treehouse');
+  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--gate-skip <steps>|none] | crew project remove <name> | crew project list');
+  // Compatibility: pooled copies were a choice per project until 0.8. They are now the machine's one setting.
+  if (args.includes('--treehouse')) console.error('crew: --treehouse is no longer a project choice and was ignored. Pooled copies are one setting of the machine: `delivery pool`.');
   // Which steps of the no-mistakes gate are left out for this project (see gateSkipOf).
   const skipAt = args.indexOf('--gate-skip'), skipText = skipAt < 0 ? null : String(args[skipAt + 1] ?? '');
   const gateSkip = skipText === null ? null : skipText === 'none' ? [] : skipText.split(',').map(s => s.trim()).filter(Boolean);
   if (gateSkip && (!skipText || gateSkip.some(s => !GATE_STEPS.includes(s)))) refuse(`--gate-skip takes ${GATE_STEPS.join(', ')} (comma-separated), or none. Push and pull request cannot be skipped: they are the delivery.`);
-  if (pooled && !toolPath('treehouse')) refuse('treehouse is not installed on this machine (Herdr: Settings > Plugins > Crew).', 4);
   const folder = path.resolve(source);
   const top = run('git', ['-C', folder, 'rev-parse', '--show-toplevel']);
   if (top.code !== 0) refuse(`${folder} is not a git repository.`);
@@ -376,9 +376,9 @@ function cmdProject(args) {
     const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
     if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
   }
-  h.config.projects[name] = { path: slash(folder), ...(pooled ? { worktrees: 'treehouse' } : {}), ...(gateSkip ? { gateSkip } : {}) };
+  h.config.projects[name] = { path: slash(folder), ...(gateSkip ? { gateSkip } : {}) };
   writeJson(path.join(h.dir, 'crew.json'), h.config);
-  console.log(`project ${name}: ${slash(folder)}${pooled ? ' (working copies from treehouse)' : ''}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}`);
+  console.log(`project ${name}: ${slash(folder)}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}`);
 }
 
 // The gate's steps a project may leave out. Unless a project says otherwise, the gate's CI
@@ -466,7 +466,8 @@ export const TOOLS = [
   { id: 'lavish-axi', crew: '`crew show` opens a decision or a long report as a page, with a link in the Herdr status bar' },
   { id: 'tasks-axi', crew: '`crew backlog` keeps the queue with it; spawn, land and finish move the item' },
   { id: 'quota-axi', crew: 'the coordinator checks which agent has room before a batch' },
-  { id: 'treehouse', crew: 'worker copies of a project added with --treehouse come from its pool' },
+  { id: 'delivery', crew: "makes and removes workers' copies (`delivery start`, `delivery finish`); it alone decides between a pool slot and a new folder" },
+  { id: 'treehouse', crew: 'the pool the shared delivery workflow takes reused copies from; crew does not call it for new tasks' },
   { id: 'no-mistakes', crew: 'a project with its gate is delivered through it' },
   { id: 'jq', crew: 'for `crew status --json` in scripts', brief: '`jq` is installed for reading JSON.' },
 ];
@@ -614,27 +615,29 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   const dir = taskDir(h, id), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
   let worktree = slash(path.join(h.worktrees, id));
   const branch = opts.kind === 'ship' ? `${extra.selfFix ? 'fix' : opts.type ?? 'feature'}/${id}` : null;
-  // A project added with --treehouse takes its copies from the treehouse pool (already set
-  // up, dependencies and all) instead of a fresh git worktree.
-  const pool = project.worktrees === 'treehouse' ? 'treehouse' : null;
-  if (pool && !toolPath('treehouse')) refuse(`Project ${opts.project} takes its working copies from treehouse, which is not installed on this machine.`, 5);
+  // Where the shared delivery workflow is installed, it makes the copy: crew asks for a task's
+  // copy and does not know whether that is a reused pool slot or a new folder. Without it,
+  // crew makes a plain git worktree itself.
+  const delivered = Boolean(toolPath('delivery'));
   // A project with the no-mistakes gate (its `no-mistakes` remote) is delivered through it.
   const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;
   const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
-    ...(branch ? { branch } : {}), ...(pool ? { pool } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
+    ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
   saveTask(h, record);
 
   const failed = why => { saveTask(h, { ...record, state: 'failed', error: why.slice(0, 400) }); refuse(`Could not create the working copy: ${why}`, 5); };
-  if (pool) {
-    const got = runTool('treehouse', ['get', '--lease', '--json', ...(branch ? ['-b', branch] : [])], { cwd: project.path, timeout: 600000 });
-    let leased = null;
-    try { leased = JSON.parse(got.stdout).path; } catch { /* reported below */ }
-    if (got.code !== 0 || !leased) failed(`treehouse gave no working copy (${lastLine(got.stderr || got.stdout)})`);
-    worktree = slash(leased);
-    record = { ...record, worktree };
+  if (delivered) {
+    const got = runTool('delivery', ['start', ...(branch ? [branch] : ['--detach', id]), '--json'], { cwd: project.path, timeout: 600000 });
+    let started = null;
+    try { started = JSON.parse(lastLine(got.stdout)); } catch { /* reported below */ }
+    if (got.code !== 0 || typeof started?.path !== 'string') failed(`delivery gave no working copy (${lastLine(got.stderr || got.stdout)})`);
+    // Invariant: a task gets a copy made for it. One that was already there belongs to other work and is left alone.
+    if (started.created !== true) failed(`${branch ?? id} already has a working copy at ${slash(started.path)}; it was left alone`);
+    worktree = slash(started.path);
+    record = { ...record, worktree, ...(started.pooled ? { pooled: true } : {}) };
     saveTask(h, record);
   } else {
     const wt = branch
@@ -663,7 +666,7 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
     '--', bashProgram(), '--login', '-i', '-c', line]);
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
-    if (pool) runTool('treehouse', ['return', worktree], { cwd: project.path, timeout: 120000 });
+    if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
     else run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
     saveTask(h, { ...record, state: 'failed', error: JSON.stringify(started.value).slice(0, 400) });
     refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
@@ -673,7 +676,7 @@ function launchWorker(h, { id, opts, agent, project, task, extra = {} }) {
   // writing the record this command started with over an accepted report.
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
-  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${pool ? ' (treehouse)' : ''}${gated ? '; delivered through no-mistakes' : ''}`);
+  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}`);
   backlogMove(h, id, 'start');
 }
 
@@ -844,6 +847,26 @@ function cmdFinish(args) {
   // of the folder, so it is retried. The folder is deleted directly only when git no longer
   // knows it as a working copy (an earlier, half-finished removal) or with --force.
   let removal = { code: 0, stderr: '' };
+  if (task.via === 'delivery') {
+    // The shared delivery workflow made the copy, so it takes it back: a pool slot is returned,
+    // a plain folder removed. Crew has already refused unsaved ship work and a keep marker,
+    // so what is left in the copy is scratch and `--force` is crew's word to discard it.
+    // A first try can fail while the closed terminal's processes let go of the folder.
+    let back = { code: 0, stdout: '', stderr: '' };
+    for (let i = 0; fs.existsSync(path.join(task.worktree, '.git')) && i < 6; i++) {
+      back = runTool('delivery', ['finish', task.worktree, '--force'], { cwd: project?.path, timeout: 180000 });
+      if (!back) refuse(`Task ${id}'s working copy was made by the shared delivery workflow, which is not installed here now; nothing was removed: ${task.worktree}`, 6);
+      if (back.code === 0) break;
+      sleep(1000);
+    }
+    if (back.code !== 0) refuse(`delivery did not take the working copy back (${lastLine(back.stdout || back.stderr)}); it was kept: ${task.worktree}`, 6);
+    if (AGENTS[task.agent]?.trust === 'claude') forgetClaudeFolder(task.worktree);
+    saveTask(h, { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state });
+    console.log(`finished ${id} (${result.how}); working copy ${task.pooled ? 'returned to the pool' : 'removed'}; report kept at ${task.report}${dropMergedBranch(project, task)}`);
+    if (task.kind === 'scout' && task.state === 'reported' && !task.reviews) backlogMove(h, id, 'done');
+    return;
+  }
+  // Compatibility: a task from before 0.8 whose project took its copies from treehouse directly.
   if (task.pool === 'treehouse') {
     // The copy is a pool slot: it goes back to treehouse, which cleans it and keeps it.
     // treehouse refuses a slot with loose files unless told to clean it. A scout's leftovers
@@ -1185,7 +1208,7 @@ const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmd
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
-  crew project add <name> <git folder> [--treehouse] [--gate-skip <steps>|none]   register a project   (crew project list)
+  crew project add <name> <git folder> [--gate-skip <steps>|none]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [--agent ${Object.keys(AGENTS).join('|')}] "<task>"

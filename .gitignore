@@ -14,3 +14,7 @@ config/
 .claude/settings.local.json
 
 .tools/
+
+# Task checkouts and their scratch files (shared delivery workflow)
+.worktrees/
+.artifacts/

@@ -50,7 +50,7 @@ dependency-free Node file in the same fork, with Firstmate's code close by as re
 | `~/.crew/core` | the installed copy of this fork on each machine (`~/.crew/tool` before 0.7); updates itself at `crew start` |
 | `~/.crew` | the home: projects (`crew.json`), `tasks/`, backlog, pages |
 | `~/.crew/coordinator` | the coordinator's rules and the folder it starts in. Herdr names the space after the folder, so the space is called "coordinator" |
-| `~/.crew/.worktrees` | workers' working copies (never under `coordinator/`, so a worker never loads the coordinator's rules) |
+| `~/.crew/.worktrees` | workers' working copies on a machine without the shared delivery workflow (never under `coordinator/`, so a worker never loads the coordinator's rules). With it, `delivery start` makes the copy: a treehouse pool slot or `<project>/.worktrees/<id>` |
 | `~/.crew/state` | update and crash records |
 | `D:\Git\crew` | development clone of this fork on both machines. On pc2 it is also the Firstmate install and holds Firstmate's untracked `config/`, `data/`, `projects/`, `state/` |
 
@@ -129,12 +129,8 @@ Crew, in order:
 4. Pi as coordinator on pc2.
 5. A self-repair that passes the suite but is wrong still reaches every machine;
    `rollback` is per machine.
-6. Postponed, to discuss: pooled working copies for the shared delivery workflow too. The
-   idea is that an agent uses treehouse instead of a plain `git worktree` whenever treehouse
-   is installed on the machine, so installing it is the opt-in and plain worktrees keep
-   working unchanged. Known from a trial: a returned slot keeps ignored files, so
-   `.artifacts/` of the previous task must be cleared; slots are numbered folders, not
-   named after the task.
+6. Confirm in real use: a coordinator spawning and finishing workers whose copies come from
+   `delivery start`, pooled and plain, including a self-repair of crew.
 
 Environment:
 
@@ -173,3 +169,4 @@ Firstmate, only if it is taken further:
 | 2026-11-17 | Two end-to-end runs on pc2; `crew show`; gate options (#17–#24, 0.5.x) |
 | 2026-11-17 | Home renamed to `~/.crew/crew`; pages open on the person's PC (#25, 0.6.0) |
 | 2026-11-20 | `crew finish` deletes a merged branch (#27). Aligned with the shared delivery workflow (#28, 0.7.0): flat `~/.crew` layout with `coordinator/`, branches named `<type>/<id>`, `.artifacts/KEEP` honoured, pooled copies returned with `--force` when their files are scratch |
+| 2026-11-20 | Workers' copies come from the shared delivery workflow (`delivery start` / `delivery finish`, 0.8.0); pooled copies are one machine setting, `delivery pool`, and the per-project `--treehouse` choice is gone |
