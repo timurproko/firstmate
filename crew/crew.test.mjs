@@ -20,6 +20,21 @@ assert.deepEqual(Object.keys(AGENTS), ['a1', 'pi', 'claude']);
 const brief = briefText({ id: 't1', kind: 'scout', task: 'Count lines.', worktree: 'W', project: 'p', report: 'R' });
 assert.match(brief, /read-only investigation/); assert.match(brief, /crew done t1/); assert.match(brief, /`R`/);
 assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit them/);
+// A plain and a gated ship brief stay exactly what they were before the shared delivery workflow
+// was known; a scout's brief does not change for a workflow project; the gate wins over it.
+{
+  const ship = { id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' };
+  const ends = '- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
+  const start = '# Task t1 (ship)\n\nx\n\n## Rules\n- Work only inside `W`. It is your own copy of the project `p`; nobody else uses it.\n';
+  assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.\n${ends}`);
+  const gated = `${start}- Make your changes on the branch already checked out here and commit them.\n- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file I --skip ci\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.\n- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.\n- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.\n${ends}`;
+  assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'] }), gated);
+  assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'], workflow: true, branch: 'fix/t1' }), gated);
+  assert.equal(briefText({ ...ship, kind: 'scout', workflow: true }), briefText({ ...ship, kind: 'scout' }));
+  const flow = briefText({ ...ship, workflow: true, branch: 'fix/t1' });
+  for (const line of ['load the `change-delivery` skill', 'Run `delivery update`', '`delivery start fix/t1` returns this same folder', 'then STOP', '`Plan: <pull request link>`', '`Implementation: <pull request link>`', 'Never mark the pull request ready and never merge it.', 'crew done t1']) assert.ok(flow.includes(line), line);
+  assert.ok(!flow.includes('Do not push or open a pull request'), flow);
+}
 
 // Claude account choice: only for Claude, only through the launcher, never an unchecked value.
 {
@@ -181,6 +196,12 @@ try {
   fs.rmSync(path.join(fakeUser, '.crew'), { recursive: true, force: true });
   assert.equal(crew(['init', homeDir]).code, 0);
   assert.ok(fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8').includes('crew spawn'));
+  {
+    // A workflow task's draft pull request is open from its plan on: the rules finish a task
+    // only after land recorded it, never merely because a pull request is open.
+    const rules = fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8');
+    assert.ok(rules.includes('task only once `crew land` has recorded the pull request') && !rules.includes('once the pull request is open'), rules);
+  }
   assert.equal(fs.readFileSync(path.join(homeDir, 'coordinator', 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
   assert.equal(crew(['init', homeDir]).code, 2, 'A home is never re-initialised');
   assert.equal(crew(['project', 'add', 'demo', project]).code, 0);
@@ -472,6 +493,7 @@ log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--b
 if (a[0] === 'auth') process.exit(1);
 if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
 if (a[0] === 'pr' && a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(ghMerged)}) ? fs.readFileSync(${JSON.stringify(ghMerged)}, 'utf8') : ''); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view' && a.includes('isDraft,body')) { console.log(JSON.stringify({ isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' })); process.exit(0); }
 console.log('https://example.invalid/acme/demo/pull/7');
 `);
   const own = (args, terminal = 'c2') => crew(args, { terminal, env: { CREW_GH: fakeGh } });
@@ -607,6 +629,7 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a.at(-1), 'checkout', '-q', 
 
   // delivery: where the shared delivery workflow is installed it makes and takes back the copies,
   // and crew does not know whether one is a pool slot or a new folder.
+  const TEMPLATE = '# Agent instructions\n\nThis file is `templates/AGENTS.md` of `owner/workflows`, identical in every repository that uses it.\n';
   const fakeDelivery = path.join(root, 'fake-delivery.mjs'), deliveryLog = path.join(root, 'delivery-log.json'), stuck = path.join(root, 'pool-stuck');
   fs.writeFileSync(deliveryLog, '[]');
   fs.writeFileSync(fakeDelivery, `import fs from 'node:fs'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
@@ -626,6 +649,11 @@ if (a[0] === 'start') {
   if (fs.existsSync(${JSON.stringify(stuck)})) { console.log('kept ' + a[1] + ': the worktree is locked. Nothing was removed.'); process.exit(1); }
   git('-C', a[1], 'reset', '-q', '--hard'); git('-C', a[1], 'clean', '-qfd'); git('-C', a[1], 'checkout', '-q', '--detach');
   console.log('finished ' + a[1] + ': slot returned to the pool');
+} else if (a[0] === 'instructions') {
+  // Like the real one: a match only for the template exactly, a list of differences otherwise.
+  const text = fs.existsSync('AGENTS.md') ? fs.readFileSync('AGENTS.md', 'utf8') : null;
+  if (text === ${JSON.stringify(TEMPLATE)}) console.log('Agent instructions match the shared template.');
+  else { console.log(text === null ? 'AGENTS.md is missing' : 'AGENTS.md differs from the shared template'); process.exit(1); }
 }
 `);
   const D = { ...T, CREW_TOOL_DELIVERY: fakeDelivery }, dl = args => tl(args, 'c2', D);
@@ -675,6 +703,85 @@ if (a[0] === 'start') {
   fs.writeFileSync(taskOf('p5').report, 'seen'); assert.equal(crew(['done', 'p5'], { terminal: taskOf('p5').terminal }).code, 0);
   r = tl(['finish', 'p5']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to treehouse[\s\S]*backlog: done p5 -> Done/);
 
+  // The shared delivery workflow: a repository that carries its instructions is delivered its
+  // own way. The worker plans in a draft pull request; crew never pushes or opens one for it.
+  assert.equal(p1.workflow, undefined, 'A copy without the shared instructions is a plain one');
+  assert.ok(fs.readFileSync(p1.brief, 'utf8').includes('Do not push or open a pull request unless'));
+  commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
+  r = dl(['spawn', 'w1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Add a feature.']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /follows the repository's delivery workflow/);
+  const w1 = taskOf('w1'), w1brief = fs.readFileSync(w1.brief, 'utf8');
+  assert.equal(w1.workflow, 'delivery');
+  assert.deepEqual(calls().filter(e => e.a[0] === 'instructions').map(e => slash(e.cwd).toLowerCase()).at(-1), slash(w1.worktree).toLowerCase(), 'Decided in the copy the worker gets');
+  assert.ok(w1brief.includes('`change-delivery` skill') && w1brief.includes('`delivery start feature/w1`') && w1brief.includes('`Plan: <pull request link>`') && !w1brief.includes('Do not push or open a pull request'), w1brief);
+  const ghCalls = () => JSON.parse(fs.readFileSync(ghLog, 'utf8')).map(e => e.a);
+  // Its first report is a plan: status says so, and land refuses it until the plan is approved.
+  fs.writeFileSync(w1.report, 'Plan: https://github.com/acme/demo/pull/11\n\nTwo outcomes.\n');
+  assert.equal(crew(['done', 'w1'], { terminal: w1.terminal }).code, 0);
+  assert.deepEqual([taskOf('w1').stage, taskOf('w1').pr], ['plan', 'https://github.com/acme/demo/pull/11']);
+  assert.match(dl(['status']).out, /^w1\treported \(plan awaiting approval\)\t[^\r\n]*\thttps:\/\/github\.com\/acme\/demo\/pull\/11\r?$/m);
+  assert.equal(JSON.parse(dl(['status', '--json']).out).tasks.find(t => t.id === 'w1').stage, 'plan');
+  r = dl(['land', 'w1']); assert.equal(r.code, 6); assert.match(r.out, /plan awaiting approval[\s\S]*crew tell w1 "approved, implement"/);
+  assert.equal(taskOf('w1').landed, undefined);
+  r = dl(['tell', 'w1', 'approved, implement']); assert.equal(r.code, 0, r.out);
+  assert.match(dl(['status']).out, /^w1\tworking \(plan\)\t/m);
+  // The implementation report: land records the pull request and reads its state, and nothing else.
+  commit(w1.worktree, { 'feature.txt': 'x\n' }, 'feat: add a feature');
+  fs.writeFileSync(w1.report, 'Implementation: https://github.com/acme/demo/pull/11\n\nDone.\n');
+  assert.equal(crew(['done', 'w1'], { terminal: w1.terminal }).code, 0);
+  assert.match(dl(['status']).out, /^w1\treported \(implementation\)\t/m);
+  // Delivered means pushed: a branch the worker never pushed, or a commit it did not push, is refused.
+  const workerPush = (copy, branch) => git('-C', copy, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`);
+  r = dl(['land', 'w1']); assert.equal(r.code, 6); assert.match(r.out, /branch feature\/w1 is not pushed\. Tell the worker: crew tell w1 "push your branch/);
+  workerPush(w1.worktree, 'feature/w1'); const pushedW1 = head(w1.worktree);
+  commit(w1.worktree, { 'late.txt': 'x\n' }, 'fix: a late fix');
+  r = dl(['land', 'w1']); assert.equal(r.code, 6); assert.match(r.out, /its copy has 1 commit that the pushed branch feature\/w1 lacks\. Tell the worker: crew tell w1 "push your last commits/);
+  assert.equal(taskOf('w1').landed, undefined);
+  assert.equal(git('-C', projectOrigin, 'rev-parse', 'feature/w1').trim(), pushedW1, 'crew pushed nothing itself');
+  workerPush(w1.worktree, 'feature/w1');
+  const ghBefore = ghCalls().length;
+  r = dl(['land', 'w1']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /delivered w1: https:\/\/github\.com\/acme\/demo\/pull\/11 \(draft, 1 of 2 outcomes ticked\)\. It follows the repository's delivery workflow/);
+  assert.deepEqual(ghCalls().slice(ghBefore), [['pr', 'view', 'https://github.com/acme/demo/pull/11', '--json', 'isDraft,body']], 'Only read, never opened');
+  assert.ok(taskOf('w1').landed);
+  assert.match(dl(['land', 'w1']).out, /already has a pull request: https:\/\/github\.com\/acme\/demo\/pull\/11/);
+  // No link on the first line: the pull request GitHub has for the branch, never another one
+  // the report mentions further down.
+  assert.equal(dl(['spawn', 'w2', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  workerPush(taskOf('w2').worktree, 'feature/w2');
+  fs.writeFileSync(taskOf('w2').report, 'Implemented it.\n\nConflicts with https://github.com/acme/demo/pull/5\n'); assert.equal(crew(['done', 'w2'], { terminal: taskOf('w2').terminal }).code, 0);
+  r = dl(['land', 'w2']); assert.equal(r.code, 0, r.out); assert.match(r.out, /delivered w2: https:\/\/example\.invalid\/acme\/demo\/pull\/7/);
+  assert.ok(ghCalls().some(a => a.join(' ') === 'pr view feature/w2 --json url --jq .url'));
+  assert.ok(!ghCalls().some(a => a[1] === 'create' && a.includes('feature/w2')));
+  assert.equal(taskOf('w2').pr, 'https://example.invalid/acme/demo/pull/7');
+  // No pull request anywhere: land says what to tell the worker and records nothing.
+  assert.equal(dl(['spawn', 'w3', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  workerPush(taskOf('w3').worktree, 'feature/w3');
+  fs.writeFileSync(taskOf('w3').report, 'Implementation: not opened yet\n'); assert.equal(crew(['done', 'w3'], { terminal: taskOf('w3').terminal }).code, 0);
+  fs.writeFileSync(ghDown, '');
+  r = dl(['land', 'w3']); assert.equal(r.code, 6); assert.match(r.out, /has not opened its pull request yet\. Tell it: crew tell w3 "open the draft pull request/);
+  assert.deepEqual([taskOf('w3').pr, taskOf('w3').landed], [undefined, undefined]);
+  fs.rmSync(ghDown);
+  // A repository on an older template still counts: the template's header line is enough.
+  commit(project, { 'AGENTS.md': `${TEMPLATE}\nAn older line.\n` }, 'Older template');
+  assert.equal(dl(['spawn', 'w4', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.equal(taskOf('w4').workflow, 'delivery');
+  // The project's own choice wins over detection, either way, and is shown in the list.
+  assert.equal(dl(['project', 'add', 'pooled', project, '--workflow', 'maybe']).code, 2);
+  r = dl(['project', 'add', 'pooled', project, '--workflow', 'plain']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(workflow: plain\)/);
+  assert.match(dl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\tworkflow plain\r?$/m);
+  assert.equal(dl(['spawn', 'w5', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.equal(taskOf('w5').workflow, undefined); assert.ok(fs.readFileSync(taskOf('w5').brief, 'utf8').includes('Do not push or open a pull request unless'));
+  git('-C', project, 'rm', '-q', 'AGENTS.md'); git('-C', project, ...who, 'commit', '-q', '-m', 'Back to plain');
+  dl(['project', 'add', 'pooled', project, '--workflow', 'delivery']);
+  assert.equal(dl(['spawn', 'w6', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.equal(taskOf('w6').workflow, 'delivery', 'Delivered by pull request without the shared instructions');
+  // Like --gate-skip, the choice is part of the registration: adding again without it drops it.
+  dl(['project', 'add', 'pooled', project]); assert.match(dl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\r?$/m);
+  assert.equal(dl(['spawn', 'w7', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.equal(taskOf('w7').workflow, undefined);
+  for (const id of ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7']) assert.equal(dl(['finish', id, '--force']).code, 0, id);
+
   // no-mistakes: a project with the gate is delivered by it; crew only records the result.
   git('-C', project, 'remote', 'add', 'no-mistakes', projectOrigin);
   r = crew(['spawn', 'g0', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x'], { terminal: 'c2' }); assert.equal(r.code, 0);
@@ -709,6 +816,13 @@ if (a[0] === 'start') {
   const g4brief = fs.readFileSync(taskOf('g4').brief, 'utf8');
   assert.ok(!g4brief.includes('--skip') && g4brief.includes('no-mistakes axi handoff') && g4brief.includes('ten minutes'), 'A watched gate is told how its watch ends');
   assert.equal(tl(['finish', 'g4', '--force']).code, 0);
+  // The gate wins over the shared delivery workflow: a gated project keeps the gate's flow.
+  r = tl(['project', 'add', 'demo', project, '--gate-skip', 'none', '--workflow', 'delivery']); assert.equal(r.code, 0, r.out);
+  assert.equal(tl(['spawn', 'g5', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
+  assert.deepEqual([taskOf('g5').gate, taskOf('g5').workflow], ['no-mistakes', undefined]);
+  assert.ok(fs.readFileSync(taskOf('g5').brief, 'utf8').includes('no-mistakes axi run') && !fs.readFileSync(taskOf('g5').brief, 'utf8').includes('change-delivery'));
+  assert.equal(tl(['finish', 'g5', '--force']).code, 0);
+  tl(['project', 'add', 'demo', project, '--gate-skip', 'none']);
 
   // show: the page is opened by lavish-axi, and its address goes on the terminal as the labels
   // Herdr's status bar reads, so the person can open it from wherever they sit.
@@ -1074,7 +1188,7 @@ if (a[0] === '--version') process.exit(0);`);
     fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
   }
 
-  console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery, a repository\'s own delivery workflow), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

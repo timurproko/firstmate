@@ -31,7 +31,7 @@ coordinator.
 
 ```
 crew init [folder]                       create a crew home (default ~/.crew)
-crew project add <name> <git folder>     register a project   (crew project list)
+crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
 crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session
 crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
@@ -47,7 +47,7 @@ crew tools [--json]                      Firstmate's tools on this machine and w
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
 crew review <id> [who]                   start a reviewer on a ship task's branch
-crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
+crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
 crew fix [who] "<problem>"               start a worker that repairs crew itself
 crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
 crew update | crew rollback              bring this machine's crew up to date, or back one step
@@ -150,7 +150,28 @@ Claude profile.
 
 ## Delivering a code change
 
-A ship task ends with commits on branch `<type>/<id>`. From there:
+How a ship task is delivered depends on the project. There are three kinds, and the kind is
+decided once, at spawn, and recorded on the task so the worker's brief, `crew land` and
+`crew status` agree:
+
+- **Shared delivery workflow.** The repository follows the `change-delivery` skill. A project
+  counts as one when it was added with `--workflow delivery`, or, without that choice, when
+  `delivery` is installed and the worker's copy carries the shared instructions (`delivery
+  instructions` reports a match, or `AGENTS.md` has the template's header line, which also
+  covers a repository on an older template). `--workflow plain` turns that off. The worker is
+  told to follow the skill. A change that needs a plan is planned first as a draft pull request,
+  then the worker stops and reports. Every report starts with `Plan: <link>` or
+  `Implementation: <link>`, and `crew done` records that stage and link. The coordinator approves
+  the plan itself (`crew tell <id> "approved, implement"`) and asks the person only about a
+  decision that is theirs. `crew status` shows `plan awaiting approval`, `plan` or
+  `implementation` without asking GitHub. `crew land` refuses a plan, and refuses while the copy
+  has commits its pushed branch lacks (the worker pushes them). For an implementation it pushes
+  nothing and opens nothing: it records the pull request (from the report's first line, else
+  `gh pr view <branch>`), moves the backlog item, and prints whether the pull request is a draft
+  and how many outcomes are ticked. The repository's bot marks it ready; the person merges.
+- **no-mistakes gate.** A project with the gate's remote (see below) is delivered by the gate;
+  `crew land` only records the pull request it opened. The gate wins over the workflow.
+- **Plain project.** The task ends with commits on branch `<type>/<id>`. From there:
 
 - `crew review <id>` starts a read-only task `<id>-review` whose brief points at that branch.
   Its report starts with `APPROVE` or `CHANGES NEEDED`. `--agent` (or `CREW_REVIEW_AGENT`)
@@ -162,6 +183,7 @@ A ship task ends with commits on branch `<type>/<id>`. From there:
   `gh`, against the branch the project folder is on (or the default branch), with the report
   as its text. If the machine is signed in to GitHub as the repository's owner among several
   accounts, that account is used. crew never merges a project's pull request.
+- `crew review` and `crew tell` work the same way for a workflow project's implementation.
 
 ## The tools Firstmate works with
 

@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.9.3';
+export const VERSION = '0.10.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -246,7 +246,8 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
 1. \`crew spawn <id> --project <name> --kind scout|ship "<task for the worker>"\`
    - \`scout\`: read-only investigation, ends with a written report.
    - \`ship\`: changes code on a branch of its own, \`<type>/<id>\`. Say what the work is with
-     \`--type feature|fix|refactor|docs|test|chore|style\` (default \`feature\`).
+     \`--type feature|fix|refactor|docs|test|chore|style\` (default \`feature\`). How it is
+     delivered depends on the project: see "Code changes".
    - Independent tasks may be spawned one after another without waiting; they run together.
    - Who does it is crew's choice unless the person said otherwise: see "Who does the work".
 2. \`crew wait <id> [<id>...]\` blocks until each worker reports (or fails). It prints the reports.
@@ -256,16 +257,30 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
    unless they asked you to cancel it.
 
 ## Code changes (ship tasks)
-1. After the worker reported, have the change checked unless it is trivial:
-   \`crew review <id>\` starts a reviewer (\`--agent\`, \`--model\` or \`--account\` picks another one for a second opinion);
-   \`crew wait <id>-review\`. Its report starts with \`APPROVE\` or \`CHANGES NEEDED\`.
-2. On \`CHANGES NEEDED\`: \`crew tell <id> "<the defects, as the reviewer wrote them>"\`, then
-   \`crew wait <id>\` and review again. After two rounds that still fail, tell the person.
-3. \`crew land <id>\` pushes the branch and opens a pull request. Give the person the link.
-   Never merge a project's pull request yourself unless the person told you to.
-4. Finish the reviewer and the task once the pull request is open.
+\`crew spawn\` says how the project delivers. There are three kinds:
+- **Shared delivery workflow** (the repository follows the \`change-delivery\` skill):
+  1. The worker's first report is its plan with a draft pull request. Read the plan (in the
+     worker's copy or the pull request) and decide yourself: \`crew tell <id> "approved, implement"\`,
+     or send it back with what to change. Ask the person only when the plan needs a decision
+     that is theirs (scope, direction, a risk the task did not cover); otherwise tell them the
+     plan and that you approved it, in a line or two.
+  2. After it reports the implementation, have it checked as for a plain project (steps 1-2).
+  3. \`crew land <id>\` records its pull request. Give the person the link.
+- **no-mistakes gate**: see Tools. Skip \`crew review\`; \`crew land\` records the gate's pull request.
+- **Plain project**:
+  1. After the worker reported, have the change checked unless it is trivial:
+     \`crew review <id>\` starts a reviewer (\`--agent\`, \`--model\` or \`--account\` picks another one
+     for a second opinion); \`crew wait <id>-review\`. Its report starts with \`APPROVE\` or \`CHANGES NEEDED\`.
+  2. On \`CHANGES NEEDED\`: \`crew tell <id> "<the defects, as the reviewer wrote them>"\`, then
+     \`crew wait <id>\` and review again. After two rounds that still fail, tell the person.
+  3. \`crew land <id>\` pushes the branch and opens a pull request. Give the person the link.
+- Merging is the person's: never merge a project's pull request unless they told you to.
+  Finish the reviewer and the task only once \`crew land\` has recorded the pull request (a
+  workflow task's draft is open from its plan on; finishing it then loses the worker).
 - \`crew tell <id> "<message>"\` is also how you answer a worker's question or correct its
   course; the worker reports again when it has dealt with it.
+- A repository that delivers by pull request but is not recognised (or the other way round):
+  ask the person, then \`crew project add <name> <folder> --workflow delivery|plain\`.
 
 ## Who does the work
 The person's agents, models and accounts are in \`config/crew-dispatch.json\` of this home, as an
@@ -323,7 +338,8 @@ is required. For any of them, read its \`--help\` before the first use instead o
   your terminal, and Herdr opens the page in their browser where they are. Say that it is open. Wait for
   their answer with \`lavish-axi poll <page.html>\`. A yes-or-no question stays in chat.
 - **delivery**: where the shared delivery workflow is installed, it makes each worker's copy
-  and decides between a reused pool slot and a new folder. Nothing changes for you.
+  and decides between a reused pool slot and a new folder. A repository that uses it is
+  delivered its way (see Code changes).
 - **no-mistakes**: a project that has its gate is delivered through it. The worker runs the
   gate, which reviews, tests, pushes and opens the pull request; skip \`crew review\` for such
   a task, and \`crew land <id>\` then only records the pull request the gate opened. The gate
@@ -368,7 +384,7 @@ function cmdProject(args) {
   const h = home();
   const [verb, name, source] = args;
   if (verb === 'list' || !verb) {
-    for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}`);
+    for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}${p.workflow ? `\tworkflow ${p.workflow}` : ''}`);
     return;
   }
   // The project list decides which repository a task works in and is cleaned up against, so
@@ -391,13 +407,17 @@ function cmdProject(args) {
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--gate-skip <steps>|none] | crew project remove <name> | crew project list');
+  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--gate-skip <steps>|none] [--workflow delivery|plain] | crew project remove <name> | crew project list');
   // Compatibility: pooled copies were a choice per project until 0.8. They are now the machine's one setting.
   if (args.includes('--treehouse')) console.error('crew: --treehouse is no longer a project choice and was ignored. Pooled copies are one setting of the machine: `delivery pool`.');
   // Which steps of the no-mistakes gate are left out for this project (see gateSkipOf).
   const skipAt = args.indexOf('--gate-skip'), skipText = skipAt < 0 ? null : String(args[skipAt + 1] ?? '');
   const gateSkip = skipText === null ? null : skipText === 'none' ? [] : skipText.split(',').map(s => s.trim()).filter(Boolean);
   if (gateSkip && (!skipText || gateSkip.some(s => !GATE_STEPS.includes(s)))) refuse(`--gate-skip takes ${GATE_STEPS.join(', ')} (comma-separated), or none. Push and pull request cannot be skipped: they are the delivery.`);
+  // Whether the project follows the shared delivery workflow, when detection cannot tell (see
+  // followsWorkflow). Like --gate-skip, it is part of the registration: re-adding without it drops it.
+  const flowAt = args.indexOf('--workflow'), workflow = flowAt < 0 ? null : String(args[flowAt + 1] ?? '');
+  if (workflow !== null && !WORKFLOWS.includes(workflow)) refuse(`--workflow takes ${WORKFLOWS.join(' or ')}.`);
   const folder = path.resolve(source);
   const top = run('git', ['-C', folder, 'rev-parse', '--show-toplevel']);
   if (top.code !== 0) refuse(`${folder} is not a git repository.`);
@@ -411,9 +431,23 @@ function cmdProject(args) {
     const waiting = allTasks(h).filter(t => t.project === name && t.state === 'closed' && t.copyToReturn);
     if (waiting.length) refuse(`Project ${name} still has working copies of finished tasks to return: ${waiting.map(t => t.id).join(' ')}. They go back once no terminal holds them (crew status --all).`);
   }
-  h.config.projects[name] = { path: slash(folder), ...(gateSkip ? { gateSkip } : {}) };
+  h.config.projects[name] = { path: slash(folder), ...(gateSkip ? { gateSkip } : {}), ...(workflow ? { workflow } : {}) };
   writeJson(path.join(h.dir, 'crew.json'), h.config);
-  console.log(`project ${name}: ${slash(folder)}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}`);
+  console.log(`project ${name}: ${slash(folder)}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}${workflow ? ` (workflow: ${workflow})` : ''}`);
+}
+
+// A project follows the shared delivery workflow (the `change-delivery` skill) when it was
+// registered with `--workflow delivery`, or, without that choice, when its copy carries the
+// shared instructions. `delivery instructions` is strict (an older template or one stray
+// instruction file fails it), so the template's own header line in AGENTS.md also counts.
+const WORKFLOWS = ['delivery', 'plain'];
+const WORKFLOW_HEADER = '`templates/AGENTS.md` of';
+function followsWorkflow(project, worktree) {
+  if (project.workflow) return project.workflow === 'delivery';
+  if (!toolPath('delivery')) return false;
+  const said = runTool('delivery', ['instructions'], { cwd: worktree, timeout: 60000 });
+  if (said?.code === 0 && /match the shared template/.test(said.stdout)) return true;
+  try { return fs.readFileSync(path.join(worktree, 'AGENTS.md'), 'utf8').includes(WORKFLOW_HEADER); } catch { return false; }
 }
 
 // The gate's steps a project may leave out. Unless a project says otherwise, the gate's CI
@@ -865,18 +899,25 @@ function backlogMove(h, id, verb, more = []) {
   } catch { /* the backlog never stops the work */ }
 }
 
-export function briefText({ id, kind, task, worktree, project, report, tools = [], gate = null, gateSkip = [] }) {
+export function briefText({ id, kind, task, worktree, project, report, tools = [], gate = null, gateSkip = [], workflow = false, branch = null }) {
   const skip = gateSkip.length ? ` --skip ${gateSkip.join(',')}` : '', watched = !gateSkip.includes('ci');
   const hints = TOOLS.filter(t => t.brief && tools.includes(t.id)).map(t => `- ${t.brief}`);
   return [
     `# Task ${id} (${kind})`, '', task.trim(), '',
     '## Rules',
     `- Work only inside \`${worktree}\`. It is your own copy of the project \`${project}\`; nobody else uses it.`,
-    kind === 'scout'
-      ? '- This is a read-only investigation: do not change project files, commit, push or open a pull request.'
+    ...(kind === 'scout'
+      ? ['- This is a read-only investigation: do not change project files, commit, push or open a pull request.']
       : gate
-        ? '- Make your changes on the branch already checked out here and commit them.'
-        : '- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.',
+        ? ['- Make your changes on the branch already checked out here and commit them.']
+        : workflow
+          // The repository delivers by its own pull-request workflow; the coordinator approves the plan.
+          ? [`- This repository uses the shared delivery workflow. Run \`delivery update\`, then load the \`change-delivery\` skill and follow it. Your copy and its branch \`${branch}\` already exist: \`delivery start ${branch}\` returns this same folder.`,
+            `- A change the skill says needs a plan: open the plan as a draft pull request in the skill's body format, then STOP: write \`Plan: <pull request link>\` as the first line of your report, the plan in a few lines below it, and run \`crew done ${id}\`. Implement only after you are told the plan is approved.`,
+            '- A small fix the skill allows without a plan: implement it in a draft pull request with the body in the skill\'s format, ticking each outcome as it lands.',
+            '- Once implemented, the first line of your report is `Implementation: <pull request link>`. Every report starts with one of these two lines.',
+            '- Never mark the pull request ready and never merge it.']
+          : ['- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.']),
     ...(kind === 'ship' && gate ? [
       `- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file ${gate}${skip}\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.`,
       watched
@@ -976,7 +1017,11 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     if (wt.code !== 0) failed(wt.stderr.trim());
   }
   if (intent) fs.writeFileSync(intent, `${task.trim()}\n`);
-  fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project) }));
+  // Decided once, in the copy the worker gets, and kept on the task so land and status agree
+  // with what the worker was told. The gate, where there is one, delivers instead.
+  const workflow = opts.kind === 'ship' && !extra.selfFix && !gated && followsWorkflow(project, worktree);
+  if (workflow) { record = { ...record, workflow: 'delivery' }; saveTask(h, record); }
+  fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
   const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, instruction: `Read the brief at ${brief} and carry it out exactly.` });
   const address = started.value?.address;
@@ -992,7 +1037,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
   const detail = pickLabel(pick) !== pick.harness || chosen.rest.length ? `; ${pickLabel(pick)}${chosen.rest.length ? `, ${chosen.rest.length} more can take over` : ''}` : '';
-  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${detail}`);
+  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}`);
   backlogMove(h, id, 'start');
 }
 
@@ -1077,8 +1122,18 @@ function cmdDone(args) {
   if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
   if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
   if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
-  saveTask(h, { ...task, state: 'reported', reported: now() });
+  saveTask(h, { ...task, state: 'reported', reported: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
   console.log(`reported ${id}. You are finished; stop here.`);
+}
+
+// A worker in a repository with the shared delivery workflow starts every report with
+// `Plan: <link>` or `Implementation: <link>`. That line is what status and land go by, so
+// nobody has to ask GitHub which stage a task is in.
+const PR_LINK = /https:\/\/[^\s)>\]]+\/pulls?\/\d+/;
+function reportedStage(report) {
+  const first = fs.readFileSync(report, 'utf8').trim().split(/\r?\n/)[0] ?? '';
+  const m = /^\W*(plan|implementation)\W*:/i.exec(first), link = PR_LINK.exec(first)?.[0];
+  return m ? { stage: m[1].toLowerCase(), ...(link ? { pr: link } : {}) } : { stage: null };
 }
 
 const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -1549,6 +1604,34 @@ function cmdReview(args) {
 export const githubOwner = url => /github\.com[:/]+([^/]+)\/[^/]+?(?:\.git)?\/?$/.exec(String(url).trim())?.[1] ?? null;
 const GH = process.env.CREW_GH || 'gh';
 const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, ...args], options) : run(GH, args, options));
+// The pull request a worker (or its gate) opened: a link in its report, else what GitHub has
+// for its branch. A workflow worker puts its own link on the first line, and a link further
+// down may be another pull request it mentions, so for it only the first line is read.
+function pullRequestOf(task, branch, { firstLine = false } = {}) {
+  const text = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8') : '';
+  const reported = PR_LINK.exec(firstLine ? text.trim().split(/\r?\n/)[0] ?? '' : text)?.[0];
+  if (reported) return reported;
+  const asked = gh(['pr', 'view', branch, '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 60000 });
+  return /https?:\/\/\S+/.exec(asked?.stdout ?? '')?.[0] ?? null;
+}
+// Commits of the copy that its pushed branch lacks: 0 when all is pushed, null when the branch
+// is not on origin at all, undefined when origin could not be asked.
+function unpushedCommits(git, branch) {
+  const listed = git('ls-remote', '--exit-code', '--heads', 'origin', branch);
+  if (listed.code === 2) return null;
+  if (listed.code !== 0 || git('fetch', '--quiet', 'origin', branch).code !== 0) return undefined;
+  return Number(git('rev-list', '--count', 'FETCH_HEAD..HEAD').stdout.trim()) || 0;
+}
+// "draft, 2 of 3 outcomes ticked" from one read of the pull request; null when GitHub does not answer.
+function pullRequestState(url) {
+  const asked = gh(['pr', 'view', url, '--json', 'isDraft,body'], { timeout: 60000 });
+  let pr = null;
+  try { pr = JSON.parse(asked.stdout); } catch { return null; }
+  if (asked.code !== 0 || !pr) return null;
+  const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
+  const ticked = (outcomes.match(/^\s*- \[[xX]\]/gm) ?? []).length, all = ticked + (outcomes.match(/^\s*- \[ \]/gm) ?? []).length;
+  return `${pr.isDraft ? 'draft' : 'ready'}${all ? `, ${ticked} of ${all} outcomes ticked` : ''}`;
+}
 function cmdLand(args) {
   const h = home();
   requireOwner(h);
@@ -1559,7 +1642,8 @@ function cmdLand(args) {
   const task = loadTask(h, id);
   if (task.selfFix) refuse(`Task ${id} repairs crew itself; publish it with \`crew selfmerge ${id}\`.`);
   if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
-  if (task.pr) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
+  // A workflow task's link is recorded already when its worker reports; it lands only once.
+  if (task.pr && (task.landed || !task.workflow)) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
   const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
@@ -1571,12 +1655,28 @@ function cmdLand(args) {
   if (task.gate === 'no-mistakes') {
     // The gate reviewed, pushed and opened the pull request while the worker drove it; what
     // is left is to find that pull request: in the report, or by asking GitHub for the branch.
-    const reported = fs.existsSync(task.report) ? /https:\/\/[^\s)>\]]+\/pulls?\/\d+/.exec(fs.readFileSync(task.report, 'utf8'))?.[0] : null;
-    const asked = reported ? null : gh(['pr', 'view', git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim(), '--json', 'url', '--jq', '.url'], { cwd: wt, timeout: 60000 });
-    const found = reported ?? /https?:\/\/\S+/.exec(asked?.stdout ?? '')?.[0];
+    const found = pullRequestOf(task, git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim());
     if (!found) no(`the no-mistakes gate has not opened a pull request for it yet. Ask the worker where the gate stands: crew tell ${id} "run no-mistakes axi status and finish the gate"`);
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
     console.log(`delivered ${id} through no-mistakes: ${found}. Merging it is the person's decision.`);
+    backlogMove(h, id, 'done', ['--pr', found]);
+    return;
+  }
+  if (task.workflow) {
+    // The repository's own workflow: the worker opened the draft pull request and ticks it,
+    // the repository's bot marks it ready. Crew only records it; it never pushes or opens one.
+    if (task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
+    // Delivered means the pull request holds every commit of the copy; the worker pushes them.
+    if (remote.code !== 0) no('the project has no `origin`, so it has no pull request to record.');
+    const behind = unpushedCommits(git, branchOf(task));
+    if (behind === undefined) no('the project\'s origin could not be reached. Try again.', 4);
+    if (behind === null) no(`its branch ${branchOf(task)} is not pushed. Tell the worker: crew tell ${id} "push your branch and open the draft pull request as the change-delivery skill says"`);
+    if (behind) no(`its copy has ${behind} commit${behind === 1 ? '' : 's'} that the pushed branch ${branchOf(task)} lacks. Tell the worker: crew tell ${id} "push your last commits to the pull request"`);
+    const found = pullRequestOf(task, branchOf(task), { firstLine: true });
+    if (!found) no(`the worker has not opened its pull request yet. Tell it: crew tell ${id} "open the draft pull request as the change-delivery skill says and put Implementation: <its link> in the first line of your report"`);
+    saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
+    const shown = pullRequestState(found);
+    console.log(`delivered ${id}: ${found}${shown ? ` (${shown})` : ''}. It follows the repository's delivery workflow: its bot marks it ready; merging is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
     return;
   }
@@ -1786,6 +1886,7 @@ function cmdStatus(args) {
     return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
       report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime),
+      ...(t.workflow ? { workflow: t.workflow, stage: t.stage ?? null } : {}),
       ...(t.copyToReturn ? { copyToReturn: copyWaiting(t) } : {}) };
   });
   // A closed task whose copy still waits to be returned is not hidden: --all lists it with its
@@ -1794,7 +1895,9 @@ function cmdStatus(args) {
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }) })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
-  for (const t of tasks) console.log(`${t.id}\t${t.state}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
+  // A workflow task's stage is what its last report said it is; GitHub is not asked here.
+  const stageOf = t => (!t.stage ? '' : t.stage === 'plan' && t.state === 'reported' ? ' (plan awaiting approval)' : ` (${t.stage})`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
   if (waiting) console.log(`${waiting} working ${waiting === 1 ? 'copy' : 'copies'} of finished tasks still to be returned (crew status --all)`);
 }
 // Where a postponed copy stands now, asked of Core: { worktree, since, heldBy, free }.
@@ -1809,7 +1912,7 @@ const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmd
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
-  crew project add <name> <git folder> [--gate-skip <steps>|none]   register a project   (crew project list)
+  crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
@@ -1823,7 +1926,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
   crew review <id> [who]                   start a reviewer on a ship task's branch
-  crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request
+  crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
   crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
