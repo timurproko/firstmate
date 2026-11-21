@@ -4,7 +4,7 @@
 // One coordinator agent owns a crew home and calls these commands; each worker is an
 // ordinary agent in its own Core terminal and its own git worktree. Everything is one
 // short process talking to Core through `hc`; there is no watcher, no hook and no
-// background service. See crew/README.md for the design and its limits.
+// background service. See the sibling README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -1891,7 +1891,18 @@ function cmdLand(args) {
 // that branch and every machine, so it checks what it can check without a person: the change
 // stays inside crew/, it sits on top of the published main, and the whole test suite passes.
 // Machines pick the result up at their next `crew start`; `crew rollback` undoes it locally.
-const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || path.join(HERE, '..')));
+export function toolLayout(folder, override) {
+  const repository = fs.existsSync(path.join(folder, '.git')) ? folder : path.dirname(folder);
+  const relative = slash(path.relative(repository, folder));
+  return { root: slash(path.resolve(override || repository)), prefix: relative ? `${relative}/` : '' };
+}
+export function repairFile(file, prefix) {
+  const own = file.startsWith(prefix) ? file.slice(prefix.length) : null;
+  return own !== null && (['crew.mjs', 'crew.test.mjs', 'README.md'].includes(own)
+    || /^(bin|docs)\/.+/.test(own));
+}
+const { root: TOOL_ROOT, prefix: TOOL_PREFIX } = toolLayout(HERE, process.env.CREW_TOOL_ROOT);
+const toolFile = name => `${TOOL_PREFIX}${name}`;
 // Update and crash records. Before 0.7 they sat directly in ~/.crew; one found there is moved
 // the first time a command uses it.
 const STATE = path.join(CREW_DIR, 'state');
@@ -1983,14 +1994,14 @@ function cmdFix(args) {
   while (fs.existsSync(taskDir(h, `fix-${n}`))) n++;
   const id = `fix-${n}`, crashes = recentCrashes();
   const task = [
-    'Repair a defect in the crew tool itself. This working copy is crew\'s own source: the tool is `crew/crew.mjs`, its tests are `crew/crew.test.mjs`, its design is in `crew/README.md`.',
+    `Repair a defect in the crew tool itself. This working copy is crew's own source: the tool is \`${toolFile('crew.mjs')}\`, its tests are \`${toolFile('crew.test.mjs')}\`, its design is in \`${toolFile('README.md')}\`.`,
     '', '## The problem, as the coordinator saw it', problem,
     ...(crashes.length ? ['', '## Crash records from this machine (read them)', ...crashes.map(f => `- \`${slash(f)}\``)] : []),
     '', '## What to do',
-    '1. Find the cause in `crew/crew.mjs`. Say so in the report if the problem is not a defect in crew.',
-    '2. Add a check to `crew/crew.test.mjs` that fails because of the defect, then make the smallest change that fixes it.',
-    '3. Change files under `crew/` only. A change anywhere else is rejected unseen.',
-    '4. Run `node crew/crew.test.mjs` and keep going until it exits 0. The fix is published only if the whole suite passes.',
+    `1. Find the cause in \`${toolFile('crew.mjs')}\`. Say so in the report if the problem is not a defect in crew.`,
+    `2. Add a check to \`${toolFile('crew.test.mjs')}\` that fails because of the defect, then make the smallest change that fixes it.`,
+    `3. Change only \`${toolFile('crew.mjs')}\`, \`${toolFile('crew.test.mjs')}\`, \`${toolFile('README.md')}\`, or files under \`${toolFile('bin/')}\` and \`${toolFile('docs/')}\`. Repository infrastructure is out of scope.`,
+    `4. Run \`node ${toolFile('crew.test.mjs')}\` and keep going until it exits 0. The fix is published only if the whole suite passes.`,
     '5. Commit on this branch. Do not push: the coordinator publishes it with `crew selfmerge`.',
     '6. In the report give the cause, the change and the new check, each in a line or two.',
   ].join('\n');
@@ -2017,10 +2028,10 @@ function cmdSelfmerge(args) {
   if (rebased.code !== 0) { git('rebase', '--abort'); no(`it does not apply on top of the published main (${lastLine(rebased.stderr || rebased.stdout)}). Finish it and start a new repair.`); }
   const files = git('diff', '--name-only', 'origin/main', 'HEAD').stdout.split(/\r?\n/).filter(Boolean);
   if (!files.length) no('it changes nothing compared with the published main.');
-  const outside = files.filter(f => !f.startsWith('crew/'));
-  if (outside.length) no(`it changes files outside crew/ (${outside.slice(0, 5).join(', ')}). A repair may only touch crew's own folder.`);
+  const outside = files.filter(f => !repairFile(f, TOOL_PREFIX));
+  if (outside.length) no(`it changes files outside crew's own files (${outside.slice(0, 5).join(', ')}). Repository infrastructure is out of scope.`);
   // The suite runs as it would on a clean machine: nothing of this session leaks into it.
-  const command = process.env.CREW_SELFTEST || 'node crew/crew.test.mjs';
+  const command = process.env.CREW_SELFTEST || `node ${toolFile('crew.test.mjs')}`;
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
   const tested = run(command, [], { shell: true, cwd: wt, env, timeout: 15 * 60 * 1000 });
   if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);

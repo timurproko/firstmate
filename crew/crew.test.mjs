@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, toolLayout, repairFile } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -103,6 +103,20 @@ const commit = (folder, files, message) => {
 
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
+gapTests.layout = () => {
+  const repo = path.join(root, 'layout'), nested = path.join(repo, 'crew');
+  fs.mkdirSync(nested, { recursive: true }); fs.mkdirSync(path.join(repo, '.git'));
+  assert.deepEqual(toolLayout(nested), { root: slash(repo), prefix: 'crew/' });
+  assert.deepEqual(toolLayout(repo), { root: slash(repo), prefix: '' });
+  fs.rmSync(path.join(repo, '.git'), { recursive: true }); fs.writeFileSync(path.join(repo, '.git'), 'gitdir: elsewhere');
+  assert.deepEqual(toolLayout(repo), { root: slash(repo), prefix: '' }, 'A linked copy has a .git file');
+  assert.deepEqual(toolLayout(nested, root), { root: slash(root), prefix: 'crew/' }, 'The repository override preserves the source layout');
+  for (const prefix of ['', 'crew/']) {
+    for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(prefix + file, prefix), prefix + file);
+    for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(prefix + file, prefix), prefix + file);
+    if (prefix) assert.ok(!repairFile('README.md', prefix));
+  }
+};
 function gapFixture(name, extra = {}) {
   const dir = path.join(root, `gap-${name}`), home = path.join(dir, 'home'), repo = path.join(dir, 'repo');
   fs.mkdirSync(repo, { recursive: true }); git('-C', repo, 'init', '-q');
