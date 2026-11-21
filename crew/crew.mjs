@@ -1357,7 +1357,7 @@ function cmdStop(args) {
 // from the project's current or default branch, or GitHub has a merged pull request whose
 // head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
 function dropMergedBranch(project, task) {
-  if (task.kind !== 'ship' || task.selfFix || !project?.path) return '';
+  if (task.kind !== 'ship' || !project?.path) return '';
   const branch = branchOf(task), git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
@@ -1437,8 +1437,6 @@ function returnCopy(task, project, { force = false } = {}) {
     if (fs.existsSync(task.worktree)) sleep(1000);
   }
   if (project) run('git', ['-C', project.path, 'worktree', 'prune']);
-  // A published self-fix is on main; its branch has nothing left to keep.
-  if (task.selfFix && task.merged && !fs.existsSync(task.worktree)) run('git', ['-C', project.path, 'branch', '-D', branchOf(task)]);
   // An emptied folder that something still sits in (a helper process the agent left behind)
   // is not worth failing for: the work is gone from disk and from git; say so and move on.
   if (fs.existsSync(task.worktree)) {
@@ -1875,8 +1873,7 @@ function cmdLand(args) {
   fs.writeFileSync(bodyFile, `${report}\n\n---\nWork of crew task \`${id}\` (${task.agent}), ${subjects.length} commit${subjects.length === 1 ? '' : 's'}.\n`);
   // A machine can be signed in to GitHub as several people. If one of them is the owner of
   // the repository, the pull request is opened as that one.
-  const owner = githubOwner(remote.stdout), token = owner ? gh(['auth', 'token', '--user', owner]) : null;
-  const env = token?.code === 0 && token.stdout.trim() ? { ...process.env, GH_TOKEN: token.stdout.trim() } : process.env;
+  const env = githubEnvironment(remote.stdout);
   const made = gh(['pr', 'create', '--base', base, '--head', `${branchOf(task)}`, '--title', title || subjects[0], '--body-file', bodyFile], { cwd: wt, env, timeout: 120000 });
   const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
   if (made.error || made.code !== 0 || !url) no(`its branch ${branchOf(task)} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
@@ -1885,12 +1882,14 @@ function cmdLand(args) {
   backlogMove(h, id, 'done', ['--pr', url]);
 }
 
+function githubEnvironment(remote) {
+  const owner = githubOwner(remote), token = owner ? gh(['auth', 'token', '--user', owner]) : null;
+  return token?.code === 0 && token.stdout.trim() ? { ...process.env, GH_TOKEN: token.stdout.trim() } : process.env;
+}
+
 // --- crew maintains itself -------------------------------------------------------
-// A defect in crew is repaired the way any other work is done: by a worker, on a branch, in
-// its own copy - here a copy of crew's own source. `crew selfmerge` is the only gate between
-// that branch and every machine, so it checks what it can check without a person: the change
-// stays inside crew/, it sits on top of the published main, and the whole test suite passes.
-// Machines pick the result up at their next `crew start`; `crew rollback` undoes it locally.
+// A worker commits a repair; crew checks its scope, rebases and tests before opening a PR.
+// The person merges it. Machines pick it up at update/start; rollback stays per machine.
 export function toolLayout(folder, override) {
   const repository = fs.existsSync(path.join(folder, '.git')) ? folder : path.dirname(folder);
   const relative = slash(path.relative(repository, folder));
@@ -2014,6 +2013,7 @@ function cmdSelfmerge(args) {
   requireOwner(h);
   const id = args[0], task = loadTask(h, id);
   if (!task.selfFix) refuse(`Task ${id} is not a repair of crew; \`crew selfmerge\` publishes only those.`);
+  if (task.pr) { console.log(`${id} already has a pull request: ${task.pr}. After the person merges it, run \`crew update\` or use the next \`crew start\`.`); return; }
   if (task.merged) { console.log(`${id} is already published as ${short(task.merged)}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; a repair is published only after its worker reported.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
@@ -2026,25 +2026,35 @@ function cmdSelfmerge(args) {
   // On top of what is published now, so a fix made on another machine meanwhile is kept.
   const rebased = git('rebase', '--quiet', 'origin/main');
   if (rebased.code !== 0) { git('rebase', '--abort'); no(`it does not apply on top of the published main (${lastLine(rebased.stderr || rebased.stdout)}). Finish it and start a new repair.`); }
-  const files = git('diff', '--name-only', 'origin/main', 'HEAD').stdout.split(/\r?\n/).filter(Boolean);
+  const changed = git('diff', '--name-only', '-z', '--no-renames', 'origin/main', 'HEAD');
+  if (changed.code !== 0) no('its changed files could not be read; nothing was pushed.');
+  const files = changed.stdout.split('\0').filter(Boolean);
   if (!files.length) no('it changes nothing compared with the published main.');
   const outside = files.filter(f => !repairFile(f, TOOL_PREFIX));
   if (outside.length) no(`it changes files outside crew's own files (${outside.slice(0, 5).join(', ')}). Repository infrastructure is out of scope.`);
   // The suite runs as it would on a clean machine: nothing of this session leaks into it.
   const command = process.env.CREW_SELFTEST || `node ${toolFile('crew.test.mjs')}`;
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
-  const tested = run(command, [], { shell: true, cwd: wt, env, timeout: 15 * 60 * 1000 });
+  const testEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
+  const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: 15 * 60 * 1000 });
   if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
-  const revision = git('rev-parse', 'HEAD').stdout.trim();
-  // An ordinary push: if main moved in these seconds it is refused, and the next try rebases again.
-  const pushed = git('push', '--quiet', 'origin', 'HEAD:main');
-  if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}). Run \`crew selfmerge ${id}\` again.`, 4);
-  saveTask(h, { ...loadTask(h, id), merged: revision, mergedAt: now() });
-  console.log(`published ${id} as ${short(revision)} (${files.length} file${files.length === 1 ? '' : 's'}: ${files.slice(0, 5).join(', ')}); tests passed`);
-  const u = updateTool();
-  console.log(u.changed ? `this machine now runs ${short(u.revision)} (was ${short(u.from)}); \`crew rollback\` goes back`
-    : u.failed ? `this machine was not updated: ${u.note}. Run \`crew update\`.` : `this machine already runs ${short(u.revision)}`);
-  console.log(`other machines update at their next \`crew start\`. Now: crew finish ${id}, then retry what failed.`);
+  const subject = git('log', '--reverse', '--format=%s', 'origin/main..HEAD').stdout.split(/\r?\n/).find(Boolean) || 'Repair the reported crew defect';
+  // Commit subjects are untrusted prose, not PR-body markup. Keep the outcome one bounded line.
+  let outcome = `Crew's reported defect is repaired: ${subject.replace(/https?:\/\/\S+|[@<>`]/g, '').replace(/\s+/g, ' ').trim()}`;
+  while (Buffer.byteLength(outcome) > 280) outcome = Array.from(outcome).slice(0, -1).join('');
+  const bodyFile = path.join(taskDir(h, id), 'pull-request.md');
+  fs.writeFileSync(bodyFile, `## Proposal\n\nRepair the reported defect in crew's own source without changing repository infrastructure. The repair is delivered for the person's merge rather than pushed to main.\n\n## Implementation\n\n- [x] ${outcome}\n\n## Acceptance\n\n- The reported crew defect is repaired on a branch based on the published main.\n- Repository infrastructure remains unchanged by this repair.\n`);
+  const checked = runTool('delivery', ['check-body', '--body-file', bodyFile, '--final'], { cwd: wt, timeout: 60000 });
+  if (checked && checked.code !== 0) no(`its pull request body was rejected by delivery (${lastLine(checked.stderr || checked.stdout)}). Nothing was pushed.`);
+  const branch = branchOf(task), remote = git('remote', 'get-url', 'origin');
+  const env = githubEnvironment(remote.stdout);
+  const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`);
+  if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}). Run \`crew selfrepair ${id}\` again.`, 4);
+  const made = gh(['pr', 'create', '--draft', '--base', 'main', '--head', branch, '--title', subject, '--body-file', bodyFile], { cwd: wt, env, timeout: 120000 });
+  const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
+  if (made.error || made.code !== 0 || !url) no(`its branch ${branch} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew selfrepair ${id}\` again.`, 4);
+  saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
+  console.log(`delivered repair ${id}: ${url}; tests passed. Merging it is the person's decision.`);
+  console.log('This machine was not updated. After the person merges it, run `crew update` or use the next `crew start`, then retry what failed.');
 }
 
 function taskElapsedSeconds(task, currentTime) {
@@ -2104,7 +2114,7 @@ function copyWaiting(task) {
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
-  home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
+  home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfrepair: cmdSelfmerge, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
   crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
