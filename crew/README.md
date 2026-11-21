@@ -270,7 +270,7 @@ the defect. The person reviews and merges the repair's pull request.
 
 `crew selfmerge` remains an alias for `crew selfrepair`. The fixer commits and stops;
 it does not push or open the pull request itself. Crew refuses delivery unless the fixer
-reported, nothing is uncommitted, the branch rebases cleanly onto the published `main`,
+reported, nothing is uncommitted, the branch can incorporate the published `main`,
 and the whole suite passes in the fixer's copy (`node crew/crew.test.mjs`).
 
 Only the tool's own `crew.mjs`, `crew.test.mjs`, `README.md`, and files inside its `bin/`
@@ -284,8 +284,16 @@ installed. The body has Proposal, ticked repair Implementation, and Acceptance s
 without Automation. It pushes only the repair branch (never forcibly or directly to main)
 and opens a draft pull request with `gh`, using the repository owner's signed-in account
 when available, as `crew land` does. Repeating delivery prints the recorded link instead
-of opening another pull request. `crew finish` keeps an unmerged repair's branch because
-it holds the commits; after merge the branch can go as for any other ship.
+of opening another pull request. New repairs use `fix/<home tag>-<id>` so different homes'
+first repairs do not compete for `fix/fix-1`; existing tasks keep their recorded branch.
+`crew finish` keeps an unmerged repair's branch because it holds the commits; after merge
+the branch can go as for any other ship.
+
+If the branch push succeeds but opening the pull request fails, repeat `crew selfrepair`.
+Before publication, crew rebases private commits onto main. Once the branch is published,
+it brings newer main commits in with a merge instead, preserving the published repair's
+history for an ordinary push. If the published branch has history missing from this copy,
+crew asks the worker to reconcile it rather than rewriting it or recommending a blind retry.
 
 The copy Herdr installed (`~/.crew/core`, or `~/.crew/tool` from before 0.7) fast-forwards itself at each `crew start`, so a
 repair reaches other machines only after the person merges its pull request, at their next

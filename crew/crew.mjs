@@ -990,7 +990,8 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   opts = { ...opts, agent: pick.harness };
   const dir = taskDir(h, id), report = slash(path.join(dir, 'report.md')), brief = slash(path.join(dir, 'brief.md'));
   let worktree = slash(path.join(h.worktrees, id));
-  const branch = opts.kind === 'ship' ? `${extra.selfFix ? 'fix' : opts.type ?? 'feature'}/${id}` : null;
+  // Repair numbers are home-local; a published branch must distinguish other homes' fix-1.
+  const branch = opts.kind === 'ship' ? (extra.selfFix ? `fix/${h.config.tag}-${id}` : `${opts.type ?? 'feature'}/${id}`) : null;
   // Where the shared delivery workflow is installed, it makes the copy: crew asks for a task's
   // copy and does not know whether that is a reused pool slot or a new folder. Without it,
   // crew makes a plain git worktree itself.
@@ -2018,9 +2019,19 @@ function cmdSelfmerge(args) {
   if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). The fixer must commit or remove them.`);
   const fetched = git('fetch', '--quiet', 'origin', 'main');
   if (fetched.code !== 0) no(`the source could not be reached (${lastLine(fetched.stderr)}). Try again.`, 4);
-  // On top of what is published now, so a fix made on another machine meanwhile is kept.
-  const rebased = git('rebase', '--quiet', 'origin/main');
-  if (rebased.code !== 0) { git('rebase', '--abort'); no(`it does not apply on top of the published main (${lastLine(rebased.stderr || rebased.stdout)}). Finish it and start a new repair.`); }
+  const branch = branchOf(task);
+  const published = git('ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${branch}`);
+  if (![0, 2].includes(published.code)) no(`its published branch could not be checked (${lastLine(published.stderr)}). Nothing was rewritten; check access to the source.`, 4);
+  if (published.code === 0) {
+    const got = git('fetch', '--quiet', 'origin', `refs/heads/${branch}`);
+    if (got.code !== 0) no(`its published branch could not be fetched (${lastLine(got.stderr)}). Nothing was rewritten; check access to the source.`, 4);
+    if (git('merge-base', '--is-ancestor', 'FETCH_HEAD', 'HEAD').code !== 0) no(`published branch ${branch} has history this copy does not contain. Have the worker reconcile that history before delivering again; nothing was rewritten.`);
+  }
+  // Rebase only private commits. A retry after a successful push must preserve the remote
+  // history, even when GitHub failed and another machine advanced main in the meantime.
+  const operation = published.code === 0 ? 'merge' : 'rebase';
+  const synced = git(operation, '--quiet', ...(operation === 'merge' ? ['--no-edit'] : []), 'origin/main');
+  if (synced.code !== 0) { git(operation, '--abort'); no(`it does not apply on top of the published main (${lastLine(synced.stderr || synced.stdout)}). Have the worker resolve the conflict before delivering again.`); }
   const changed = git('diff', '--name-only', '-z', '--no-renames', 'origin/main', 'HEAD');
   if (changed.code !== 0) no('its changed files could not be read; nothing was pushed.');
   const files = changed.stdout.split('\0').filter(Boolean);
@@ -2040,10 +2051,10 @@ function cmdSelfmerge(args) {
   fs.writeFileSync(bodyFile, `## Proposal\n\nRepair the reported defect in crew's own source without changing repository infrastructure. The repair is delivered for the person's merge rather than pushed to main.\n\n## Implementation\n\n- [x] ${outcome}\n\n## Acceptance\n\n- The reported crew defect is repaired on a branch based on the published main.\n- Repository infrastructure remains unchanged by this repair.\n`);
   const checked = runTool('delivery', ['check-body', '--body-file', bodyFile, '--final'], { cwd: wt, timeout: 60000 });
   if (checked && checked.code !== 0) no(`its pull request body was rejected by delivery (${lastLine(checked.stderr || checked.stdout)}). Nothing was pushed.`);
-  const branch = branchOf(task), remote = git('remote', 'get-url', 'origin');
+  const remote = git('remote', 'get-url', 'origin');
   const env = githubEnvironment(remote.stdout);
   const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`);
-  if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}). Run \`crew selfrepair ${id}\` again.`, 4);
+  if (pushed.code !== 0) no(`the push was refused (${lastLine(pushed.stderr)}). Nothing was overwritten; check the remote branch and Git access before delivering again.`, 4);
   const made = gh(['pr', 'create', '--draft', '--base', 'main', '--head', branch, '--title', subject, '--body-file', bodyFile], { cwd: wt, env, timeout: 120000 });
   const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
   if (made.error || made.code !== 0 || !url) no(`its branch ${branch} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew selfrepair ${id}\` again.`, 4);
