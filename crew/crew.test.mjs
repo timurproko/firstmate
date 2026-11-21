@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -85,12 +85,12 @@ const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), f
 fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
-function crew(args, { terminal, cwd = homeDir, env: extra = {} } = {}) {
+function crew(args, { terminal, cwd = homeDir, env: extra = {}, script = path.join(here, 'crew.mjs') } = {}) {
   const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '',
     // No tool of the machine the suite runs on is seen, unless a test names a fake one.
     CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
   delete env.CREW_HOME;
-  const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
+  const r = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
 }
 const git = (...args) => { const r = spawnSync('git', args, { encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
@@ -103,6 +103,134 @@ const commit = (folder, files, message) => {
 
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
+gapTests['repair-scope'] = () => {
+  for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
+  for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);
+};
+function repairFixture(name, sharedOrigin) {
+  const dir = path.join(root, `repair-${name}`), seed = path.join(dir, 'seed'), repo = path.join(dir, 'core'), origin = sharedOrigin || path.join(dir, 'github.com', 'acme', 'crew.git'), home = path.join(dir, 'home');
+  const owner = `repair-owner-${name}`;
+  fs.mkdirSync(seed, { recursive: true }); git('-C', seed, 'init', '-q', '-b', 'main');
+  fs.cpSync(here, path.join(seed, 'crew'), { recursive: true });
+  commit(seed, { 'package.json': '{"private":true}\n', 'crew/docs/selftest.mjs': "import fs from 'node:fs'; process.exit(fs.existsSync(new URL('./broken', import.meta.url)) ? 1 : 0);\n" }, 'baseline');
+  if (!sharedOrigin) git('clone', '-q', '--bare', seed, origin);
+  git('clone', '-q', slash(origin), repo);
+  git('-C', repo, 'config', 'user.name', 't'); git('-C', repo, 'config', 'user.email', 't@example.invalid');
+  const fakeGh = path.join(dir, 'gh.mjs'), log = path.join(dir, 'gh.json'), merged = path.join(dir, 'merged'), down = path.join(dir, 'gh-down'), deliveryLog = path.join(dir, 'delivery.json'), delivery = path.join(dir, 'delivery.mjs');
+  fs.writeFileSync(log, '[]'); fs.writeFileSync(deliveryLog, '[]');
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs';
+const a = process.argv.slice(2), file = ${JSON.stringify(log)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
+log.push({ a, token: process.env.GH_TOKEN === 'fake-token', body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
+if (a[0] === 'auth') { console.log('fake-token'); process.exit(0); }
+if (a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(merged)}) ? fs.readFileSync(${JSON.stringify(merged)}, 'utf8') : ''); process.exit(0); }
+if (a[1] === 'create' && fs.existsSync(${JSON.stringify(down)})) { console.error('GitHub temporarily unavailable'); process.exit(1); }
+console.log('https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'create').length);
+`);
+  fs.writeFileSync(delivery, `import fs from 'node:fs'; const a = process.argv.slice(2), f = ${JSON.stringify(deliveryLog)}; fs.writeFileSync(f, JSON.stringify([...JSON.parse(fs.readFileSync(f, 'utf8')), a])); if (a[0] !== 'check-body' || !a.includes('--final')) process.exit(1);`);
+  const script = path.join(repo, 'crew', 'crew.mjs');
+  const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const env = { CREW_CLAUDE_ACCOUNTS: '', CREW_GH: fakeGh, CREW_SELFTEST: 'node crew/docs/selftest.mjs', CREW_WORKTREES: path.join(dir, 'copies') };
+  const call = (args, extra = {}) => crew(args, { script, cwd: home, terminal: owner, env: { ...env, ...extra } });
+  assert.equal(call(['init', home]).code, 0); assert.equal(call(['start']).code, 0);
+  const task = id => JSON.parse(fs.readFileSync(path.join(home, 'tasks', id, 'task.json'), 'utf8'));
+  const reported = t => { fs.writeFileSync(t.report, 'Repaired.'); const r = crew(['done', t.id], { script, cwd: home, terminal: t.terminal, env }); assert.equal(r.code, 0, r.out); };
+  return { dir, repo, origin, home, call, task, reported, log, merged, down, delivery, deliveryLog, fakeGh };
+}
+gapTests.selfrepair = () => {
+  const f = repairFixture('nested'), first = git('-C', f.origin, 'rev-parse', 'main').trim();
+  let r = f.call(['fix', '--agent', 'pi', 'Repair the reported defect.']); assert.equal(r.code, 0, r.out);
+  const t = f.task('fix-1'); f.reported(t);
+  commit(t.worktree, { 'crew/unrelated.txt': 'Not a tool file.\n' }, 'outside the allowlist');
+  r = f.call(['selfrepair', t.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, /outside crew's own files/);
+  assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 0);
+  git('-C', t.worktree, 'reset', '-q', '--hard', 'HEAD~1');
+  commit(t.worktree, { 'crew/docs/repair.md': 'The repair.\n' }, 'fix(crew): repair the reported defect');
+  const rejectedBody = path.join(f.dir, 'rejected-body.mjs'); fs.writeFileSync(rejectedBody, "console.error('invalid repair body'); process.exit(1);\n");
+  r = f.call(['selfrepair', t.id], { CREW_TOOL_DELIVERY: rejectedBody }); assert.equal(r.code, 6, r.out); assert.match(r.out, /body was rejected/);
+  assert.equal(spawnSync('git', ['-C', f.origin, 'rev-parse', '--verify', `refs/heads/${t.branch}`]).status, 128, 'Body rejection must precede publication');
+  r = f.call(['selfrepair', t.id], { CREW_TOOL_DELIVERY: f.delivery }); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /https:\/\/github.com\/acme\/crew\/pull\/1/); assert.match(r.out, /not updated/);
+  assert.equal(f.task(t.id).pr, 'https://github.com/acme/crew/pull/1');
+  assert.equal(git('-C', f.origin, 'rev-parse', 'main').trim(), first);
+  assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), first);
+  const tip = git('-C', t.worktree, 'rev-parse', 'HEAD').trim();
+  assert.equal(git('-C', f.origin, 'rev-parse', t.branch).trim(), tip);
+  const calls = JSON.parse(fs.readFileSync(f.log, 'utf8')), made = calls.find(x => x.a[1] === 'create');
+  assert.deepEqual(calls.find(x => x.a[0] === 'auth').a, ['auth', 'token', '--user', 'acme']); assert.ok(made.token);
+  assert.ok(made.a.includes('--draft')); assert.equal(made.a[made.a.indexOf('--base') + 1], 'main');
+  assert.match(made.body, /^## Proposal[\s\S]*## Implementation\n\n- \[x\] [^\n]+[\s\S]*## Acceptance/); assert.ok(!made.body.includes('## Automation'));
+  assert.equal((made.body.match(/^- \[x\]/gm) || []).length, 1, 'One delivered outcome describes this repair');
+  assert.ok(made.body.includes('fix(crew): repair the reported defect')); assert.ok(!made.body.includes('- [ ]'));
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.deliveryLog, 'utf8'))[0].filter(a => a.startsWith('--')), ['--body-file', '--final']);
+  r = f.call(['selfmerge', t.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already has a pull request/);
+  assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).filter(x => x.a[1] === 'create').length, 1);
+  r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out);
+  assert.ok(git('-C', f.repo, 'branch', '--list', t.branch).trim(), 'An unmerged repair keeps its commits');
+  assert.equal(f.call(['fix', '--agent', 'pi', 'Repair another defect.']).code, 0);
+  const t2 = f.task('fix-2'); f.reported(t2);
+  const tip2 = commit(t2.worktree, { 'crew/docs/second.md': 'Second repair.\n' }, 'fix(crew): repair another defect');
+  assert.equal(f.call(['selfrepair', t2.id]).code, 0);
+  fs.writeFileSync(f.merged, tip2);
+  r = f.call(['finish', t2.id]); assert.equal(r.code, 0, r.out); assert.ok(r.out.includes(`merged branch ${t2.branch} deleted`), r.out);
+};
+gapTests['repair-two-homes'] = () => {
+  const a = repairFixture('machine-one'), b = repairFixture('machine-two', a.origin);
+  const first = git('-C', a.origin, 'rev-parse', 'main').trim();
+  const tasks = [a, b].map((f, i) => {
+    const r = f.call(['fix', '--agent', 'pi', `Repair machine ${i + 1}'s defect.`]); assert.equal(r.code, 0, r.out);
+    const t = f.task('fix-1');
+    commit(t.worktree, { [`crew/docs/machine-${i + 1}.md`]: 'Repaired.\n' }, `fix(crew): repair machine ${i + 1}`); f.reported(t);
+    return t;
+  });
+  for (const [i, f] of [a, b].entries()) {
+    const r = f.call(['selfrepair', tasks[i].id], { CREW_GH: a.fakeGh }); assert.equal(r.code, 0, r.out);
+  }
+  for (const [i, f] of [a, b].entries()) {
+    const tag = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).tag;
+    assert.equal(f.task(tasks[i].id).branch, `fix/${tag}-fix-1`);
+    assert.equal(f.task(tasks[i].id).pr, `https://github.com/acme/crew/pull/${i + 1}`);
+    assert.equal(git('-C', a.origin, 'rev-parse', tasks[i].branch).trim(), git('-C', tasks[i].worktree, 'rev-parse', 'HEAD').trim());
+  }
+  assert.notEqual(tasks[0].branch, tasks[1].branch); assert.equal(git('-C', a.origin, 'rev-parse', 'main').trim(), first);
+  const made = JSON.parse(fs.readFileSync(a.log, 'utf8')).filter(x => x.a[1] === 'create');
+  for (const [i, f] of [a, b].entries()) {
+    const t = tasks[i]; assert.equal(made[i].a[made[i].a.indexOf('--head') + 1], t.branch);
+    if (i) fs.writeFileSync(f.merged, git('-C', t.worktree, 'rev-parse', 'HEAD').trim());
+    const r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out);
+    assert.equal(Boolean(git('-C', f.repo, 'branch', '--list', t.branch).trim()), !i, 'Finish keeps the unmerged home branch and deletes the exact merged home branch');
+  }
+};
+gapTests['repair-legacy-branch'] = () => {
+  const f = repairFixture('legacy-branch'); assert.equal(f.call(['fix', '--agent', 'pi', 'A previously started repair.']).code, 0);
+  const t = f.task('fix-1');
+  // An existing task keeps its recorded local branch; do not infer a new name during delivery.
+  git('-C', t.worktree, 'branch', '-m', 'fix/fix-1'); t.branch = 'fix/fix-1';
+  fs.writeFileSync(path.join(f.home, 'tasks', t.id, 'task.json'), JSON.stringify(t));
+  const tip = commit(t.worktree, { 'crew/docs/legacy.md': 'Legacy repair.\n' }, 'fix(crew): deliver an existing repair'); f.reported(t);
+  let r = f.call(['selfrepair', t.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(t.id).branch, t.branch);
+  assert.equal(git('-C', f.origin, 'rev-parse', t.branch).trim(), tip);
+  const made = JSON.parse(fs.readFileSync(f.log, 'utf8')).find(x => x.a[1] === 'create'); assert.equal(made.a[made.a.indexOf('--head') + 1], t.branch);
+  fs.writeFileSync(f.merged, tip); r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out); assert.ok(r.out.includes(`merged branch ${t.branch} deleted`), r.out);
+};
+gapTests['repair-published-retry'] = () => {
+  const f = repairFixture('published-retry'), first = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+  assert.equal(f.call(['fix', '--agent', 'pi', 'A repair whose pull request must be retried.']).code, 0);
+  const t = f.task('fix-1');
+  const published = commit(t.worktree, { 'crew/docs/retry.md': 'Repair.\n' }, 'fix(crew): recover after a GitHub outage'); f.reported(t);
+  fs.writeFileSync(f.down, ''); let r = f.call(['selfrepair', t.id]); assert.equal(r.code, 4, r.out); assert.match(r.out, /branch .* is pushed, but the pull request was not opened/);
+  assert.equal(f.task(t.id).pr, undefined); assert.equal(git('-C', f.origin, 'rev-parse', t.branch).trim(), published);
+  const peer = path.join(f.dir, 'peer'); git('clone', '-q', f.origin, peer);
+  const advanced = commit(peer, { 'upstream-only.txt': 'Another machine advanced main.\n' }, 'advance main'); git('-C', peer, 'push', '-q', 'origin', 'HEAD:main');
+  fs.rmSync(f.down); r = f.call(['selfrepair', t.id]); assert.equal(r.code, 0, r.out);
+  const delivered = git('-C', f.origin, 'rev-parse', t.branch).trim();
+  assert.equal(spawnSync('git', ['-C', t.worktree, 'merge-base', '--is-ancestor', published, delivered]).status, 0, 'The original published repair remains in history');
+  assert.equal(spawnSync('git', ['-C', t.worktree, 'merge-base', '--is-ancestor', advanced, delivered]).status, 0, 'The retried repair also includes the current main');
+  assert.equal(git('-C', f.origin, 'rev-parse', 'main').trim(), advanced); assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), first);
+  const made = JSON.parse(fs.readFileSync(f.log, 'utf8')).filter(x => x.a[1] === 'create');
+  assert.equal(made.length, 2); assert.equal(made[1].a[made[1].a.indexOf('--head') + 1], t.branch);
+  assert.ok(f.task(t.id).pr); r = f.call(['selfrepair', t.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already has a pull request/);
+  assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).filter(x => x.a[1] === 'create').length, 2);
+};
 function gapFixture(name, extra = {}) {
   const dir = path.join(root, `gap-${name}`), home = path.join(dir, 'home'), repo = path.join(dir, 'repo');
   fs.mkdirSync(repo, { recursive: true }); git('-C', repo, 'init', '-q');
@@ -734,13 +862,16 @@ if (a[0] === 'run') {`));
 
   // --- crew maintains itself -----------------------------------------------------------
   // A published source (bare), this machine's installed tool (a clone of it) and another
-  // machine (a second clone). The "suite" is a small script that fails when crew/broken exists.
+  // machine (a second clone). The small suite fails on an allowlisted broken marker.
   const origin = path.join(root, 'origin.git'), tool = path.join(root, 'tool'), peer = path.join(root, 'peer'), seed = path.join(root, 'seed');
   fs.mkdirSync(seed); git('-C', seed, 'init', '-q', '-b', 'main');
-  commit(seed, { 'crew/check.mjs': "import fs from 'node:fs'; process.exit(fs.existsSync('crew/broken') ? 1 : 0);\n", 'crew/tool.txt': 'one\n', 'README.md': 'outside\n' }, 'seed');
+  commit(seed, { 'crew/docs/check.mjs': "import fs from 'node:fs'; process.exit(fs.existsSync('crew/docs/broken') ? 1 : 0);\n", 'crew/docs/tool.txt': 'one\n', 'README.md': 'outside\n' }, 'seed');
   git('clone', '-q', '--bare', seed, origin); git('clone', '-q', origin, tool); git('clone', '-q', origin, peer);
   for (const folder of [tool, peer]) { git('-C', folder, 'config', 'user.name', 't'); git('-C', folder, 'config', 'user.email', 't@example.invalid'); }
-  const self = { CREW_TOOL_ROOT: tool, CREW_SELFTEST: 'node crew/check.mjs' };
+  const selfGh = path.join(root, 'self-gh.mjs'), selfLog = path.join(root, 'self-gh.json');
+  fs.writeFileSync(selfLog, '[]');
+  fs.writeFileSync(selfGh, `import fs from 'node:fs'; const a = process.argv.slice(2), f = ${JSON.stringify(selfLog)}; fs.writeFileSync(f, JSON.stringify([...JSON.parse(fs.readFileSync(f, 'utf8')), { a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }])); if (a[1] !== 'list') console.log('https://github.com/acme/crew/pull/1');`);
+  const self = { CREW_TOOL_ROOT: tool, CREW_SELFTEST: 'node crew/docs/check.mjs', CREW_GH: selfGh };
   const sm = (args, terminal = 'c2', env = {}) => crew(args, { terminal, env: { ...self, ...env } });
   const head = folder => git('-C', folder, 'rev-parse', 'HEAD').trim();
   const taskOf = id => JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', id, 'task.json'), 'utf8'));
@@ -759,13 +890,15 @@ if (a[0] === 'run') {`));
   assert.equal(sm(['fix', 'x'], 'c1').code, 3);
   assert.equal(sm(['fix']).code, 2);
   r = sm(['fix', '--agent', 'pi', 'crew project list crashed', 'instead of printing nothing']); assert.equal(r.code, 0, r.out);
-  assert.match(r.out, /spawned fix-1: pi ship in terminal (t\d+)[\s\S]*next: crew wait fix-1, then crew selfmerge fix-1/);
+  assert.match(r.out, /spawned fix-1: pi ship in terminal (t\d+)[\s\S]*next: crew wait fix-1, then crew selfrepair fix-1/);
   const fix1 = taskOf('fix-1'), fixCopy = path.join(copies, 'fix-1');
   assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).includes('crew.kind=fix'), 'A fixer is labelled as one');
   assert.deepEqual([fix1.selfFix, fix1.project, fix1.projectPath, fix1.base], [true, 'crew:self', slash(tool), first]);
   const fixBrief = fs.readFileSync(fix1.brief, 'utf8');
-  assert.ok(fixBrief.includes('crew project list crashed instead of printing nothing') && fixBrief.includes(crashFiles[0]) && fixBrief.includes('under `crew/` only'), fixBrief);
-  assert.equal(git('-C', fixCopy, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'fix/fix-1');
+  assert.ok(fixBrief.includes('crew project list crashed instead of printing nothing') && fixBrief.includes(crashFiles[0]) && fixBrief.includes('`crew/crew.mjs`') && fixBrief.includes('Repository infrastructure is out of scope'), fixBrief);
+  const homeTag = JSON.parse(fs.readFileSync(path.join(homeDir, 'crew.json'), 'utf8')).tag;
+  assert.equal(fix1.branch, `fix/${homeTag}-fix-1`);
+  assert.equal(git('-C', fixCopy, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), fix1.branch);
   r = sm(['fix', 'another']); assert.equal(r.code, 2); assert.match(r.out, /already open: fix-1/);
 
   // selfmerge: every gate refuses and publishes nothing.
@@ -776,26 +909,35 @@ if (a[0] === 'run') {`));
   fs.writeFileSync(path.join(fixCopy, 'crew', 'half.txt'), 'x');
   r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /uncommitted files \(crew\/half\.txt\)/);
   fs.rmSync(path.join(fixCopy, 'crew', 'half.txt'));
-  commit(fixCopy, { 'README.md': 'changed outside\n', 'crew/tool.txt': 'two\n' }, 'too wide');
-  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /outside crew\/ \(README\.md\)/);
+  commit(fixCopy, { 'README.md': 'changed outside\n', 'crew/docs/tool.txt': 'two\n' }, 'too wide');
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /outside crew's own files \(README\.md\)/);
   git('-C', fixCopy, 'reset', '-q', '--hard', 'HEAD~1');
-  commit(fixCopy, { 'crew/tool.txt': 'two\n', 'crew/broken': '' }, 'breaks the suite');
-  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /the test suite fails \(node crew\/check\.mjs, exit 1\)/);
+  commit(fixCopy, { 'crew/docs/tool.txt': 'two\n', 'crew/docs/broken': '' }, 'breaks the suite');
+  r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 6); assert.match(r.out, /the test suite fails \(node crew\/docs\/check\.mjs, exit 1\)/);
   assert.deepEqual([head(origin), head(tool)], [first, first], 'A refused repair reaches nobody');
+  assert.equal(spawnSync('git', ['-C', origin, 'rev-parse', '--verify', `refs/heads/${fix1.branch}`]).status, 128, 'Neither an out-of-scope repair nor a failing suite publishes a branch');
+  assert.equal(JSON.parse(fs.readFileSync(selfLog, 'utf8')).length, 0, 'Refusals do not ask GitHub to open a pull request');
   git('-C', fixCopy, 'reset', '-q', '--hard', 'HEAD~1');
-  commit(fixCopy, { 'crew/tool.txt': 'two\n' }, 'the repair');
+  commit(fixCopy, { 'crew/docs/tool.txt': 'two\n' }, 'the repair');
   // Meanwhile another machine published something else: the repair goes on top of it.
   const theirs = commit(peer, { 'crew/peer.txt': 'theirs\n' }, 'from another machine'); git('-C', peer, 'push', '-q', 'origin', 'HEAD:main');
   r = sm(['selfmerge', 'fix-1']); assert.equal(r.code, 0, r.out);
-  assert.match(r.out, /published fix-1 as [0-9a-f]{8} \(1 file: crew\/tool\.txt\); tests passed[\s\S]*this machine now runs [0-9a-f]{8} \(was [0-9a-f]{8}\)[\s\S]*crew finish fix-1/);
-  const second = head(origin);
-  assert.equal(head(tool), second, 'The installed tool is updated at once');
-  assert.equal(git('-C', origin, 'rev-parse', 'HEAD~1').trim(), theirs, 'On top of what the other machine published');
-  assert.equal(fs.readFileSync(path.join(tool, 'crew', 'tool.txt'), 'utf8').replace(/\r/g, ''), 'two\n');
-  assert.equal(taskOf('fix-1').merged, second);
-  assert.match(sm(['selfmerge', 'fix-1']).out, /already published/);
+  assert.match(r.out, /delivered repair fix-1: https:\/\/github.com\/acme\/crew\/pull\/1; tests passed[\s\S]*This machine was not updated/);
+  assert.equal(head(origin), theirs, 'Delivery does not move the published main');
+  assert.equal(head(tool), first, 'Delivery does not update the installed source');
+  const second = head(fixCopy);
+  assert.equal(git('-C', origin, 'rev-parse', fix1.branch).trim(), second);
+  assert.equal(git('-C', fixCopy, 'rev-parse', 'HEAD~1').trim(), theirs, 'The repair rebases on the other machine\'s published change');
+  assert.equal(taskOf('fix-1').pr, 'https://github.com/acme/crew/pull/1');
+  assert.equal(taskOf('fix-1').merged, undefined);
+  assert.match(sm(['selfrepair', 'fix-1']).out, /already has a pull request/);
+  assert.equal(JSON.parse(fs.readFileSync(selfLog, 'utf8')).filter(x => x.a[1] === 'create').length, 1);
+  // Simulate the person's merge, then the explicit update that installs the repair.
+  git('-C', peer, 'fetch', '-q', 'origin', fix1.branch); git('-C', peer, 'merge', '-q', '--ff-only', 'FETCH_HEAD'); git('-C', peer, 'push', '-q', 'origin', 'HEAD:main');
+  assert.equal(sm(['update']).code, 0); assert.equal(head(tool), second);
+  assert.equal(fs.readFileSync(path.join(tool, 'crew', 'docs', 'tool.txt'), 'utf8').replace(/\r/g, ''), 'two\n');
   assert.equal(sm(['finish', 'fix-1']).code, 0);
-  assert.equal(git('-C', tool, 'branch', '--list', 'fix/fix-1').trim(), '', 'A published repair leaves no branch behind');
+  assert.equal(git('-C', tool, 'branch', '--list', fix1.branch).trim(), '', 'A published repair leaves no branch behind');
   assert.equal(crew(['spawn', 'no', '--project', 'crew:self', 'x'], { terminal: 'c2' }).code, 2, "crew's own source is not a project for ordinary tasks");
 
   // rollback: this machine goes back one step and stays there while that revision is the latest.
@@ -817,7 +959,9 @@ if (a[0] === 'run') {`));
   // A newer crew brings its coordinator rules into an existing home.
   fs.writeFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'old rules');
   assert.match(crew(['start'], { terminal: 'c2' }).out, /coordinator rules changed/);
-  assert.ok(fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8').includes('crew selfmerge'));
+  const repairRules = fs.readFileSync(path.join(homeDir, 'coordinator', 'AGENTS.md'), 'utf8').split('## When crew itself is wrong')[1];
+  for (const text of ['crew selfrepair', 'wait for their merge', 'crew update', 'After two refused repairs', 'crew rollback']) assert.ok(repairRules.includes(text), text);
+  assert.ok(!repairRules.includes('without asking the person')); assert.equal((repairRules.match(/crew selfmerge/g) || []).length, 1);
 
   // --- follow-ups, review and delivery ---------------------------------------------------
   assert.deepEqual(['https://github.com/acme/tool.git', 'git@github.com:acme/tool', 'https://github.com/acme/tool/', path.join(root, 'x.git')].map(githubOwner), ['acme', 'acme', 'acme', null]);
@@ -1685,7 +1829,7 @@ if (a[0] === '--version') process.exit(0);`);
     fs.writeFileSync(dispatch, JSON.stringify({ shared_quota: true, default: [{ harness: 'a1', model: 'openai-codex/gpt-x' }, { harness: 'claude', account: 'one@example.com' }] }));
   }
 
-  console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery, a repository\'s own delivery workflow), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery, a repository\'s own delivery workflow), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded pull request, update after merge, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
   }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

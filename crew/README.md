@@ -49,7 +49,7 @@ crew tell <id> "<message>"               send the worker a follow-up; it reports
 crew review <id> [who]                   start a reviewer on a ship task's branch
 crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
 crew fix [who] "<problem>"               start a worker that repairs crew itself
-crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
+crew selfrepair <id>                     check that repair and open its pull request
 crew update | crew rollback              bring this machine's crew up to date, or back one step
 ```
 
@@ -259,22 +259,46 @@ original spawn or creation to report, stop, failure, closure, or now. Relaunch d
 
 A defect in crew is handled like any other work: a worker fixes it on a branch, in a copy
 of crew's own source. The coordinator's rules tell it to do this instead of working around
-the defect, and without asking the person.
+the defect. The person reviews and merges the repair's pull request.
 
 | Command | What it does |
 | --- | --- |
 | `crew fix "<problem>"` | Starts a fixer (`fix-1`, `fix-2`, …) on crew's source. One at a time. Recent crash records are attached. |
-| `crew selfmerge <id>` | Publishes the repair to `main` of the source and updates this machine. |
+| `crew selfrepair <id>` | Checks the repair, pushes its branch, and opens and records its pull request against `main`. No merge or local update. |
 | `crew update` | Fast-forwards this machine's crew to the published `main`. |
 | `crew rollback` | Puts this machine back on the revision before its last update. |
 
-`crew selfmerge` is the only gate, so it refuses unless all of this holds: the fixer
-reported; nothing is uncommitted; the branch rebases cleanly onto the published `main`; every
-changed file is under `crew/`; and `node crew/crew.test.mjs` exits 0 in the fixer's copy. The
-push is an ordinary one (never forced), with the machine's own git credentials.
+`crew selfmerge` remains an alias for `crew selfrepair`. The fixer commits and stops;
+it does not push or open the pull request itself. Crew refuses delivery unless the fixer
+reported, nothing is uncommitted, the branch can incorporate the published `main`,
+and the whole suite passes in the fixer's copy (`node crew/crew.test.mjs`).
+
+Only the tool's own `crew.mjs`, `crew.test.mjs`, `README.md`, and files inside its `bin/`
+and `docs/` may change, with the allowlist written relative to the tool's own folder. Repository
+infrastructure such as `.github/`, root agent instructions, package metadata, scripts,
+licence, ignore and attribute files is excluded. The repository root README
+is also excluded; the tool's README is `crew/README.md`.
+
+Crew checks the shared-delivery pull request body with `delivery check-body --final` when
+installed. The body has Proposal, ticked repair Implementation, and Acceptance sections,
+without Automation. It pushes only the repair branch (never forcibly or directly to main)
+and opens a draft pull request with `gh`, using the repository owner's signed-in account
+when available, as `crew land` does. Repeating delivery prints the recorded link instead
+of opening another pull request. New repairs use `fix/<home tag>-<id>` so different homes'
+first repairs do not compete for `fix/fix-1`; existing tasks keep their recorded branch.
+`crew finish` keeps an unmerged repair's branch because it holds the commits; after merge
+the branch can go as for any other ship.
+
+If the branch push succeeds but opening the pull request fails, repeat `crew selfrepair`.
+Before publication, crew rebases private commits onto main. Once the branch is published,
+it brings newer main commits in with a merge instead, preserving the published repair's
+history for an ordinary push. If the published branch has history missing from this copy,
+crew asks the worker to reconcile it rather than rewriting it or recommending a blind retry.
 
 The copy Herdr installed (`~/.crew/core`, or `~/.crew/tool` from before 0.7) fast-forwards itself at each `crew start`, so a
-repair published from one machine reaches the others at their next session. A developer's
+repair reaches other machines only after the person merges its pull request, at their next
+session or an explicit `crew update`. Opening the pull request does not update any machine.
+After the merge and update, retry the command that failed. A developer's
 checkout never updates itself. After `crew rollback` the machine stays on the older revision
 until something newer than the one it left is published. `crew start` also rewrites the
 home's `AGENTS.md` when the rules of the running version differ, so do not keep notes there.
@@ -282,8 +306,9 @@ home's `AGENTS.md` when the rules of the running version differ, so do not keep 
 A command that fails with an unexpected error exits 70 and writes a record to
 `~/.crew/state/crashes/`.
 
-What this does not protect against: a repair that passes the suite and is still wrong. It
-reaches every machine at its next session; `crew rollback` is per machine.
+What this does not protect against: a repair that passes the suite, is merged, and is still
+wrong. It reaches installed machines at update or their next session; `crew rollback` is
+per machine.
 
 ## Limits
 
@@ -352,5 +377,7 @@ task with its copy waiting. The next finish or start retries safely, as the outp
 
 ## Tests
 
-`node crew/crew.test.mjs` runs everything against a fake Core.
+`node crew/crew.test.mjs` runs everything against a fake Core. Self-repair delivery,
+updates, and rollback use isolated repositories, fake GitHub responses, and local remotes;
+no real terminals or GitHub are touched.
 The suite needs only Node.js and git.
