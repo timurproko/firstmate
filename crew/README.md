@@ -36,12 +36,12 @@ crew project remove <name>               forget a project with no unfinished tas
 crew start | crew end                    take or release the home for this session
 crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
     who: [--agent a1|pi|claude] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]
-crew agents [--role scout|ship|review|fix] [who] [--json]   who would do the work now: profiles, quota, fallback order
-crew relaunch <id> [who] ["<why>"]       hand unfinished work to another agent in the same working copy
-crew wait <id>... [--timeout seconds] [--no-fallback]   block until each worker reports; one that ran out of quota is replaced
-crew status [--all] [--json]             tasks and their terminals
+crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   candidates and quota now, next choice marked
+crew relaunch <id> [who] ["<why>"]       end the current session and hand over working, stopped or failed work; copy stays
+crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; the owner can hand over quota/login stops
+crew status [--all] [--json]             tasks, terminals and elapsed time; JSON also shows delivery kind and standby eligibility
 crew stop <id> [--force]                 ask the worker to leave
-crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
+crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
 crew done [<id>]                         (worker) my report is written
 crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
@@ -66,12 +66,13 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
   space/tab labels. The agent starts with one instruction as its command-line argument
   ("read the brief…"), so nothing is typed into it.
 - **Report.** The worker writes `tasks/<id>/report.md` and runs `crew done` from its own
-  terminal. `crew wait` reads the task file once a second; it asks Core only to notice a
-  terminal that ended without a report.
+  terminal. `crew wait` reads the task file once a second. Every few seconds it asks Core
+  about ended terminals, missing agents, quota/login stops on non-working screens, and
+  questions or permissions that need a person.
 - **Finish.** A worker still working is never closed without `--force`. A1 leaves through
   its integration API (`session.exit`, proven by `session-unavailable`); other agents are
-  closed once idle. Then the terminal and the working copy are removed; the report and, for
-  `ship`, the branch stay.
+  closed once idle. The terminal is removed; the copy's return can be postponed. The report
+  stays, as do ship branches not proved merged.
 
 ## Agents
 
@@ -114,51 +115,74 @@ Claude profile.
 - **A floor** (`"floor": 50` on a profile, Firstmate's field) is the share of its quota, in percent, a profile
   keeps in reserve: once it is known to have less left, it yields to the next. It is not dropped but moved
   behind the others, so when everybody else is out it is still used and work goes on. The figure is the
-  tightest of the account's windows (for Claude: the session window or the week, whichever has less left).
+  minimum remaining percentage of applicable effective availability from quota-axi: account-wide
+  scopes and the model's or product's own bounds, not raw window percentages.
 - **A project's own list.** `"projects": { "<name>": [ ...profiles ] }` (or `{ "default": [...], "roles": {...} }`) is used
   for that project instead of the general lists: for a project where an agent of the general list cannot work.
   `"crew:self"` names crew's own source, which `crew fix` works on. Order of precedence: the project's role list,
-  the project's list, the general role list, `default`.
-- **The list is a fallback chain, in the person's order.** The order is never rearranged; a
-  candidate is only passed over for a known reason: its quota is used up, its login is no
-  longer accepted, or its program is not installed. A quota that could not be read is
-  uncertainty, not an empty account, and the candidate stays. What the command line names
-  (`--agent`, `--model`, `--effort`, `--account`, or `--rule <n>`) goes first and the
-  configured list stands behind it; `--no-fallback` keeps only that. Without the file, crew
-  starts `a1` as it always did.
-- **Quota** comes from quota-axi as it is. One ordinary reading covers the candidates that
+  the project's list, the general role list, `default`. `crew agents --project <name>` inspects it.
+- **The list is a fallback chain, in the person's order.** Only a floor changes that order:
+  normal and unknown quota come before below-floor candidates, preserving order within each
+  group. Exhausted quota, rejected logins and missing programs are passed over, not forgotten.
+  Unreadable quota is uncertainty, not an empty account. Candidates are deduplicated by agent,
+  model and account; profiles differing only in effort or floor are one attempt, first wins.
+- **Command-line choices.** `--agent` starts a clean profile. `--model`, `--effort` or
+  `--account` alone adjusts the first selected profile, keeping its other fields. That choice
+  goes first, with the selected list behind it. `--rule <n>` replaces the ordinary list with
+  that rule's `use`; numbers start at one, and crew does not match `when` text to tasks.
+  `--no-fallback` keeps one profile before Claude account expansion, so also name `--account`
+  for exactly one Claude account. Without a configured list, spawn defaults to `a1`, review to
+  `CREW_REVIEW_AGENT` or the author's agent, and fix to `CREW_FIX_AGENT` or `a1`. Configured
+  project, role and default lists take precedence over these legacy defaults.
+- **Quota** comes from quota-axi as it is. A profile's optional `provider` overrides the
+  quota-axi family, not the launch program's `--provider` (that comes from the model prefix).
+  One ordinary reading covers the candidates that
   spend from the machine's own logins (A1's are found through `PI_CODING_AGENT_DIR`). For each
   saved Claude account the plugin's helper writes that account's current login into an empty
   temporary folder (`session-dir.js refresh <account> --into <folder>`, which also rotates
   tokens that are about to expire, under the plugin's lock), quota-axi reads exactly that
   folder (`CLAUDE_CONFIG_DIR=<folder> quota-axi --provider claude --profile-only --json`), and
-  the folder is removed. With a single candidate nothing is read.
+  the folder is removed. Ordinary initial selection skips quota and installation checks for
+  one candidate; `crew agents` and hand-over check even one. `shared_quota: true` disables
+  quota reads; so do `CREW_NO_QUOTA=1` and a missing quota-axi. Installation checks still apply
+  when choosing among candidates or inspecting them.
 - **While work is under way.** `crew wait` looks at a worker that is no longer working: when
   the last lines of its screen say it stopped on a limit or a lost login, the next candidate
   of the task's chain is started in the same working copy and told to go on from what is
   there (`git status`, `git log`, the report). The task keeps its id; its record holds
-  `launch` (who works now), `chain` (who is left) and `fallbacks` (who stopped, and why).
+  `launch` (who works now), the complete original `candidates`, `chain` (untried choices in
+  original order), and `fallbacks` (who stopped, and why). At hand-over, all untried choices
+  are checked again, including those passed over earlier. Only the owning coordinator hands
+  over automatically, unless wait has `--no-fallback` or `CREW_NO_FALLBACK=1`.
   The same happens when the agent is gone: the terminal is still there but Core sees no agent in it and no
   report was written (a crash at start, an agent that left). That counts only 45 seconds after the worker
   was started (`CREW_DEAD_SECONDS`) and when two checks in a row see it, since a starting agent looks the same,
   and only for agents Core recognises in a terminal (`a1`, `claude`).
-  `crew relaunch <id>` does the same by hand. Only when nobody is left does the wait end with
-  "needs a person", and a spawn with "Nobody can take this work now", each with the reason
-  per candidate.
-- `crew agents` shows the list as it stands, with every candidate's quota; `crew status`
-  shows who works on each task.
+  A terminal that actually ended without a report instead fails the task, without hand-over.
+  Wait says "needs a person" when nobody else can work, or when the worker asks a question
+  or permission, even with candidates left. A spawn with nobody usable gives the reason per candidate.
+  `crew relaunch <id>` accepts working, stopped and failed tasks, not a reported task. It ends
+  the current session even if busy, without an idle test or `--force`; the copy stays. Without
+  selection flags it uses the saved list and excludes every tried candidate. A selection flag
+  rebuilds the list from current configuration and excludes only the current candidate.
+- `crew agents` shows rows in original order and marks the next choice, not a sorted fallback
+  list. `crew status` shows the current worker. JSON retains `standby` labels and adds
+  `standbyStatus`: each remaining candidate's recorded status, note, `passedOver` and
+  `checkedAt`. Status does not reread quota; an old task can only reconsider the chain it saved.
 
 ## Delivering a code change
 
 How a ship task is delivered depends on the project. There are three kinds, and the kind is
 decided once, at spawn, and recorded on the task so the worker's brief, `crew land` and
-`crew status` agree:
+`crew status --json` agree (`deliveryKind`: `gate`, `workflow` or `plain`; `null` for non-ships):
 
 - **Shared delivery workflow.** The repository follows the `change-delivery` skill. A project
   counts as one when it was added with `--workflow delivery`, or, without that choice, when
   `delivery` is installed and the worker's copy carries the shared instructions (`delivery
   instructions` reports a match, or `AGENTS.md` has the template's header line, which also
-  covers a repository on an older template). `--workflow plain` turns that off. The worker is
+  covers a repository on an older template). `--workflow plain` turns that off, not a selected
+  gate. Re-adding a project replaces its registration: omitted `--workflow` and `--gate-skip`
+  choices are dropped, so repeat options you want to keep. The worker is
   told to follow the skill. A change that needs a plan is planned first as a draft pull request,
   then the worker stops and reports. Every report starts with `Plan: <link>` or
   `Implementation: <link>`, and `crew done` records that stage and link. The coordinator approves
@@ -167,23 +191,30 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
   `implementation` without asking GitHub. `crew land` refuses a plan, and refuses while the copy
   has commits its pushed branch lacks (the worker pushes them). For an implementation it pushes
   nothing and opens nothing: it records the pull request (from the report's first line, else
-  `gh pr view <branch>`), moves the backlog item, and prints whether the pull request is a draft
-  and how many outcomes are ticked. The repository's bot marks it ready; the person merges.
-- **no-mistakes gate.** A project with the gate's remote (see below) is delivered by the gate;
-  `crew land` only records the pull request it opened. The gate wins over the workflow.
+  `gh pr view <branch>`) and moves the backlog item. When GitHub answers, it also prints draft
+  or ready, plus ticked outcomes if `## Implementation` has checkboxes. No summary does not
+  mean land failed. The repository's bot marks it ready; the person merges.
+- **no-mistakes gate.** A project with the gate's remote and the `no-mistakes` tool installed
+  is delivered by the gate; `crew land` only records its pull request. The gate wins over
+  the workflow. Without the tool, crew uses workflow detection or plain delivery instead.
 - **Plain project.** The task ends with commits on branch `<type>/<id>`. From there:
 
-- `crew review <id>` starts a read-only task `<id>-review` whose brief points at that branch.
-  Its report starts with `APPROVE` or `CHANGES NEEDED`. `--agent` (or `CREW_REVIEW_AGENT`)
-  picks a different agent for it.
+- `crew review <id>` starts a read-only task on that branch, usually `<id>-review` (truncated
+  at the ID limit, numbered if taken). Use the printed ID. Its report starts with `APPROVE`
+  or `CHANGES NEEDED`. An explicit `--agent` overrides a configured review list; the legacy
+  defaults above need not choose a different agent from the author.
 - `crew tell <id> "<message>"` pastes a follow-up into the worker's terminal and reopens the
   task; the worker rewrites its report and runs `crew done` again. Refused when the worker is
   gone or is waiting for a person.
 - `crew land <id>` pushes the branch to the project's `origin` and opens a pull request with
-  `gh`, against the branch the project folder is on (or the default branch), with the report
-  as its text. If the machine is signed in to GitHub as the repository's owner among several
+  `gh`, against the branch the project folder is on (or the default branch), with the first
+  200 report lines followed by task, agent and commit-count attribution. If the machine is
+  signed in to GitHub as the repository's owner among several
   accounts, that account is used. crew never merges a project's pull request.
 - `crew review` and `crew tell` work the same way for a workflow project's implementation.
+
+For every kind, first land requires a reported worker, an existing copy, and clean tracked
+and untracked files, even when it only records a link. An already-landed PR can return early.
 
 ## The tools Firstmate works with
 
@@ -196,15 +227,16 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
 | `lavish-axi` | The coordinator's rules say when to use it: showing a decision or long report as a page. |
 | `quota-axi` | Crew reads it, unchanged, when it chooses who works (see "Who does the work"): one ordinary reading for the machine's own logins, and one `--profile-only` reading per saved Claude account. |
-| `tasks-axi` | `crew backlog <tasks-axi command…>` keeps the durable list of work in `<home>/backlog.md`. A task with the same id as a backlog item moves it: In flight at spawn, Done at `land` (ship, with the pull request) or `finish` (scout). Reading is open to any session; changes are the owner's. |
+| `tasks-axi` | `crew backlog <tasks-axi command…>` keeps the durable list of work in `<home>/backlog.md`. A task with the same id as a backlog item moves it: In flight at spawn, Done at `land` (ship, with the pull request) or `finish` (reported scout, excluding reviewers except legacy treehouse tasks). Reading is open to any session; changes are the owner's. |
 | `delivery` | The shared delivery workflow's command. `crew spawn` asks it for the task's copy (`delivery start <type>/<id> --json`, or `--detach <id>` for a scout) and `crew finish` hands the copy back (`delivery finish <copy> --force`, after crew's own refusal of unsaved ship work and of a keep marker). The copy is cut from the project's published default branch. Whether copies are pooled is one setting of the machine, `delivery pool`. |
 | `treehouse` | The pool `delivery` takes reused copies from. Crew does not call it for new tasks; the `--treehouse` option of `crew project add` is accepted and ignored. |
-| `no-mistakes` | A project that has the gate (a `no-mistakes` remote) is delivered through it: the ship worker's brief tells it to run `no-mistakes axi run --yes --intent-file <task>` and follow it to a pull request. `crew land` then pushes nothing and only records that pull request (from the report, or from `gh pr view`). The gate's CI watch is left out by default (`--skip ci`): delivery ends at the open pull request. `crew project add <name> <folder> --gate-skip ci,lint` leaves out more steps (rebase, review, test, document, lint, ci) where they cannot run on the machine; `--gate-skip none` keeps the watch. |
+| `no-mistakes` | A project with a `no-mistakes` remote uses the installed tool for ship delivery; without the tool it falls back to workflow detection or plain delivery: the ship worker's brief tells it to run `no-mistakes axi run --yes --intent-file <task>` and follow it to a pull request. `crew land` then pushes nothing and only records that pull request (from the report, or from `gh pr view`). The gate's CI watch is left out by default (`--skip ci`): delivery ends at the open pull request. `crew project add <name> <folder> --gate-skip ci,lint` leaves out more steps (rebase, review, test, document, lint, ci) where they cannot run on the machine; `--gate-skip none` keeps the watch. |
 
 `CREW_TOOL_<NAME>` (for example `CREW_TOOL_TASKS_AXI`) names a tool's program explicitly;
 otherwise it is looked up on `PATH`.
 
-`crew status` shows the pull request link of a delivered task.
+`crew status` shows pull request links and elapsed time (`elapsedSeconds` in JSON), from the
+original spawn or creation to report, stop, failure, closure, or now. Relaunch does not reset it.
 
 ## Crew repairs itself
 
@@ -255,31 +287,51 @@ quiet folder), and on Windows a shell keeps the folder it was opened in even aft
 opened from a worker's tab, with their own agent in it, would be ended with the worker. So finish asks Core for
 the live terminals of this machine. When another one sits in the copy, with or without `--force`, finish still
 does everything else (stops the worker, removes its terminal, forgets the Claude folder trust, closes the task,
-moves the backlog item) and only postpones handing the copy back. The task record keeps `copyToReturn`, and the
+moves a reported scout's backlog item, excluding reviewers except legacy treehouse tasks) and
+only postpones handing the copy back. Ship backlog items move at land, not finish. The task record keeps `copyToReturn`, and the
 output names the terminal that holds the copy. Herdr's shell integration reports where a shell is now in the
 label `custom.cwd`; when that is elsewhere, the message says "opened in the copy, now in <folder>", so a tab
 that looks unrelated is recognised. Holding is still decided by Core's `cwd`, because that is what treehouse
 acts on.
 
-Crew has no background process, so the postponed copies are returned at the next `crew start` and at every
-`crew finish` (of any task): each one that no terminal holds any more goes back the way finish would have taken
-it (delivery, the legacy treehouse path, or `git worktree remove`), its merged branch is dropped, and one line
-says so. A copy deleted by hand meanwhile is pruned from git and its merged branch dropped. Copies still held
-wait for next time with one summary line; a failed return is reported in one line and never fails the command.
-Since somebody worked in the copy meanwhile, finish records what the copy held when it was postponed (changed,
-untracked and ignored files with their times, and the keep marker). The later return keeps the copy waiting,
-with a line that says why, when a file is new or changed since then, a `.artifacts/KEEP` marker appeared, a
+Crew has no background process. `crew start` and successful `crew finish` handling, including
+an already-closed task, sweep waiting copies; an earlier refusal skips the sweep. A free,
+unprotected copy goes back through delivery, legacy treehouse or git, and its proved-merged
+branch is dropped. A copy deleted by hand is pruned from git. A failed automatic return is
+reported but does not fail the triggering command. An explicit `crew finish <closed-id> --force`
+does refuse if Core is silent, a terminal holds the copy, or the return fails.
+
+Finish records changed and untracked file times and the keep marker before stopping. The
+non-forced ship refusal uses that same inspection, not an earlier clean result. Ignored
+entries get a stat-only walk, without following symlinks or reading contents. Each ignored
+root stores file count, newest modification time, total size and a metadata digest, so edits,
+additions and removals inside a large folder are visible without storing every file. There
+is no file-count limit; a 30-second budget or unreadable entry records an incomplete snapshot
+and keeps the copy waiting with the reason. Older snapshots without this protection also wait.
+The later return keeps the copy waiting, with a reason, when work changed since the snapshot,
+a `.artifacts/KEEP` marker appeared, a
 rebase, merge, cherry-pick, revert, bisect or `git worktree lock` began there, or the copy's HEAD reached a
 commit that no branch or tag holds (its own reflog is read, so moving back does not hide it), for any kind of
 task. Stashes and branches made in the copy live in the repository and outlive it. A `--force` given at finish covers only what was there then. `crew finish <id>` on such a
-closed task tries its copy again and says how it stands; `crew finish <id> --force` discards what was found and
-returns the copy, never while a terminal holds it. A Core that does not answer keeps every waiting copy and
-says which. A project keeps its registration while one of its finished tasks still waits for its copy. `crew status --all` lists such a task with who holds its copy; plain `crew status`
-ends with a line counting them.
+closed task tries its copy again and says how it stands. `crew finish <id> --force` accepts what
+is there now and can cancel a still-busy worker whose stop was pending, but never another
+terminal. It compares again after any retried stop/removal; known newer writes keep waiting.
+If inspection cannot be completed, the current `--force` authorizes discarding the contents
+unseen instead. Stop/removal confirmation and the other-terminal check still apply; output
+explicitly says when work was discarded unseen. Automatic retries never inherit earlier force. A Core that does not answer keeps every waiting copy and
+says which. A project keeps its registration while a finished task waits for its copy.
+`crew status --all` shows holders, new work, keep/history protections, a free copy, or an
+unanswered Core query. Unconfirmed worker stops and terminal removals are shown as pending,
+never free; reading status never returns a copy. JSON's `copyToReturn` has `why`, `kept`,
+`pending` and `free`. Plain status ends with a count of waiting copies.
 
-The refusals that protect work come first and are unchanged: uncommitted ship work, the `.artifacts/KEEP`
-marker, a worker still working without `--force`, and a Core that does not answer (about the worker or the
-terminal listing) all stop finish with nothing removed.
+Protective refusals come before stopping: uncommitted ship work, a failed work inspection,
+`.artifacts/KEEP`, a busy worker without `--force`, or an unanswered initial Core query leave
+the worker and copy intact. Before immediate return, the whole snapshot is compared after
+stopping and terminal removal, including ignored files and scout scratch, even with `--force`.
+Work written while leaving postpones return rather than refusing with the worker gone. A silent
+second terminal listing, unconfirmed stop or terminal removal, or failed return also leaves a closed
+task with its copy waiting. The next finish or start retries safely, as the output says.
 
 ## Tests
 

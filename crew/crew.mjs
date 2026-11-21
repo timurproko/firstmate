@@ -6,12 +6,13 @@
 // short process talking to Core through `hc`; there is no watcher, no hook and no
 // background service. See crew/README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.10.0';
+export const VERSION = '0.10.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -597,7 +598,8 @@ export function cleanProfile(raw, where = '') {
     out.floor = floor;
   }
   // Firstmate's optional `provider` is the quota-axi family the profile spends from.
-  if (typeof p.provider === 'string' && WORD.test(p.provider)) out.family = p.provider;
+  const provider = p.provider ?? p.family; // `family` is the normalized form in saved candidates.
+  if (typeof provider === 'string' && WORD.test(provider)) out.family = provider;
   return out;
 }
 
@@ -749,20 +751,21 @@ function agentInstalled(harness, env = process.env) {
   return !dirs.length || dirs.some(dir => names.some(name => fs.existsSync(path.join(dir, name))));
 }
 
-// Reads the candidates' quota and keeps, in their own order, those that can take work now.
-// The order is the person's preference and is not rearranged; a candidate is only dropped
-// for a known reason. One known to be under its own `floor` is kept but goes behind the
+// Reads quota and selects candidates that can work now. Only floors rearrange the order;
+// each group otherwise keeps the person's preference. Known exclusions apply to this
+// selection, never to the saved original chain. One known to be under its own `floor` is kept but goes behind the
 // others, in order: it is saved for when nobody else can work, so a floor never stops work.
-// With a single candidate there is nothing to choose and nothing is read.
+// Ordinary initial selection skips reads for one candidate; agents and relaunch check it.
 function usableCandidates(candidates, { shared = false, always = false, env = process.env } = {}) {
   const check = candidates.length > 1 || always, facts = check ? quotaFacts(candidates, { shared, env }) : new Map();
   if (check) for (const c of candidates) if (!agentInstalled(c.harness, env)) facts.set(pickKey(c), { status: 'missing', note: `${AGENTS[c.harness].command} is not installed on this machine` });
   const rows = candidates.map(c => ({ ...c, fact: facts.get(pickKey(c)) ?? { status: 'unknown', note: 'not checked: the only candidate' } }));
   for (const r of rows) if (r.fact.status === 'ok' && r.floor !== undefined && r.fact.remaining < r.floor) r.fact = { ...r.fact, status: 'low', note: `${r.fact.note}, under its floor of ${r.floor}%` };
-  const strip = ({ fact, family, ...c }) => c;
+  const strip = ({ fact, ...c }) => c;
   return { rows, usable: [...rows.filter(r => ['ok', 'unknown'].includes(r.fact.status)), ...rows.filter(r => r.fact.status === 'low')].map(strip) };
 }
 const candidateLines = rows => rows.map(r => `  ${pickLabel(r)} - ${r.fact.note}`).join('\n');
+const candidateChecks = rows => ({ checkedAt: now(), facts: Object.fromEntries(rows.map(r => [pickKey(r), r.fact])) });
 
 // Who takes a new piece of work, and who stands behind them.
 function chooseWorker(h, role, flags, legacy, project = null) {
@@ -772,7 +775,7 @@ function chooseWorker(h, role, flags, legacy, project = null) {
   const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
   for (const r of rows) { if (r === taken) break; console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`); }
   if (taken.fact.status === 'low') console.log(`${pickLabel(taken)} is under its floor (${taken.fact.note}), but nobody above their floor can take the work`);
-  return { pick: usable[0], rest: usable.slice(1), source };
+  return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source };
 }
 
 function cmdAgents(args) {
@@ -994,8 +997,9 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(h.worktrees, { recursive: true });
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
-    // What the worker was started with, and the candidates left to take over from it.
-    launch: { ...pick, source: chosen.source }, chain: chosen.rest,
+    // Keep the original order, even for candidates that cannot work now: hand-over rereads
+    // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
+    launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
   saveTask(h, record);
 
@@ -1036,7 +1040,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // writing the record this command started with over an accepted report.
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
-  const detail = pickLabel(pick) !== pick.harness || chosen.rest.length ? `; ${pickLabel(pick)}${chosen.rest.length ? `, ${chosen.rest.length} more can take over` : ''}` : '';
+  const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
   console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}`);
   backlogMove(h, id, 'start');
 }
@@ -1051,10 +1055,15 @@ function relaunch(h, task, reason, flags = null) {
   const config = dispatchConfig(h);
   // The task's own chain as it stood at launch; a task from before there were chains, or an
   // explicit choice on the command line, takes the configured one as it stands now.
-  const candidates = (named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.chain).filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
-  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
-  if (!usable.length) return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+  const original = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.candidates ?? task.chain;
+  const candidates = original.filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
+  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true }), checks = candidateChecks(rows);
+  if (!usable.length) {
+    saveTask(h, { ...task, candidateChecks: checks });
+    return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+  }
   const [pick, ...rest] = usable;
+  const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
   if (task.terminal) {
     let seen = probe(task.terminal).state;
     if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; task ${task.id} was left as it is. Try again.`, 4);
@@ -1069,7 +1078,7 @@ function relaunch(h, task, reason, flags = null) {
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const { error, ...kept } = task;
-  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, chain: rest, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
+  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
     fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
@@ -1207,7 +1216,7 @@ function a1Api(type, target) {
 // `stopped: true` is returned only for something that was observed: Core says the terminal
 // is finished or gone, or A1 itself says the session no longer exists. A Core that does not
 // answer is never read as "gone".
-function stopWorker(task, { force = false } = {}) {
+function stopWorker(task, { force = false, onStop = null } = {}) {
   let { state, t } = probe(task.terminal);
   if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
   if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
@@ -1225,17 +1234,22 @@ function stopWorker(task, { force = false } = {}) {
     const target = { sessionId: t.labels['a1.session'], runtimeId: t.labels['a1.runtime'] };
     const reply = a1Api('session.exit', target);
     if (reply?.success) {
+      onStop?.();
       for (let i = 0; i < 15; i++) {
         if (a1Api('session.lifecycle', target)?.error?.code === 'session-unavailable') return { stopped: true, how: 'a1 exit api' };
         sleep(1000);
       }
       return { stopped: false, how: 'a1 admitted the exit but is still there' };
     }
+    // No reply cannot prove the exit request was rejected; only an explicit rejection can
+    // still be a refusal with the worker intact. Finish must retain an unconfirmed attempt.
+    if (onStop && !reply && !force) { onStop(); return { stopped: false, how: 'A1 did not confirm the exit request' }; }
     if (!force) refuse(`A1 refused to exit (${reply?.error?.code ?? 'no answer'}). Nothing was closed.`, 6);
   }
   // Every other agent (and a forced stop of an A1 that would not leave) is stopped by ending
   // the terminal's program, then asking Core again: only a terminal seen finished or gone
   // counts.
+  onStop?.();
   hc(['kill', task.terminal]);
   for (let i = 0; i < 10; i++) {
     const after = probe(task.terminal).state;
@@ -1356,12 +1370,12 @@ const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : 
 
 // Work in a copy that its removal would lose: a ship task's uncommitted or untracked files
 // (its branch keeps only commits) and the shared delivery workflow's keep marker. A scout is
-// read-only by its brief; what it leaves behind is scratch. { dirty: files or null when git
-// could not tell, keep }.
-function workInCopy(task) {
-  let dirty = [];
-  if (task.kind === 'ship' && fs.existsSync(path.join(task.worktree, '.git'))) dirty = gitStatus(task.worktree)?.map(e => e.file) ?? null;
-  return { dirty, keep: fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP')) };
+// read-only by its brief; what it leaves behind is scratch. Derive protection from the exact
+// snapshot that will become the accepted baseline, never an earlier clean inspection.
+// { dirty: files or null when git could not tell, keep }.
+function workInCopy(task, snapshot) {
+  const dirty = task.kind === 'ship' ? snapshot ? Object.keys(snapshot.files) : null : [];
+  return { dirty, keep: snapshot ? snapshot.keep !== null : fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP')) };
 }
 // `git status` of a folder as [{ code, file }], or null when git could not tell. Read with -z:
 // the text form quotes names with non-ASCII or special characters, and such a quoted name is
@@ -1379,20 +1393,52 @@ function gitStatus(folder, ...more) {
   return entries;
 }
 const listFiles = files => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ', …' : ''}`;
-// What a postponed copy held when finish accepted to discard it: every changed or untracked
-// file (any kind of task) with its modification time, and the keep marker's. Finish only
-// accepted what was there then (a scout's scratch, or what --force covered); null when git
-// could not tell.
-function snapshotCopy(folder) {
-  const stamp = p => { try { return fs.statSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
-  const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : []);
-  // Ignored files go with the copy too (a forced removal takes everything), so they count;
-  // they are listed by folder, whose time changes when something is written into it.
-  const changed = git('--untracked-files=all'), ignored = git('--ignored');
-  if (!changed || !ignored) return null;
-  const files = {};
-  for (const { file } of [...changed, ...ignored.filter(e => e.code === '!!')]) files[file] = stamp(file);
-  return { files, keep: stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
+// Metadata only: one fingerprint per ignored root, even for a large dependency tree. The
+// digest includes names and individual metadata: count/max/size alone can hide a rename,
+// a same-size edit below the newest timestamp, or two changes whose sizes cancel out.
+// Never follow symlinks or read contents. A slow/unreadable walk is uncertainty, not clean.
+export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
+  const deadline = performance.now() + budgetMs;
+  const stamp = p => { try { return fs.lstatSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
+  // An existing copy without its Git marker is uninspectable, not empty. A copy already
+  // gone is handled separately by finish/return and has no contents left to compare.
+  const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : fs.existsSync(folder) ? null : []);
+  const changed = git('--untracked-files=all'), roots = git('--ignored');
+  if (!changed || !roots) return null;
+  // Filenames are arbitrary keys, including __proto__, constructor and toString.
+  const files = Object.create(null), ignored = Object.create(null);
+  let incomplete = null;
+  const checkTime = () => { if (performance.now() >= deadline) throw new Error('ignored walk exceeded its time budget'); };
+  try {
+    for (const { code, file } of changed) {
+      files[file] = stamp(file);
+      if (files[file] === null && !code.includes('D')) throw new Error(`could not read ${file}`);
+    }
+    for (const { file } of roots.filter(e => e.code === '!!')) {
+      const hash = createHash('sha256'), summary = { files: 0, newestMtimeMs: 0, totalSize: 0 };
+      const walk = name => {
+        checkTime();
+        let stat;
+        try { stat = fs.lstatSync(path.join(folder, name)); } catch { throw new Error(`could not read ${name}`); }
+        hash.update(JSON.stringify([name, stat.mode, stat.size, stat.mtimeMs, stat.ctimeMs]));
+        if (stat.isDirectory() && !stat.isSymbolicLink()) {
+          let names;
+          try { names = fs.readdirSync(path.join(folder, name)).sort(); } catch { throw new Error(`could not read ${name}`); }
+          for (const child of names) walk(`${name.replace(/\/$/, '')}/${child}`);
+        } else {
+          summary.files++;
+          summary.newestMtimeMs = Math.max(summary.newestMtimeMs, stat.mtimeMs);
+          summary.totalSize += stat.size;
+        }
+        checkTime();
+      };
+      // Strip git's trailing slash before lstat: otherwise a directory symlink can be followed.
+      walk(file.replace(/\/$/, ''));
+      ignored[file] = { ...summary, metadata: hash.digest('hex') };
+    }
+    checkTime();
+  } catch (error) { incomplete = error.message; }
+  return { files, ignoredVersion: 1, ignored, incomplete, keep: stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
 }
 // Where the copy's history stood: its HEAD and branch, how many entries its own HEAD reflog
 // has (a linked copy's reflog is its own and goes with it), and which git operations are
@@ -1423,17 +1469,25 @@ function commitsOnlyInCopy(folder, before) {
 // is new or changed since finish's snapshot, or a keep marker that was not there then. Only
 // `crew finish <id> --force` on the closed task discards that. { kept, leftovers }: `kept`
 // says why it waits (or null), `leftovers` that finish's accepted files are still there.
-function checkWaitingCopy(task) {
-  const seen = snapshotCopy(task.worktree), before = task.copyToReturn.left ?? { files: {}, keep: null };
-  if (!seen) return { kept: { why: 'uncommitted work', text: 'it could not be checked for work written since finish' }, leftovers: false };
+function checkWaitingCopy(task, before = task.copyToReturn?.left, { discardUnseen = false } = {}) {
+  const seen = snapshotCopy(task.worktree);
+  const uncertain = !seen ? 'it could not be checked for work written since finish' : !before ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
+  // Only this invocation's explicit force authorizes discarding unseen contents. A failed
+  // comparison is not proof of new work; without that authority it still protects the copy.
+  if (uncertain) return { kept: discardUnseen ? null : { why: 'uncommitted work', text: !seen ? uncertain : `changes cannot be determined: ${uncertain}` }, leftovers: true, unseen: discardUnseen ? uncertain : null };
   if (seen.keep !== null && seen.keep !== before.keep) return { kept: { why: 'marked to keep', text: 'it was marked to keep by .artifacts/KEEP since finish' }, leftovers: true };
-  const added = Object.keys(seen.files).filter(file => !(file in before.files) || before.files[file] !== seen.files[file]);
+  // JSON-parsed older snapshots have ordinary-object dictionaries. Copy their own keys
+  // into prototype-free records before comparing, without changing the saved format.
+  const beforeFiles = Object.assign(Object.create(null), before.files), beforeIgnored = Object.assign(Object.create(null), before.ignored);
+  const ignored = new Set([...Object.keys(beforeIgnored), ...Object.keys(seen.ignored)]);
+  const added = [...Object.keys(seen.files).filter(file => !Object.hasOwn(beforeFiles, file) || beforeFiles[file] !== seen.files[file]),
+    ...[...ignored].filter(file => JSON.stringify(beforeIgnored[file]) !== JSON.stringify(seen.ignored[file]))];
   if (added.length) return { kept: { why: 'uncommitted work', text: `it has work written since finish (${listFiles(added)})` }, leftovers: true };
   const started = seen.operations.filter(name => !(before.operations ?? []).includes(name));
   if (started.length) return { kept: { why: 'operation in progress', text: `it has ${started.map(name => OPERATIONS[name]).join(' and ')} since finish` }, leftovers: true };
   const commits = commitsOnlyInCopy(task.worktree, before);
   if (commits.length) return { kept: { why: 'commits', text: `it has commits made since finish that no branch holds (${listFiles(commits.map(sha => sha.slice(0, 8)))})` }, leftovers: true };
-  return { kept: null, leftovers: Object.keys(seen.files).length > 0 || seen.keep !== null };
+  return { kept: null, leftovers: Object.keys(seen.files).length > 0 || Object.keys(seen.ignored).length > 0 || seen.keep !== null };
 }
 
 // Copies whose return finish postponed because another terminal held them. They go back
@@ -1458,12 +1512,47 @@ function returnWaitingCopies(h, { skip = null } = {}) {
   }
   if (held) console.log(`${held} working ${held === 1 ? 'copy' : 'copies'} of finished tasks still held by another terminal; crew returns ${held === 1 ? 'it' : 'them'} once nothing holds ${held === 1 ? 'it' : 'them'}`);
 }
+// Called only after a proved worker stop (or its persisted retry). A1's API exit can leave
+// the wrapper shell live: end that shell too. Unknown answers still postpone removal.
+function removeStoppedTerminal(task) {
+  try {
+    let seen = probe(task.terminal).state;
+    if (seen === 'live') { hc(['kill', task.terminal]); seen = probe(task.terminal).state; }
+    if (seen === 'finished') { hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
+    return seen === 'absent' ? null : { state: seen === 'unknown' ? 'silent' : 'held',
+      text: `Core ${seen === 'unknown' ? 'did not confirm removal of' : 'still has'} worker terminal ${task.terminal}` };
+  } catch (error) {
+    if (!(error instanceof Refusal)) throw error;
+    return { state: 'silent', text: error.message };
+  }
+}
 // One postponed copy, handed back the way finish would have: never while a terminal holds it,
 // and not over work written or marked in it since finish, unless the person asks for that
 // now (`crew finish <id> --force` on the closed task). A --force given at finish covered only
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
 function returnWaiting(h, task, { force = false } = {}) {
   const { copyToReturn, ...rest } = task, project = projectOf(h, task);
+  // A new explicit force accepts what is here now, not work written during the stop/removal
+  // it is about to retry. Keep the original durable baseline if more work appears meanwhile.
+  const accepted = force ? snapshotCopy(task.worktree) : copyToReturn.left;
+  if (copyToReturn.stopPending) {
+    // The stop was requested but not confirmed. Reapply idle/busy protection before any
+    // further lifecycle action; uncertainty never grants permission to discard the copy.
+    try {
+      const result = stopWorker(task, { force });
+      if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
+      copyToReturn.stopPending = false;
+      saveTask(h, task);
+    } catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      return { state: error.exitCode === 4 ? 'silent' : 'held', line: `The working copy of ${task.id} is kept: ${error.message}` };
+    }
+  }
+  if (copyToReturn.cleanupTerminal) {
+    const pending = removeStoppedTerminal(task);
+    if (pending) return { state: pending.state, line: `${pending.text}; the working copy of ${task.id} is kept. The next crew finish or crew start retries it.` };
+    saveTask(h, { ...task, copyToReturn: { ...copyToReturn, cleanupTerminal: false } });
+  }
   if (!fs.existsSync(task.worktree)) {
     // Removed by hand: git still lists it and the merged branch is still there.
     if (project?.path) run('git', ['-C', project.path, 'worktree', 'prune']);
@@ -1473,13 +1562,13 @@ function returnWaiting(h, task, { force = false } = {}) {
   const holders = otherTerminalsIn(task.worktree, task.terminal);
   if (holders === null) return { state: 'silent', line: `${CORE_SILENT} the terminals in ${task.worktree}; the working copy of ${task.id} was kept. Try again.` };
   if (holders.length) return { state: 'held', line: `the working copy of ${task.id} is still held by ${describeHolders(holders, task.worktree)}; nothing was removed.` };
-  const check = force ? { kept: null, leftovers: true } : checkWaitingCopy(task);
-  if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. \`crew finish ${task.id} --force\` discards it and returns the copy.` };
+  const check = checkWaitingCopy(task, accepted, { discardUnseen: force });
+  if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. ${force ? 'The copy changed during this forced attempt; stop writes to it before retrying force.' : `\`crew finish ${task.id} --force\` discards its present contents and returns the copy.`}` };
   // What is left was accepted at finish (or now): discarding it is what was asked.
   const back = returnCopy(task, project, { force: check.leftovers });
   if (!back.ok) return { state: 'failed', line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
-  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}` };
+  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}` };
 }
 
 function cmdFinish(args) {
@@ -1507,39 +1596,47 @@ function cmdFinish(args) {
   // stays until it is free, and everything else is finished. Core is asked before anything is
   // stopped, so a Core that cannot list its terminals still leaves everything as it was.
   if (fs.existsSync(task.worktree) && otherTerminalsIn(task.worktree, task.terminal) === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
-  const result = stopWorker(task, { force });
-  if (!result.stopped) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
-  // A self-fix works on crew's own source, which is not a registered project.
-  const project = projectOf(h, task);
-  // Work that exists only in the working copy is lost when the copy goes, so it is not
-  // cleaned up unless discarding it was asked for (see workInCopy).
-  const work = force ? { dirty: [], keep: false } : workInCopy(task);
+  // Establish the accepted baseline first, and derive the protective refusal from it.
+  // A separate earlier clean result must never authorize dirty work found by this snapshot.
+  const left = snapshotCopy(task.worktree);
+  const work = force ? { dirty: [], keep: false } : workInCopy(task, left);
   if (work.dirty === null) refuse(`Could not check ${task.worktree} for uncommitted work; nothing was removed. Pass --force to discard it unseen.`, 6);
   if (work.dirty.length) refuse(`Task ${id} has uncommitted work in ${task.worktree} (${listFiles(work.dirty)}). Nothing was removed. Commit it there, or pass --force to discard it.`, 6);
   // A copy marked to keep (the shared delivery workflow's marker) is not removed unasked.
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
-  if (task.terminal) {
-    let seen = probe(task.terminal).state;
-    if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; the working copy was kept. Try again.`, 4);
-    if (seen !== 'absent') { hc(['kill', task.terminal]); hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
-    if (seen !== 'absent') refuse(`Core ${seen === 'unknown' ? 'did not confirm that' : 'still has'} terminal ${task.terminal}${seen === 'unknown' ? ' is gone' : ''}; the working copy was kept.`, 6);
+  let attempted = false, result;
+  try { result = stopWorker(task, { force, onStop: () => { attempted = true; } }); }
+  catch (error) {
+    if (!attempted || !(error instanceof Refusal)) throw error;
+    result = { stopped: false, how: error.message };
   }
+  if (!result.stopped && !attempted) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
+  const project = projectOf(h, task);
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
   const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
-  // Asked again now that the worker's own terminal is gone: a tab may have been opened since.
-  // Treehouse would end it with the copy, so the copy waits and only its return is postponed.
-  const holders = fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
-  if (holders === null || holders.length) {
-    const by = holders === null ? 'Core did not say which terminals are in it' : `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it`;
-    forget();
-    saveTask(h, { ...closed, copyToReturn: { since: now(), heldBy: holders?.map(t => t.address) ?? [], left: snapshotCopy(task.worktree) } });
-    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${by}) and crew returns it by itself once nothing holds it; report kept at ${task.report}`);
+  // Record the remaining work before asking Core again, so an interrupted removal is retried.
+  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, cleanupTerminal: true } };
+  saveTask(h, waiting);
+  const cleanup = result.stopped ? removeStoppedTerminal(task) : { text: `its worker stop is not confirmed (${result.how})` };
+  waiting.copyToReturn.cleanupTerminal = Boolean(cleanup);
+  const holders = cleanup ? null : fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
+  let reason = cleanup?.text ?? (holders === null ? 'Core did not say which terminals are in it' : holders.length ? `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it` : null);
+  // Only after stopping and removing the terminal can we compare everything written while
+  // leaving, including ignored files and scout scratch. Even force accepted only the pre-stop
+  // contents. Known changes postpone return with the original baseline. An uninspectable
+  // copy needs explicit discard-unseen authority; never infer that authority for a retry.
+  const comparison = reason ? null : checkWaitingCopy(waiting, left, { discardUnseen: force });
+  reason ??= comparison?.kept?.text ?? null;
+  const back = reason ? null : returnCopy(task, project, { force });
+  reason ??= back && !back.ok ? back.why : null;
+  forget();
+  if (reason) {
+    waiting.copyToReturn.heldBy = holders?.map(t => t.address) ?? [];
+    saveTask(h, waiting);
+    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}`);
   } else {
-    const back = returnCopy(task, project, { force });
-    if (!back.ok) refuse(back.why, 6);
-    forget();
     saveTask(h, closed);
-    console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
+    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
   }
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
   if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
@@ -1883,9 +1980,11 @@ function cmdStatus(args) {
   const currentTime = Date.now();
   const tasks = allTasks(h).filter(t => all || t.state !== 'closed').map(t => {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
-    return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
+    return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel),
+      standbyStatus: (t.chain ?? []).map(c => { const fact = t.candidateChecks?.facts?.[pickKey(c)]; return { ...c, label: pickLabel(c), status: fact?.status ?? 'unknown', note: fact?.note ?? 'no recorded reading', remaining: fact?.remaining ?? null, passedOver: Boolean(fact && !['ok', 'unknown'].includes(fact.status)), checkedAt: t.candidateChecks?.checkedAt ?? null }; }), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
       core: core ? { state: core.state, agent: core.status?.app ?? null, status: core.status?.state ?? null } : null,
       report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime),
+      deliveryKind: t.kind === 'ship' ? t.gate ? 'gate' : t.workflow ? 'workflow' : 'plain' : null,
       ...(t.workflow ? { workflow: t.workflow, stage: t.stage ?? null } : {}),
       ...(t.copyToReturn ? { copyToReturn: copyWaiting(t) } : {}) };
   });
@@ -1897,15 +1996,17 @@ function cmdStatus(args) {
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
   // A workflow task's stage is what its last report said it is; GitHub is not asked here.
   const stageOf = t => (!t.stage ? '' : t.stage === 'plan' && t.state === 'reported' ? ' (plan awaiting approval)' : ` (${t.stage})`);
-  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.pending ? `waits: ${t.copyToReturn.pending}${t.copyToReturn.heldBy ? `; held by ${t.copyToReturn.heldBy}` : ''}` : t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
   if (waiting) console.log(`${waiting} working ${waiting === 1 ? 'copy' : 'copies'} of finished tasks still to be returned (crew status --all)`);
 }
 // Where a postponed copy stands now, asked of Core: { worktree, since, heldBy, free }.
 function copyWaiting(task) {
   const holders = fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
-  const free = Array.isArray(holders) && !holders.length, kept = free && fs.existsSync(task.worktree) ? checkWaitingCopy(task).kept : null;
-  const why = holders === null ? 'unknown' : holders.length ? 'held' : kept ? kept.why : 'free';
-  return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, free: why === 'free' };
+  const { stopPending, cleanupTerminal } = task.copyToReturn;
+  const pending = stopPending ? 'its worker stop is not confirmed' : cleanupTerminal ? 'its worker terminal removal is not confirmed' : null;
+  const free = !pending && Array.isArray(holders) && !holders.length, kept = free && fs.existsSync(task.worktree) ? checkWaitingCopy(task).kept : null;
+  const why = stopPending ? 'stop pending' : cleanupTerminal ? 'terminal removal pending' : holders === null ? 'unknown' : holders.length ? 'held' : kept ? kept.why : 'free';
+  return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, pending, free: why === 'free' };
 }
 
 const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
@@ -1913,26 +2014,48 @@ const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmd
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
   crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
+      re-adding replaces the registration: omitted workflow and gate-skip choices are dropped
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
       who: ${PICK_USAGE}
-  crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   who would do the work now: profiles, quota, fallback order
-  crew relaunch <id> [who] ["<why>"]       hand unfinished work to another agent in the same working copy
-  crew wait <id>... [--timeout seconds] [--no-fallback]   block until each worker reports; one that ran out of quota is replaced
-  crew status [--all] [--json]             tasks and their terminals
+  crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked
+  crew relaunch <id> [who] ["<why>"]       end the current session, even busy; hand over working, stopped or failed work; copy stays
+      no choice: reread all untried saved candidates, including earlier skips; a choice rebuilds the list and excludes only the current worker
+  crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; the owner can hand over quota/login stops
+      CREW_NO_FALLBACK=1 also disables hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
+  crew status [--all] [--json]             tasks, terminals, PR links and elapsed time; --all also shows why finished copies wait
+      JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
   crew stop <id> [--force]                 ask the worker to leave
-  crew finish <id> [--force]               stop it, remove its terminal, working copy and merged branch
+  crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
+      protective refusals use the accepted baseline before stop; later uncertainty postpones return; status alone returns nothing
+      current --force can discard uninspectable contents unseen, but never override an unconfirmed stop/removal or another terminal
+      sweeps follow successful handling only; forced finish of a closed task refuses held, silent or failed returns
+      backlog: only reported scouts move here (not reviewers, except legacy treehouse); ships move at land
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
-  crew review <id> [who]                   start a reviewer on a ship task's branch
-  crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
+  crew review <id> [who]                   start a read-only reviewer; use its printed ID (truncated or numbered when needed)
+  crew land <id> [--title "<title>"]       push/open a plain PR, or record the workflow/gate PR
+      first land requires a reported worker, existing copy and clean tracked/untracked files; an already-landed PR can return early
+      plain PR text uses the first 200 report lines plus attribution; workflow draft/outcome summary is best-effort
   crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
   crew fix [who] "<problem>"               start a worker that repairs crew itself
   crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
-  crew update | crew rollback              bring this machine's crew up to date, or back one step`;
+  crew update | crew rollback              bring this machine's crew up to date, or back one step
+
+  Choices: --agent starts clean; model/effort/account alone modify the first selected profile.
+  --rule replaces the list by its one-based number; descriptions are not matched to tasks.
+  --no-fallback keeps one profile before Claude account expansion; also name --account for one login.
+  Lists override legacy defaults: spawn a1, review CREW_REVIEW_AGENT or author, fix CREW_FIX_AGENT or a1.
+  Only floors rearrange candidates: normal/unknown before low, order kept within groups.
+  Profiles sharing agent/model/account are one attempt even if effort or floor differs.
+  Profile provider selects the quota family, not the launch provider; floors use applicable effective availability.
+  Initial selection skips reads for one candidate; agents/hand-over check even one. Shared quota,
+  CREW_NO_QUOTA=1 or missing quota-axi skips quota reads, not applicable installation checks.
+  Gate delivery needs both the no-mistakes remote and installed tool; otherwise workflow/plain.
+`;
 
 export function main(argv) {
   const [name, ...args] = argv;

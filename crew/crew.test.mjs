@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main } from './crew.mjs';
+import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -60,8 +60,8 @@ if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forE
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
-else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; save(); }
-else if (a[0] === 'rm') { delete w.terminals[a.at(-1)]; save(); }
+else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); if (w.silentAfterKill) w.silent = true; save(); }
+else if (a[0] === 'rm') { if (!w.failRm) delete w.terminals[a.at(-1)]; if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
@@ -90,7 +90,331 @@ const commit = (folder, files, message) => {
   return git('-C', folder, 'rev-parse', 'HEAD').trim();
 };
 
+// Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
+const gapTests = {};
+function gapFixture(name, extra = {}) {
+  const dir = path.join(root, `gap-${name}`), home = path.join(dir, 'home'), repo = path.join(dir, 'repo');
+  fs.mkdirSync(repo, { recursive: true }); git('-C', repo, 'init', '-q');
+  commit(repo, { 'README.md': 'baseline\n', '.gitignore': 'scratch/\nloose.log\n' }, 'baseline');
+  const owner = `owner-${name}`, w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const call = (args, env = {}) => crew(args, { cwd: home, terminal: owner, env: { CREW_CLAUDE_ACCOUNTS: '', ...extra, ...env } });
+  assert.equal(call(['init', home]).code, 0);
+  assert.equal(call(['project', 'add', 'demo', repo]).code, 0);
+  assert.equal(call(['start']).code, 0);
+  const taskFile = id => path.join(home, 'tasks', id, 'task.json');
+  const task = id => JSON.parse(fs.readFileSync(taskFile(id), 'utf8'));
+  const save = t => fs.writeFileSync(taskFile(t.id), JSON.stringify(t));
+  const spawn = (id, flags = []) => { const r = call(['spawn', id, '--project', 'demo', ...flags, 'Count lines.']); assert.equal(r.code, 0, r.out); return task(id); };
+  const guest = t => { const w = readWorld(); w.terminals[`guest-${name}`] = { address: `guest-${name}`, state: 'live', labels: {}, cwd: t.worktree }; fs.writeFileSync(world, JSON.stringify(w)); };
+  const leave = () => { const w = readWorld(); delete w.terminals[`guest-${name}`]; fs.writeFileSync(world, JSON.stringify(w)); };
+  return { dir, home, repo, call, task, save, spawn, guest, leave };
+}
+gapTests.ignored = () => {
+  const f = gapFixture('ignored'), count = Math.max(12001, Number(process.env.CREW_TEST_IGNORED_FILES) || 12001);
+  const fill = t => { fs.mkdirSync(path.join(t.worktree, 'scratch')); for (let i = 0; i < count; i++) fs.writeFileSync(path.join(t.worktree, 'scratch', `${i}.txt`), 'old'); fs.utimesSync(path.join(t.worktree, 'scratch'), 1700000000, 1700000000); };
+  const changed = f.spawn('changed'); fill(changed); f.guest(changed);
+  let r = f.call(['finish', changed.id]); assert.equal(r.code, 0, r.out);
+  const before = fs.statSync(path.join(changed.worktree, 'scratch'));
+  fs.writeFileSync(path.join(changed.worktree, 'scratch', '0.txt'), 'new');
+  fs.utimesSync(path.join(changed.worktree, 'scratch'), before.atime, before.mtime);
+  f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out);
+  assert.ok(fs.existsSync(changed.worktree), 'An existing ignored file changed after finish must keep the copy');
+  assert.match(r.out, /work written since finish.*scratch/);
+  r = f.call(['finish', changed.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(changed.worktree));
+  r = f.call(['finish', changed.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(changed.worktree));
+
+  const untouched = f.spawn('untouched'); fill(untouched); f.guest(untouched);
+  const start = performance.now(), snapshot = snapshotCopy(untouched.worktree), elapsed = performance.now() - start;
+  console.log(`ignored walk: ${count} files, ${elapsed.toFixed(1)} ms, ${JSON.stringify(snapshot).length} stored bytes`);
+  assert.equal(snapshot.ignored['scratch/'].files, count); assert.equal(snapshot.incomplete, null);
+  assert.ok(JSON.stringify(snapshot).length < 2000, 'The stored fingerprint is bounded independently of file count');
+  r = f.call(['finish', untouched.id]); assert.equal(r.code, 0, r.out);
+  f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(untouched.worktree), r.out);
+
+  const uncertain = f.spawn('uncertain'); fill(uncertain); f.guest(uncertain);
+  const tree = path.join(uncertain.worktree, 'scratch'), first = snapshotCopy(uncertain.worktree).ignored['scratch/'];
+  fs.rmSync(path.join(tree, '0.txt'));
+  assert.equal(snapshotCopy(uncertain.worktree).ignored['scratch/'].files, count - 1, 'Removal changes the fingerprint');
+  fs.writeFileSync(path.join(tree, 'added.txt'), 'old');
+  assert.notEqual(snapshotCopy(uncertain.worktree).ignored['scratch/'].metadata, first.metadata, 'Same-count, same-size replacement changes the metadata digest');
+  const outside = path.join(f.dir, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'external.txt'), 'one');
+  fs.symlinkSync(outside, path.join(tree, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+  const linked = snapshotCopy(uncertain.worktree).ignored['scratch/'];
+  fs.writeFileSync(path.join(outside, 'external.txt'), 'changed outside');
+  assert.deepEqual(snapshotCopy(uncertain.worktree).ignored['scratch/'], linked, 'Directory symlink targets are not inspected');
+  assert.match(snapshotCopy(uncertain.worktree, { budgetMs: 0 }).incomplete, /time budget/);
+  const lstat = fs.lstatSync;
+  try {
+    fs.lstatSync = (file, ...args) => { if (String(file).endsWith(`${path.sep}added.txt`)) throw Object.assign(new Error('denied'), { code: 'EACCES' }); return lstat(file, ...args); };
+    assert.match(snapshotCopy(uncertain.worktree).incomplete, /could not read.*added\.txt/);
+  } finally { fs.lstatSync = lstat; }
+  r = f.call(['finish', uncertain.id]); assert.equal(r.code, 0, r.out); f.leave();
+  const saved = f.task(uncertain.id); saved.copyToReturn.left.incomplete = 'ignored walk exceeded its time budget'; f.save(saved);
+  r = f.call(['start']); assert.ok(fs.existsSync(uncertain.worktree)); assert.match(r.out, /time budget/);
+  delete saved.copyToReturn.left.ignoredVersion; delete saved.copyToReturn.left.incomplete; f.save(saved);
+  r = f.call(['start']); assert.ok(fs.existsSync(uncertain.worktree)); assert.match(r.out, /older snapshot/);
+  assert.equal(f.call(['finish', uncertain.id, '--force']).code, 0);
+};
+
+gapTests.finish = () => {
+  const f = gapFixture('finish'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const dirty = f.spawn('dirty', ['--kind', 'ship']);
+  const untouched = (task, message) => {
+    const before = readWorld().log.length, original = fs.readFileSync(path.join(f.home, 'tasks', task.id, 'task.json'), 'utf8');
+    const r = f.call(['finish', task.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, message);
+    assert.equal(readWorld().terminals[task.terminal].state, 'live', 'Refusing finish must leave the worker alive');
+    assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])), 'A refusal sends no stop/removal command');
+    assert.equal(fs.readFileSync(path.join(f.home, 'tasks', task.id, 'task.json'), 'utf8'), original);
+    assert.ok(fs.existsSync(task.worktree));
+  };
+  fs.writeFileSync(path.join(dirty.worktree, 'half.txt'), 'unsaved'); untouched(dirty, /has uncommitted work/); fs.rmSync(path.join(dirty.worktree, 'half.txt'));
+  const keep = f.spawn('keep'); fs.mkdirSync(path.join(keep.worktree, '.artifacts')); fs.writeFileSync(path.join(keep.worktree, '.artifacts', 'KEEP'), '');
+  untouched(keep, /marked to keep/); fs.rmSync(path.join(keep.worktree, '.artifacts'), { recursive: true });
+  const gitFile = path.join(dirty.worktree, '.git'); fs.renameSync(gitFile, `${gitFile}-saved`); fs.writeFileSync(gitFile, 'gitdir: missing\n');
+  untouched(dirty, /Could not check.*uncommitted work/); fs.rmSync(gitFile); fs.renameSync(`${gitFile}-saved`, gitFile);
+  assert.equal(f.call(['finish', keep.id]).code, 0);
+
+  patch({ writeOnKill: path.join(dirty.worktree, 'late.txt') });
+  let r = f.call(['finish', dirty.id]); assert.equal(r.code, 0, r.out); patch({ writeOnKill: null });
+  assert.equal(f.task(dirty.id).state, 'closed'); assert.ok(fs.existsSync(path.join(dirty.worktree, 'late.txt'))); assert.match(r.out, /kept for now.*work written|kept for now.*uncommitted/);
+  r = f.call(['start']); assert.ok(fs.existsSync(dirty.worktree)); assert.match(r.out, /work written since finish/);
+  assert.equal(f.call(['finish', dirty.id, '--force']).code, 0);
+
+  const stopping = f.spawn('stopping'); patch({ silentAfterKill: true });
+  r = f.call(['finish', stopping.id]); assert.equal(r.code, 0, r.out);
+  assert.ok(f.task(stopping.id).copyToReturn?.stopPending && fs.existsSync(stopping.worktree), 'An unconfirmed stop postpones return instead of refusing after changing the worker');
+  patch({ silentAfterKill: false, silent: false }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(stopping.worktree));
+
+  const second = f.spawn('second'); patch({ silentLsAfterRm: true });
+  r = f.call(['finish', second.id]); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(second.id).state, 'closed'); assert.ok(f.task(second.id).copyToReturn && fs.existsSync(second.worktree));
+  assert.match(r.out, /Core did not say.*crew (?:start|finish)|Core did not say.*next.*(?:start|finish)/);
+  patch({ silentLsAfterRm: false, silentLs: false }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(second.worktree));
+
+  const removal = f.spawn('removal'); patch({ silentAfterRm: true });
+  r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(removal.id).copyToReturn && fs.existsSync(removal.worktree));
+  patch({ silentAfterRm: false, silent: false }); r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(removal.worktree));
+
+  // A proved API exit can leave the wrapper shell live. A persisted cleanup retries that
+  // shell too; it must never become an indefinitely held copy after the worker has left.
+  const shell = f.spawn('shell');
+  f.save({ ...shell, state: 'closed', closed: new Date().toISOString(), copyToReturn: { since: new Date().toISOString(), left: snapshotCopy(shell.worktree), cleanupTerminal: true } });
+  r = f.call(['finish', shell.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(shell.worktree), r.out);
+  assert.ok(!readWorld().terminals[shell.terminal]);
+};
+
+gapTests.chain = () => {
+  const dir = path.join(root, 'gap-quota'); fs.mkdirSync(dir); const bin = path.join(dir, 'bin'); fs.mkdirSync(bin);
+  for (const name of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, name), '');
+  const quota = path.join(dir, 'quota.json'), log = path.join(dir, 'reads.log'), tool = path.join(dir, 'quota.mjs');
+  fs.writeFileSync(tool, `import fs from 'node:fs';
+const q = JSON.parse(fs.readFileSync(${JSON.stringify(quota)}, 'utf8')), a = process.argv.slice(2), families = a[a.indexOf('--provider') + 1].split(',');
+fs.appendFileSync(${JSON.stringify(log)}, families.join(',') + '\\n');
+console.log(JSON.stringify({providers: families.map(provider => q[provider] === 'login' ? {provider, state: {error: 'unauthorized'}, quotaSemantics: {status: 'unknown'}} : {provider, quotaSemantics: {status: 'known', effectiveAvailability: [{scope: 'all_models', effectivePercentRemaining: q[provider]}]}})}));`);
+  const setQuota = q => fs.writeFileSync(quota, JSON.stringify(q)); setQuota({ codex: 0, claude: 'login', copilot: 70 });
+  const f = gapFixture('chain', { CREW_TOOL_QUOTA_AXI: tool, CREW_AGENT_PATH: bin }); fs.mkdirSync(path.join(f.home, 'config'));
+  fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify({ default: [
+    { harness: 'a1', model: 'custom/gpt-x', provider: 'codex' }, { harness: 'claude', model: 'opus' }, { harness: 'pi', model: 'github-copilot/gpt-x' }] }));
+  const task = f.spawn('recover'); assert.equal(task.agent, 'pi');
+  assert.deepEqual(task.chain.map(c => c.harness), ['a1', 'claude'], 'Passed-over candidates remain in the original chain');
+  let shown = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === task.id);
+  assert.deepEqual(shown.standbyStatus.map(c => [c.status, c.passedOver]), [['exhausted', true], ['signed-out', true]]);
+  assert.ok(shown.standbyStatus.every(c => c.checkedAt && c.note));
+  setQuota({ codex: 60, claude: 'login', copilot: 0 }); fs.writeFileSync(log, '');
+  setTerminal(task.terminal, { status: { state: 'error', app: 'pi' }, screen: 'usage limit reached' });
+  let r = f.call(['wait', task.id, '--timeout', '6']); assert.equal(r.code, 124, r.out);
+  assert.equal(f.task(task.id).agent, 'a1', 'Automatic hand-over reconsiders recovered candidates');
+  assert.equal(f.task(task.id).launch.family, 'codex', 'The quota-family override survives saving and hand-over');
+  assert.ok(!fs.readFileSync(log, 'utf8').includes('copilot'), 'The current/tried worker is not read again');
+  setQuota({ codex: 0, claude: 70, copilot: 80 }); fs.writeFileSync(log, '');
+  r = f.call(['relaunch', task.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).agent, 'claude', 'Unnamed relaunch reconsiders a recovered login');
+  assert.equal(fs.readFileSync(log, 'utf8').trim(), 'claude', 'Only the untried candidate is read');
+  assert.deepEqual(f.task(task.id).candidates.map(c => c.harness), ['a1', 'claude', 'pi']);
+  assert.equal(f.call(['relaunch', task.id]).code, 8, 'Unnamed relaunch never repeats an already tried candidate');
+  setQuota({ codex: 70, claude: 70, copilot: 80 });
+  assert.equal(f.call(['relaunch', task.id, '--agent', 'a1', '--model', 'openai-codex/gpt-x']).code, 0, 'A named relaunch may retry an earlier choice');
+  assert.equal(f.call(['finish', task.id, '--force']).code, 0);
+};
+
+gapTests['review-stop-race'] = () => {
+  const f = gapFixture('review-race'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const lost = [];
+  for (const [id, flags, file, closed] of [
+    ['ship-ignored', ['--kind', 'ship'], 'scratch/late.txt', false],
+    ['scout-scratch', [], 'late.txt', false],
+    ['forced-ship', ['--kind', 'ship', '--force'], 'late.txt', false],
+    ['forced-scout', ['--force'], 'scratch/late.txt', false],
+    ['closed-force', ['--force'], 'late.txt', true],
+    ['closed-normal', [], 'late.txt', true],
+  ]) {
+    const force = flags.includes('--force'), t = f.spawn(id, flags.filter(flag => flag !== '--force'));
+    if (file.startsWith('scratch/')) { fs.mkdirSync(path.join(t.worktree, 'scratch')); fs.writeFileSync(path.join(t.worktree, 'scratch', 'before.txt'), 'accepted'); }
+    if (force && !closed) setTerminal(t.terminal, { status: { state: 'working', app: t.agent } });
+    if (closed) f.save({ ...t, state: 'closed', closed: new Date().toISOString(), copyToReturn: { since: new Date().toISOString(), left: snapshotCopy(t.worktree), cleanupTerminal: true } });
+    const late = path.join(t.worktree, file); patch({ writeOnKill: late });
+    let r = f.call(['finish', id, ...(force ? ['--force'] : [])]); patch({ writeOnKill: null });
+    assert.equal(r.code, 0, r.out);
+    if (!fs.existsSync(late)) { lost.push(`${id}: work written while stopping was deleted`); continue; }
+    assert.equal(f.task(id).state, 'closed'); assert.ok(f.task(id).copyToReturn, r.out);
+    assert.match(r.out, /work written since finish/);
+    r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(late), 'Automatic sweeps do not inherit the original force');
+    r = f.call(['finish', id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(late), 'A normal retry still protects late work');
+    assert.equal(f.call(['finish', id, '--force']).code, 0); assert.ok(!fs.existsSync(t.worktree), 'Only a new explicit forced finish accepts the late work');
+  }
+  assert.deepEqual(lost, [], 'Every initial and resumed finish compares the post-stop copy, even with force');
+};
+
+gapTests['review-force-retry'] = () => {
+  const f = gapFixture('review-force'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const t = f.spawn('pending'); setTerminal(t.terminal, { status: { state: 'working', app: t.agent } }); patch({ unkillable: true });
+  let r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(f.task(t.id).copyToReturn.stopPending);
+  patch({ unkillable: false }); const before = readWorld().log.length;
+  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.equal(readWorld().terminals[t.terminal].state, 'live');
+  assert.ok(!readWorld().log.slice(before).some(a => a[0] === 'kill'), 'Automatic retries do not force a busy worker');
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.ok(!readWorld().terminals[t.terminal] && !fs.existsSync(t.worktree), 'An explicitly forced retry cancels and returns the pending copy');
+  const writing = f.spawn('pending-write'); setTerminal(writing.terminal, { status: { state: 'working', app: writing.agent } }); patch({ unkillable: true });
+  assert.equal(f.call(['finish', writing.id, '--force']).code, 0);
+  const late = path.join(writing.worktree, 'late.txt'); patch({ unkillable: false, writeOnKill: late });
+  r = f.call(['finish', writing.id, '--force']); patch({ writeOnKill: null }); assert.equal(r.code, 0, r.out);
+  assert.ok(fs.existsSync(late) && f.task(writing.id).copyToReturn, 'A forced stop retry also protects work written during its own cancellation');
+  assert.equal(f.call(['finish', writing.id, '--force']).code, 0); assert.ok(!fs.existsSync(writing.worktree));
+};
+
+gapTests['review-pending-status'] = () => {
+  const f = gapFixture('review-status'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const t = f.spawn('pending'); setTerminal(t.terminal, { status: { state: 'working', app: t.agent } }); patch({ unkillable: true });
+  let r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); patch({ unkillable: false });
+  const assertPending = (task, why, text) => {
+    const before = readWorld().log.length;
+    const shown = JSON.parse(f.call(['status', '--all', '--json']).out).tasks.find(s => s.id === task.id).copyToReturn;
+    assert.equal(shown.free, false, 'A pending lifecycle confirmation must not be presented as a free copy');
+    assert.equal(shown.why, why); assert.match(shown.pending, text);
+    const line = f.call(['status', '--all']).out.split(/\r?\n/).find(line => line.startsWith(`${task.id}\t`));
+    assert.match(line, text); assert.ok(!line.includes('free now') && !line.includes('--force discards it'), line);
+    assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])), 'Status is observational only');
+  };
+  assertPending(t, 'stop pending', /worker stop is not confirmed/);
+  const removal = f.spawn('removal'); patch({ failRm: true }); r = f.call(['finish', removal.id]); assert.equal(r.code, 0, r.out);
+  assertPending(removal, 'terminal removal pending', /worker terminal removal is not confirmed/);
+  patch({ failRm: false }); assert.equal(f.call(['finish', t.id, '--force']).code, 0); assert.equal(f.call(['finish', removal.id]).code, 0);
+};
+
+gapTests['review2-baseline-race'] = () => {
+  const f = gapFixture('review2-baseline'), t = f.spawn('racing', ['--kind', 'ship']);
+  const late = path.join(t.worktree, 'late.txt'), preload = slash(path.join(f.dir, 'race.cjs'));
+  // Return a genuinely clean first status result, then let the worker write before the
+  // coordinator receives it. NODE_OPTIONS applies the hook only to this fake-Core command.
+  fs.writeFileSync(preload, `const cp = require('node:child_process'), fs = require('node:fs'), original = cp.spawnSync;
+let written = false;
+cp.spawnSync = function(command, args, options) {
+  const result = original(command, args, options);
+  if (!written && command === 'git' && args[1] === ${JSON.stringify(t.worktree)} && args.includes('status') && args.includes('--porcelain') && result.status === 0) {
+    written = true; fs.writeFileSync(${JSON.stringify(late)}, 'written after the clean result');
+  }
+  return result;
+};
+require('node:module').syncBuiltinESMExports();`);
+  const r = f.call(['finish', t.id], { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${JSON.stringify(preload)}` });
+  assert.ok([0, 6].includes(r.code), r.out);
+  assert.ok(fs.existsSync(late), 'Work between the clean result and baseline must not be silently accepted and deleted');
+  if (r.code === 6) assert.equal(readWorld().terminals[t.terminal].state, 'live', 'A refusal leaves the worker intact');
+  else assert.ok(f.task(t.id).copyToReturn, 'Work outside the accepted baseline postpones return');
+  assert.equal(f.call(['finish', t.id, '--force']).code, 0); assert.ok(!fs.existsSync(t.worktree));
+};
+
+gapTests['review2-unseen-force'] = () => {
+  const f = gapFixture('review2-unseen'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const corrupt = t => { const file = path.join(t.worktree, '.git'); fs.renameSync(file, `${file}-saved`); fs.writeFileSync(file, 'gitdir: missing\n'); };
+  const t = f.spawn('unseen', ['--kind', 'ship']); fs.writeFileSync(path.join(t.worktree, 'unsaved.txt'), 'discard only by explicit request'); corrupt(t);
+  let r = f.call(['finish', t.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, /Pass --force to discard it unseen/); assert.equal(readWorld().terminals[t.terminal].state, 'live');
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.ok(!fs.existsSync(t.worktree), 'Explicit force must discard an uninspectable copy on the first attempt');
+  assert.match(r.out, /discarded unseen/); assert.ok(!f.task(t.id).copyToReturn);
+
+  const closed = f.spawn('closed', ['--kind', 'ship']);
+  f.save({ ...closed, state: 'closed', closed: new Date().toISOString(), copyToReturn: { since: new Date().toISOString(), left: snapshotCopy(closed.worktree), cleanupTerminal: true } });
+  corrupt(closed);
+  r = f.call(['finish', closed.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(closed.worktree)); assert.match(r.out, /--force.*discards/);
+  f.guest(closed);
+  r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 6, r.out); assert.ok(fs.existsSync(closed.worktree), 'Unseen discard still cannot override another terminal');
+  f.leave(); patch({ silentLs: true }); r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 4, r.out); assert.ok(fs.existsSync(closed.worktree));
+  patch({ silentLs: false }); r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(closed.worktree), r.out); assert.match(r.out, /discarded unseen/);
+};
+
+gapTests['review2-missing-git'] = () => {
+  const f = gapFixture('review2-missing'), t = f.spawn('missing', ['--kind', 'ship']);
+  fs.renameSync(path.join(t.worktree, '.git'), path.join(t.worktree, '.git-saved'));
+  fs.writeFileSync(path.join(t.worktree, 'unsaved.txt'), 'not inspectable without the Git marker');
+  let r = f.call(['finish', t.id]); assert.equal(r.code, 6, 'A missing Git marker is an inspection failure, not proof of a clean ship');
+  assert.equal(readWorld().terminals[t.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(t.worktree, 'unsaved.txt')));
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(t.worktree)); assert.match(r.out, /discarded unseen/);
+};
+
+gapTests['review3-prototype-names'] = () => {
+  const f = gapFixture('review3-names'), names = ['__proto__', 'constructor', 'toString'];
+  const writeNames = t => { for (const name of names) fs.writeFileSync(path.join(t.worktree, name), 'accepted before finish'); };
+  const assertOwnNames = record => { for (const name of names) assert.ok(Object.hasOwn(record, name), `${name} must be an own filename key`); };
+  for (const [i, name] of names.entries()) {
+    const t = f.spawn(`untracked-${i}`, ['--kind', 'ship']); fs.writeFileSync(path.join(t.worktree, name), 'uncommitted');
+    const snapshot = snapshotCopy(t.worktree), r = f.call(['finish', t.id]);
+    assert.equal(r.code, 6, `Uncommitted ${name} must refuse finish: ${r.out}`);
+    assert.ok(fs.existsSync(path.join(t.worktree, name))); assert.equal(readWorld().terminals[t.terminal].state, 'live');
+    assert.ok(Object.hasOwn(snapshot.files, name)); assert.equal(Object.getPrototypeOf(snapshot.files), null);
+    assert.equal(f.call(['finish', t.id, '--force']).code, 0);
+  }
+
+  // Saved JSON (including older records) has ordinary-object dictionaries. Unchanged
+  // accepted filenames must round-trip without either losing names or inventing changes.
+  const oldFiles = f.spawn('old-files', ['--kind', 'ship']); writeNames(oldFiles); f.guest(oldFiles);
+  assert.equal(f.call(['finish', oldFiles.id, '--force']).code, 0);
+  const savedFiles = f.task(oldFiles.id); assert.equal(Object.getPrototypeOf(savedFiles.copyToReturn.left.files), Object.prototype); assertOwnNames(savedFiles.copyToReturn.left.files);
+  f.save(JSON.parse(JSON.stringify(savedFiles))); f.leave();
+  let r = f.call(['finish', oldFiles.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(oldFiles.worktree), r.out);
+
+  const oldLost = f.spawn('old-lost', ['--kind', 'ship']); fs.writeFileSync(path.join(oldLost.worktree, '__proto__'), 'older writer omitted this key'); f.guest(oldLost);
+  assert.equal(f.call(['finish', oldLost.id, '--force']).code, 0);
+  const lost = f.task(oldLost.id); delete lost.copyToReturn.left.files.__proto__; f.save(lost); f.leave();
+  r = f.call(['finish', oldLost.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(path.join(oldLost.worktree, '__proto__')), 'A name omitted by an older snapshot cannot be inferred safe to discard');
+  assert.equal(f.call(['finish', oldLost.id, '--force']).code, 0);
+
+  fs.appendFileSync(path.join(f.repo, '.git', 'info', 'exclude'), `\n${names.map(name => `/${name}`).join('\n')}\n`);
+  const oldIgnored = f.spawn('old-ignored', ['--kind', 'ship']); writeNames(oldIgnored); f.guest(oldIgnored);
+  const snapshot = snapshotCopy(oldIgnored.worktree); assert.equal(Object.getPrototypeOf(snapshot.ignored), null); assertOwnNames(snapshot.ignored);
+  assert.equal(f.call(['finish', oldIgnored.id]).code, 0);
+  const savedIgnored = f.task(oldIgnored.id); assert.equal(Object.getPrototypeOf(savedIgnored.copyToReturn.left.ignored), Object.prototype); assertOwnNames(savedIgnored.copyToReturn.left.ignored);
+  f.save(JSON.parse(JSON.stringify(savedIgnored))); f.leave();
+  r = f.call(['finish', oldIgnored.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(oldIgnored.worktree), r.out);
+
+  for (const [i, name] of names.entries()) {
+    const t = f.spawn(`ignored-${i}`, ['--kind', 'ship']); fs.writeFileSync(path.join(t.worktree, name), 'accepted'); f.guest(t);
+    assert.equal(f.call(['finish', t.id]).code, 0);
+    const older = f.task(t.id);
+    if (name === '__proto__') { delete older.copyToReturn.left.ignored.__proto__; f.save(older); }
+    fs.writeFileSync(path.join(t.worktree, name), 'work written after finish');
+    f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out);
+    assert.ok(fs.existsSync(path.join(t.worktree, name)), `Ignored ${name} must be protected after finish`); assert.match(r.out, /work written since finish/);
+    assert.equal(f.call(['finish', t.id, '--force']).code, 0);
+  }
+};
+
+gapTests.status = () => {
+  const f = gapFixture('delivery'), ship = f.spawn('ship', ['--kind', 'ship']), scout = f.spawn('scout');
+  for (const [fields, expected] of [[{}, 'plain'], [{ workflow: 'delivery' }, 'workflow'], [{ gate: 'no-mistakes', workflow: 'delivery' }, 'gate']]) {
+    f.save({ ...ship, ...fields });
+    const tasks = JSON.parse(f.call(['status', '--json']).out).tasks;
+    assert.equal(tasks.find(t => t.id === ship.id).deliveryKind, expected);
+    assert.equal(tasks.find(t => t.id === scout.id).deliveryKind, null);
+  }
+  assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
+};
+
 try {
+  const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
+  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
+  if (!onlyGaps) {
+  // The focused fixtures have their own homes and copies, but share the fake Core transport.
+  fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
   // Status uses spawn time (creation while preparing), freezes settled tasks, and formats
   // elapsed time without contacting Core or depending on the wall clock.
   {
@@ -672,10 +996,10 @@ if (a[0] === 'start') {
   git('-C', project, 'worktree', 'add', '-q', '-b', 'feature/taken', path.join(root, 'taken'), 'HEAD');
   r = dl(['spawn', 'taken', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']); assert.equal(r.code, 5); assert.match(r.out, /feature\/taken already has a working copy at .*; it was left alone/);
   assert.equal(taskOf('taken').state, 'failed'); assert.ok(fs.existsSync(path.join(root, 'taken')) && !calls().some(e => e.a[0] === 'finish'));
-  // Finish hands the copy back; a refusal keeps the task open and says why.
+  // A failure after stopping closes the task with a durable postponed return, not a dead worker on an open task.
   fs.writeFileSync(stuck, '');
-  r = dl(['finish', 'p1']); assert.equal(r.code, 6); assert.match(r.out, /delivery did not take the working copy back \(kept .*the worktree is locked/);
-  assert.equal(taskOf('p1').state, 'working', 'A copy that was not taken back keeps its task open');
+  r = dl(['finish', 'p1']); assert.equal(r.code, 0); assert.match(r.out, /delivery did not take the working copy back \(kept .*the worktree is locked/);
+  assert.equal(taskOf('p1').state, 'closed'); assert.ok(taskOf('p1').copyToReturn, 'A failed return remains retryable');
   fs.rmSync(stuck);
   r = dl(['finish', 'p1']); assert.equal(r.code, 0, r.out); assert.match(r.out, /working copy returned to the pool/);
   assert.deepEqual(calls().at(-1).a, ['finish', p1.worktree, '--force']);
@@ -917,7 +1241,7 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['spawn', 'acc', '--project', 'demo', '--agent', 'claude', '--model', 'opus', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /passed over claude opus as one@example\.com: quota used up/); assert.match(q.out, /; claude opus as two@example\.com\r?\n/);
     assert.ok(lastRun().includes("claude-as.sh' --as 'two@example.com' --command") && lastRun().includes("'--model' 'opus' '--permission-mode'"), lastRun());
-    assert.deepEqual(task2('acc').chain, [], 'A login that is gone or empty is not kept as a fallback');
+    assert.deepEqual(task2('acc').chain.map(c => c.account), ['one@example.com', 'gone@example.com'], 'An exhausted or rejected login remains available for reconsideration');
     assert.deepEqual(fs.readFileSync(quotaLog, 'utf8').trim().split('\n'), ['one@example.com', 'two@example.com'], 'Each saved account is read by itself; the one whose login is gone is not');
 
     // The person's list: Firstmate's dispatch file, with roles and an account-less Claude profile.
@@ -943,9 +1267,9 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['spawn', 'cfg', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /passed over a1 openai-codex\/gpt-x \(high\): quota used up/); assert.match(q.out, /; a1 github-copilot\/gpt-x, 2 more can take over/);
     assert.ok(lastRun().includes("'a1' '--provider' 'github-copilot' '--model' 'gpt-x' 'Read the brief"), lastRun());
-    assert.deepEqual(task2('cfg').chain.map(c => c.account), ['one@example.com', 'two@example.com']);
+    assert.deepEqual(task2('cfg').chain.map(c => c.account), [undefined, undefined, 'one@example.com', 'two@example.com', 'gone@example.com']);
     assert.match(crew2(['status']).out, /cfg\tworking\tscout\/a1 github-copilot\/gpt-x\t/);
-    assert.equal(JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === 'cfg').standby.length, 2);
+    assert.equal(JSON.parse(crew2(['status', '--json']).out).tasks.find(t => t.id === 'cfg').standby.length, 5);
 
     // The worker stops on a limit: `crew wait` hands the task to the next candidate and goes on waiting.
     const first = task2('cfg').terminal;
@@ -954,7 +1278,7 @@ if (a[0] === '--version') process.exit(0);`);
     assert.match(q.out, /== cfg: a1 github-copilot\/gpt-x stopped \(Error: Codex error: The usage limit has been reached\); claude opus as one@example\.com continues it in terminal/);
     const moved = task2('cfg');
     assert.equal(moved.agent, 'claude'); assert.equal(moved.state, 'working'); assert.notEqual(moved.terminal, first); assert.equal(readWorld().terminals[first], undefined, 'The stopped worker\'s terminal is gone');
-    assert.deepEqual(moved.chain.map(c => c.account), ['two@example.com']); assert.equal(moved.fallbacks.length, 1);
+    assert.deepEqual(moved.chain.map(c => c.account), [undefined, undefined, 'two@example.com', 'gone@example.com']); assert.equal(moved.fallbacks.length, 1);
     assert.ok(lastRun().includes("--as 'one@example.com'") && lastRun().includes('Another worker (a1 github-copilot/gpt-x) began this task and had to stop') && lastRun().includes('continue from there'), lastRun());
     assert.equal(readWorld().terminals[moved.terminal].cwd, moved.worktree, 'Same working copy');
     assert.match(crew2(['status']).out, /scout\/claude opus as one@example\.com \(after a1 github-copilot\/gpt-x\)/);
@@ -969,7 +1293,7 @@ if (a[0] === '--version') process.exit(0);`);
     q = crew2(['wait', 'cfg', '--timeout', '6']); assert.match(q.out, /claude opus as two@example\.com continues it/);
     setTerminal(task2('cfg').terminal, { status: { state: 'idle', app: 'claude' }, screen: 'Please run /login' });
     q = crew2(['wait', 'cfg', '--timeout', '8']); assert.equal(q.code, 7, q.out);
-    assert.match(q.out, /== cfg: needs a person - claude opus as two@example\.com stopped \(Please run \/login\) and there is no other candidate in its chain/);
+    assert.match(q.out, /== cfg: needs a person - claude opus as two@example\.com stopped \(Please run \/login\) and nobody else can take it:/);
     // By hand: the coordinator (or the person) names who takes it. The quota has come back for codex.
     setQuota({ codex: 30, copilot: null, 'one@example.com': 70, 'two@example.com': 55 });
     q = crew2(['relaunch', 'cfg', '--agent', 'a1', '--model', 'openai-codex/gpt-x', 'quota is back']); assert.equal(q.code, 0, q.out);
@@ -1152,7 +1476,7 @@ if (a[0] === '--version') process.exit(0);`);
     setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 80 });
     q = crew2(['spawn', 'floor1', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /passed over claude opus as one@example\.com: 49% left, under its floor of 50%/); assert.equal(task2('floor1').launch.account, 'two@example.com');
-    assert.deepEqual(task2('floor1').chain.map(c => [c.account, c.floor]), [['one@example.com', 50]], 'The account under its floor stands last, with its floor kept');
+    assert.deepEqual(task2('floor1').chain.map(c => [c.account, c.floor]), [[undefined, undefined], ['one@example.com', 50], ['gone@example.com', undefined]], 'The complete original order and floors survive for later reconsideration');
     setQuota({ codex: 0, 'one@example.com': 49, 'two@example.com': 20 });
     q = crew2(['spawn', 'floor2', '--project', 'demo', 'Count.']); assert.equal(q.code, 0, q.out);
     assert.match(q.out, /claude opus as one@example\.com is under its floor \(49% left, under its floor of 50%\), but nobody above their floor can take the work/); assert.equal(task2('floor2').launch.account, 'one@example.com');
@@ -1189,6 +1513,7 @@ if (a[0] === '--version') process.exit(0);`);
   }
 
   console.log('PASS: who does the work (profiles, per-account quota, passing over, hand-over on a limit, relaunch), Firstmate\'s tools (list, backlog, copies from the delivery workflow, no-mistakes delivery, a repository\'s own delivery workflow), follow-ups, review, delivery as a pull request, self-repair (crash record, fix, guarded selfmerge, update at start, rollback) and crew helpers, status durations, home and project setup, single ownership, spawn request, worker report, wait outcomes, guarded finish, owner takeover, project removal, the Claude worker command, its folder trust and account choice, and the five reviewed defects');
+  }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
