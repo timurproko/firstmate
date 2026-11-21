@@ -351,6 +351,53 @@ gapTests['review2-missing-git'] = () => {
   r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(t.worktree)); assert.match(r.out, /discarded unseen/);
 };
 
+gapTests['review3-prototype-names'] = () => {
+  const f = gapFixture('review3-names'), names = ['__proto__', 'constructor', 'toString'];
+  const writeNames = t => { for (const name of names) fs.writeFileSync(path.join(t.worktree, name), 'accepted before finish'); };
+  const assertOwnNames = record => { for (const name of names) assert.ok(Object.hasOwn(record, name), `${name} must be an own filename key`); };
+  for (const [i, name] of names.entries()) {
+    const t = f.spawn(`untracked-${i}`, ['--kind', 'ship']); fs.writeFileSync(path.join(t.worktree, name), 'uncommitted');
+    const snapshot = snapshotCopy(t.worktree), r = f.call(['finish', t.id]);
+    assert.equal(r.code, 6, `Uncommitted ${name} must refuse finish: ${r.out}`);
+    assert.ok(fs.existsSync(path.join(t.worktree, name))); assert.equal(readWorld().terminals[t.terminal].state, 'live');
+    assert.ok(Object.hasOwn(snapshot.files, name)); assert.equal(Object.getPrototypeOf(snapshot.files), null);
+    assert.equal(f.call(['finish', t.id, '--force']).code, 0);
+  }
+
+  // Saved JSON (including older records) has ordinary-object dictionaries. Unchanged
+  // accepted filenames must round-trip without either losing names or inventing changes.
+  const oldFiles = f.spawn('old-files', ['--kind', 'ship']); writeNames(oldFiles); f.guest(oldFiles);
+  assert.equal(f.call(['finish', oldFiles.id, '--force']).code, 0);
+  const savedFiles = f.task(oldFiles.id); assert.equal(Object.getPrototypeOf(savedFiles.copyToReturn.left.files), Object.prototype); assertOwnNames(savedFiles.copyToReturn.left.files);
+  f.save(JSON.parse(JSON.stringify(savedFiles))); f.leave();
+  let r = f.call(['finish', oldFiles.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(oldFiles.worktree), r.out);
+
+  const oldLost = f.spawn('old-lost', ['--kind', 'ship']); fs.writeFileSync(path.join(oldLost.worktree, '__proto__'), 'older writer omitted this key'); f.guest(oldLost);
+  assert.equal(f.call(['finish', oldLost.id, '--force']).code, 0);
+  const lost = f.task(oldLost.id); delete lost.copyToReturn.left.files.__proto__; f.save(lost); f.leave();
+  r = f.call(['finish', oldLost.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(path.join(oldLost.worktree, '__proto__')), 'A name omitted by an older snapshot cannot be inferred safe to discard');
+  assert.equal(f.call(['finish', oldLost.id, '--force']).code, 0);
+
+  fs.appendFileSync(path.join(f.repo, '.git', 'info', 'exclude'), `\n${names.map(name => `/${name}`).join('\n')}\n`);
+  const oldIgnored = f.spawn('old-ignored', ['--kind', 'ship']); writeNames(oldIgnored); f.guest(oldIgnored);
+  const snapshot = snapshotCopy(oldIgnored.worktree); assert.equal(Object.getPrototypeOf(snapshot.ignored), null); assertOwnNames(snapshot.ignored);
+  assert.equal(f.call(['finish', oldIgnored.id]).code, 0);
+  const savedIgnored = f.task(oldIgnored.id); assert.equal(Object.getPrototypeOf(savedIgnored.copyToReturn.left.ignored), Object.prototype); assertOwnNames(savedIgnored.copyToReturn.left.ignored);
+  f.save(JSON.parse(JSON.stringify(savedIgnored))); f.leave();
+  r = f.call(['finish', oldIgnored.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(oldIgnored.worktree), r.out);
+
+  for (const [i, name] of names.entries()) {
+    const t = f.spawn(`ignored-${i}`, ['--kind', 'ship']); fs.writeFileSync(path.join(t.worktree, name), 'accepted'); f.guest(t);
+    assert.equal(f.call(['finish', t.id]).code, 0);
+    const older = f.task(t.id);
+    if (name === '__proto__') { delete older.copyToReturn.left.ignored.__proto__; f.save(older); }
+    fs.writeFileSync(path.join(t.worktree, name), 'work written after finish');
+    f.leave(); r = f.call(['start']); assert.equal(r.code, 0, r.out);
+    assert.ok(fs.existsSync(path.join(t.worktree, name)), `Ignored ${name} must be protected after finish`); assert.match(r.out, /work written since finish/);
+    assert.equal(f.call(['finish', t.id, '--force']).code, 0);
+  }
+};
+
 gapTests.status = () => {
   const f = gapFixture('delivery'), ship = f.spawn('ship', ['--kind', 'ship']), scout = f.spawn('scout');
   for (const [fields, expected] of [[{}, 'plain'], [{ workflow: 'delivery' }, 'workflow'], [{ gate: 'no-mistakes', workflow: 'delivery' }, 'gate']]) {

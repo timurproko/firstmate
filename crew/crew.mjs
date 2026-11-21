@@ -1405,7 +1405,8 @@ export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
   const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : fs.existsSync(folder) ? null : []);
   const changed = git('--untracked-files=all'), roots = git('--ignored');
   if (!changed || !roots) return null;
-  const files = {}, ignored = {};
+  // Filenames are arbitrary keys, including __proto__, constructor and toString.
+  const files = Object.create(null), ignored = Object.create(null);
   let incomplete = null;
   const checkTime = () => { if (performance.now() >= deadline) throw new Error('ignored walk exceeded its time budget'); };
   try {
@@ -1475,9 +1476,12 @@ function checkWaitingCopy(task, before = task.copyToReturn?.left, { discardUnsee
   // comparison is not proof of new work; without that authority it still protects the copy.
   if (uncertain) return { kept: discardUnseen ? null : { why: 'uncommitted work', text: !seen ? uncertain : `changes cannot be determined: ${uncertain}` }, leftovers: true, unseen: discardUnseen ? uncertain : null };
   if (seen.keep !== null && seen.keep !== before.keep) return { kept: { why: 'marked to keep', text: 'it was marked to keep by .artifacts/KEEP since finish' }, leftovers: true };
-  const ignored = new Set([...Object.keys(before.ignored ?? {}), ...Object.keys(seen.ignored)]);
-  const added = [...Object.keys(seen.files).filter(file => !(file in before.files) || before.files[file] !== seen.files[file]),
-    ...[...ignored].filter(file => JSON.stringify(before.ignored?.[file]) !== JSON.stringify(seen.ignored[file]))];
+  // JSON-parsed older snapshots have ordinary-object dictionaries. Copy their own keys
+  // into prototype-free records before comparing, without changing the saved format.
+  const beforeFiles = Object.assign(Object.create(null), before.files), beforeIgnored = Object.assign(Object.create(null), before.ignored);
+  const ignored = new Set([...Object.keys(beforeIgnored), ...Object.keys(seen.ignored)]);
+  const added = [...Object.keys(seen.files).filter(file => !Object.hasOwn(beforeFiles, file) || beforeFiles[file] !== seen.files[file]),
+    ...[...ignored].filter(file => JSON.stringify(beforeIgnored[file]) !== JSON.stringify(seen.ignored[file]))];
   if (added.length) return { kept: { why: 'uncommitted work', text: `it has work written since finish (${listFiles(added)})` }, leftovers: true };
   const started = seen.operations.filter(name => !(before.operations ?? []).includes(name));
   if (started.length) return { kept: { why: 'operation in progress', text: `it has ${started.map(name => OPERATIONS[name]).join(' and ')} since finish` }, leftovers: true };
