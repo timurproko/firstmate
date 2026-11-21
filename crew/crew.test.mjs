@@ -1353,11 +1353,16 @@ if (a[0] === '--version') process.exit(0);`);
     }
     {
       const lastError = 'Error: upstream connect error or disconnect/reset before headers: remote connection failure';
-      const task = recovering('error-handover', { onSends: [{}, {}, { screen: `${lastError}\n` }] }, { chain: [{ harness: 'a1', model: 'openai-codex/gpt-x' }] });
+      const task = recovering('error-handover', { onSends: [{}, {}, { screen: `${lastError}\n` }] }, {
+        chain: [{ harness: 'a1', model: 'openai-codex/gpt-x' }],
+        candidates: [{ harness: 'a1' }, { harness: 'a1', model: 'github-copilot/gpt-x' }, { harness: 'a1', model: 'openai-codex/gpt-x' }],
+      });
       q = quickWait(task.id, {}, [], 'k1', '2'); assert.equal(q.code, 124, q.out);
       const moved = task2(task.id);
       assert.notEqual(moved.terminal, task.terminal, q.out); assert.equal(sendsTo(task.terminal).length, 3);
       assert.equal(moved.fallbacks.at(-1).why, lastError);
+      assert.equal(moved.launch.model, 'github-copilot/gpt-x', 'Error hand-over rechecks the full saved candidates, not just the old usable chain');
+      assert.deepEqual(moved.candidates, task.candidates); assert.deepEqual(moved.chain, task.chain);
       assert.equal(readWorld().terminals[moved.terminal].cwd, task.worktree);
       assert.ok(lastRun().includes(lastError), lastRun());
     }
