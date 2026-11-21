@@ -4,7 +4,7 @@
 // One coordinator agent owns a crew home and calls these commands; each worker is an
 // ordinary agent in its own Core terminal and its own git worktree. Everything is one
 // short process talking to Core through `hc`; there is no watcher, no hook and no
-// background service. See the sibling README.md for the design and its limits.
+// background service. See crew/README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.11.0';
+export const VERSION = '0.12.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -356,12 +356,14 @@ these rules and \`crew --help\` say, is a defect in crew, not in the project. Do
 around it by hand and never edit crew's own files yourself.
 1. \`crew fix "<the command you ran, what happened, what you expected>"\` starts a fixer on
    crew's own source. Then \`crew wait <fix id>\`.
-2. \`crew selfmerge <fix id>\` publishes the repair by itself, without asking the person, but
-   only if it stays inside crew's folder and crew's whole test suite passes. It then updates
-   this machine; other machines update when their next session starts.
-3. \`crew finish <fix id>\`, retry the command that failed, and go on with the work.
+2. \`crew selfrepair <fix id>\` checks the repair, runs crew's whole suite and opens its pull
+   request. Only crew's own module, test module, README, bin/ and docs/ files may change;
+   repository infrastructure is out of scope. Give the person the link and wait for their merge.
+3. After they merge, \`crew update\` (or the next \`crew start\`) brings the repair to this
+   machine. Then \`crew finish <fix id>\`, retry the failed command, and go on with the work.
 4. Tell the person in one line what was wrong and that it is repaired.
-- If \`crew selfmerge\` refuses, read why. Finish that fix and start one new \`crew fix\` that
+- \`crew selfmerge\` is an alias for \`crew selfrepair\`; it never merges or pushes to main.
+- If \`crew selfrepair\` refuses, read why. Finish that fix and start one new \`crew fix\` that
   includes the refusal. After two refused repairs of the same problem, stop and tell the person.
 - If crew got worse right after an update, run \`crew rollback\` and tell the person.
 `;
@@ -1816,7 +1818,7 @@ function cmdLand(args) {
   const id = rest[0];
   if (!id) refuse('Usage: crew land <id> [--title "<pull request title>"]');
   const task = loadTask(h, id);
-  if (task.selfFix) refuse(`Task ${id} repairs crew itself; publish it with \`crew selfmerge ${id}\`.`);
+  if (task.selfFix) refuse(`Task ${id} repairs crew itself; deliver it with \`crew selfrepair ${id}\`.`);
   if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
@@ -1890,18 +1892,11 @@ function githubEnvironment(remote) {
 // --- crew maintains itself -------------------------------------------------------
 // A worker commits a repair; crew checks its scope, rebases and tests before opening a PR.
 // The person merges it. Machines pick it up at update/start; rollback stays per machine.
-export function toolLayout(folder, override) {
-  const repository = fs.existsSync(path.join(folder, '.git')) ? folder : path.dirname(folder);
-  const relative = slash(path.relative(repository, folder));
-  return { root: slash(path.resolve(override || repository)), prefix: relative ? `${relative}/` : '' };
+const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || path.join(HERE, '..')));
+// Paths here are relative to the tool's own folder, not to its repository.
+export function repairFile(file) {
+  return ['crew.mjs', 'crew.test.mjs', 'README.md'].includes(file) || /^(bin|docs)\/.+/.test(file);
 }
-export function repairFile(file, prefix) {
-  const own = file.startsWith(prefix) ? file.slice(prefix.length) : null;
-  return own !== null && (['crew.mjs', 'crew.test.mjs', 'README.md'].includes(own)
-    || /^(bin|docs)\/.+/.test(own));
-}
-const { root: TOOL_ROOT, prefix: TOOL_PREFIX } = toolLayout(HERE, process.env.CREW_TOOL_ROOT);
-const toolFile = name => `${TOOL_PREFIX}${name}`;
 // Update and crash records. Before 0.7 they sat directly in ~/.crew; one found there is moved
 // the first time a command uses it.
 const STATE = path.join(CREW_DIR, 'state');
@@ -1993,26 +1988,26 @@ function cmdFix(args) {
   while (fs.existsSync(taskDir(h, `fix-${n}`))) n++;
   const id = `fix-${n}`, crashes = recentCrashes();
   const task = [
-    `Repair a defect in the crew tool itself. This working copy is crew's own source: the tool is \`${toolFile('crew.mjs')}\`, its tests are \`${toolFile('crew.test.mjs')}\`, its design is in \`${toolFile('README.md')}\`.`,
+    'Repair a defect in the crew tool itself. This working copy is crew\'s own source: the tool is `crew/crew.mjs`, its tests are `crew/crew.test.mjs`, its design is in `crew/README.md`.',
     '', '## The problem, as the coordinator saw it', problem,
     ...(crashes.length ? ['', '## Crash records from this machine (read them)', ...crashes.map(f => `- \`${slash(f)}\``)] : []),
     '', '## What to do',
-    `1. Find the cause in \`${toolFile('crew.mjs')}\`. Say so in the report if the problem is not a defect in crew.`,
-    `2. Add a check to \`${toolFile('crew.test.mjs')}\` that fails because of the defect, then make the smallest change that fixes it.`,
-    `3. Change only \`${toolFile('crew.mjs')}\`, \`${toolFile('crew.test.mjs')}\`, \`${toolFile('README.md')}\`, or files under \`${toolFile('bin/')}\` and \`${toolFile('docs/')}\`. Repository infrastructure is out of scope.`,
-    `4. Run \`node ${toolFile('crew.test.mjs')}\` and keep going until it exits 0. The fix is published only if the whole suite passes.`,
-    '5. Commit on this branch. Do not push: the coordinator publishes it with `crew selfmerge`.',
+    '1. Find the cause in `crew/crew.mjs`. Say so in the report if the problem is not a defect in crew.',
+    '2. Add a check to `crew/crew.test.mjs` that fails because of the defect, then make the smallest change that fixes it.',
+    '3. Change only `crew/crew.mjs`, `crew/crew.test.mjs`, `crew/README.md`, or files under `crew/bin/` and `crew/docs/`. Repository infrastructure is out of scope.',
+    '4. Run `node crew/crew.test.mjs` and keep going until it exits 0. The fix is published only if the whole suite passes.',
+    '5. Commit on this branch and stop. Do not push or open a pull request: after its checks, the coordinator opens the pull request with `crew selfrepair`. The person merges it.',
     '6. In the report give the cause, the change and the new check, each in a line or two.',
   ].join('\n');
   launchWorker(h, { id, opts, chosen: chooseWorker(h, 'fix', flags, legacy, SELF_PROJECT), project: { path: TOOL_ROOT }, task, extra: { selfFix: true, projectPath: TOOL_ROOT, base: toolRevision() } });
-  console.log(`next: crew wait ${id}, then crew selfmerge ${id}`);
+  console.log(`next: crew wait ${id}, then crew selfrepair ${id}`);
 }
 
 function cmdSelfmerge(args) {
   const h = home();
   requireOwner(h);
   const id = args[0], task = loadTask(h, id);
-  if (!task.selfFix) refuse(`Task ${id} is not a repair of crew; \`crew selfmerge\` publishes only those.`);
+  if (!task.selfFix) refuse(`Task ${id} is not a repair of crew; \`crew selfrepair\` delivers only those.`);
   if (task.pr) { console.log(`${id} already has a pull request: ${task.pr}. After the person merges it, run \`crew update\` or use the next \`crew start\`.`); return; }
   if (task.merged) { console.log(`${id} is already published as ${short(task.merged)}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; a repair is published only after its worker reported.`);
@@ -2030,10 +2025,10 @@ function cmdSelfmerge(args) {
   if (changed.code !== 0) no('its changed files could not be read; nothing was pushed.');
   const files = changed.stdout.split('\0').filter(Boolean);
   if (!files.length) no('it changes nothing compared with the published main.');
-  const outside = files.filter(f => !repairFile(f, TOOL_PREFIX));
+  const outside = files.filter(f => !f.startsWith('crew/') || !repairFile(f.slice('crew/'.length)));
   if (outside.length) no(`it changes files outside crew's own files (${outside.slice(0, 5).join(', ')}). Repository infrastructure is out of scope.`);
   // The suite runs as it would on a clean machine: nothing of this session leaks into it.
-  const command = process.env.CREW_SELFTEST || `node ${toolFile('crew.test.mjs')}`;
+  const command = process.env.CREW_SELFTEST || 'node crew/crew.test.mjs';
   const testEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
   const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: 15 * 60 * 1000 });
   if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
@@ -2147,7 +2142,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
   crew fix [who] "<problem>"               start a worker that repairs crew itself
-  crew selfmerge <id>                      publish that repair if it stays in crew/ and the tests pass
+  crew selfrepair <id>                     check that repair and open its pull request (selfmerge is an alias)
   crew update | crew rollback              bring this machine's crew up to date, or back one step
 
   Choices: --agent starts clean; model/effort/account alone modify the first selected profile.
