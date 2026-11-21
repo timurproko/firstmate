@@ -1400,7 +1400,9 @@ const listFiles = files => `${files.slice(0, 5).join(', ')}${files.length > 5 ? 
 export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
   const deadline = performance.now() + budgetMs;
   const stamp = p => { try { return fs.lstatSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
-  const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : []);
+  // An existing copy without its Git marker is uninspectable, not empty. A copy already
+  // gone is handled separately by finish/return and has no contents left to compare.
+  const git = (...a) => (fs.existsSync(path.join(folder, '.git')) ? gitStatus(folder, ...a) : fs.existsSync(folder) ? null : []);
   const changed = git('--untracked-files=all'), roots = git('--ignored');
   if (!changed || !roots) return null;
   const files = {}, ignored = {};

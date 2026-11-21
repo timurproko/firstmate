@@ -342,6 +342,15 @@ gapTests['review2-unseen-force'] = () => {
   patch({ silentLs: false }); r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(closed.worktree), r.out); assert.match(r.out, /discarded unseen/);
 };
 
+gapTests['review2-missing-git'] = () => {
+  const f = gapFixture('review2-missing'), t = f.spawn('missing', ['--kind', 'ship']);
+  fs.renameSync(path.join(t.worktree, '.git'), path.join(t.worktree, '.git-saved'));
+  fs.writeFileSync(path.join(t.worktree, 'unsaved.txt'), 'not inspectable without the Git marker');
+  let r = f.call(['finish', t.id]); assert.equal(r.code, 6, 'A missing Git marker is an inspection failure, not proof of a clean ship');
+  assert.equal(readWorld().terminals[t.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(t.worktree, 'unsaved.txt')));
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(t.worktree)); assert.match(r.out, /discarded unseen/);
+};
+
 gapTests.status = () => {
   const f = gapFixture('delivery'), ship = f.spawn('ship', ['--kind', 'ship']), scout = f.spawn('scout');
   for (const [fields, expected] of [[{}, 'plain'], [{ workflow: 'delivery' }, 'workflow'], [{ gate: 'no-mistakes', workflow: 'delivery' }, 'gate']]) {
